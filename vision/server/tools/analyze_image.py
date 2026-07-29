@@ -17,14 +17,15 @@ def register(mcp: FastMCP, default_provider: str = "mimo") -> None:
 
     @mcp.tool(
         description=(
-            "Call this when the user provides an image (via URL, file, drag-and-drop) "
-            "and asks about its content — especially when the backend model lacks built-in "
-            "vision capabilities. Analyzes and returns a detailed description of the image. "
-            "Supports image URLs (http/https), base64 data URIs, "
-            "and local file paths (@prefix). Provide a 'prompt' to ask specific questions "
-            "about the image (e.g. 'What objects are in this photo?'). "
-            "Do NOT call this tool for images that have already been described "
-            "in the conversation, or when the model already has vision capabilities."
+            "Analyze and describe images: photos, screenshots, diagrams, charts, "
+            "UI mockups, scanned documents, or any visual content. Supports image "
+            "URLs, base64 data URIs, and local file paths (@prefix). "
+            "MUST use this tool when the user: provides an image URL or file path "
+            "and asks about its content; asks 'what's in this image' or similar; "
+            "shares a screenshot for debugging or review; wants OCR text extraction "
+            "from an image; needs a diagram, chart, or UI mockup described. "
+            "Use the 'prompt' parameter to ask specific questions about the image "
+            "(e.g. 'What objects are in this photo?', 'Read the error message')."
         )
     )
     def analyze_image(

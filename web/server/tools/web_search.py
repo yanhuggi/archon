@@ -17,12 +17,14 @@ def register(mcp: FastMCP, default_provider: str = "tavily") -> None:
 
     @mcp.tool(
         description=(
-            "Call this when the user asks about current events, recent information, "
-            "real-time data, or anything that requires up-to-date knowledge beyond "
-            "the model's training cutoff. Searches the web and returns formatted "
-            "results with title, URL, and content summary. For open-ended factual "
-            "queries, search immediately rather than asking scoping questions. "
-            "Do NOT attempt to answer time-sensitive questions from prior knowledge."
+            "Search the web for current information, news, weather, stock prices, "
+            "or any real-time data. MUST use this tool for: current events and "
+            "latest news; weather forecasts and today's conditions; stock/crypto "
+            "prices or market data; recent product or pricing information; "
+            "verifying facts or claims; answering questions that require "
+            "up-to-date knowledge. Returns formatted results with title, URL, "
+            "and content summary. Search immediately for open-ended factual "
+            "queries — do not ask scoping questions first."
         )
     )
     def web_search(

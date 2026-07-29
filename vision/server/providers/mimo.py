@@ -45,13 +45,17 @@ def _get_allowed_dir() -> Path:
     """Return the allowed base directory for local file reads.
 
     Reads MIMO_ALLOWED_DIR from environment at call time (not import time),
-    so runtime changes to the env var take effect. Defaults to the server
-    script's parent directory (``server/``).
+    so runtime changes to the env var take effect.
+
+    When MIMO_ALLOWED_DIR is set, only paths under that directory are allowed.
+    When it is not set, path restriction is disabled — any readable local file
+    can be processed. This is a local-only MCP tool; the user has full control
+    over which files are passed to it.
     """
     raw = os.environ.get("MIMO_ALLOWED_DIR", "").strip()
     if raw:
         return Path(os.path.realpath(raw))
-    return Path(__file__).resolve().parent.parent
+    return Path("/")
 
 
 def _validate_path_safe(resolved: Path) -> None:
@@ -120,6 +124,12 @@ def process_image_source(source: str) -> str:
     # HTTP/HTTPS URL — pass through (MiMo API accepts URLs directly)
     if source.startswith(("http://", "https://")):
         return source
+
+    # file:// URL — extract local path and process as local file
+    if source.startswith("file://"):
+        import urllib.parse
+        source = urllib.parse.urlparse(source).path
+        # Fall through to local file handling below
 
     # Local file path — resolve, validate scope, warn, then open
     print(_LOCAL_FILE_UPLOAD_WARNING, file=sys.stderr)
