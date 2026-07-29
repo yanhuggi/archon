@@ -16,6 +16,11 @@ _MAX_SEARCH_RESULTS = 200
 _DEFAULT_TIMEOUT = 30
 _DEFAULT_MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10 MB
 _ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
+_DEFAULT_FIELDS = (
+    "summary,description,status,assignee,reporter,issuetype,"
+    "priority,labels,created,updated,subtasks,issuelinks,"
+    "attachment,parent,components,versions,fixVersions,duedate,resolution"
+)
 
 
 class JiraProvider:
@@ -163,6 +168,119 @@ class JiraProvider:
 
     # ── get_issue ──────────────────────────────────────────────────
 
+    def get_issue_json(self, issue_key: str, **kwargs) -> dict:
+        """Get issue details as structured JSON.
+
+        Args:
+            issue_key: Jira issue key (e.g. 'PROJ-123').
+
+        Returns:
+            Dictionary with issue details including attachments.
+        """
+        err = self._validate_issue_key(issue_key)
+        if err:
+            return {"error": err}
+
+        field_map = self._get_field_map()
+        custom_fields = ",".join(field_map.keys())
+        fields_param = _DEFAULT_FIELDS
+        if custom_fields:
+            fields_param += "," + custom_fields
+
+        try:
+            client = self._get_client()
+            resp = client.get(f"/rest/api/2/issue/{issue_key}", params={"fields": fields_param})
+            resp.raise_for_status()
+            issue = resp.json()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                self._invalidate_client()
+            print(f"Error: Jira HTTP {e.response.status_code}: {e.response.text[:200]}", file=sys.stderr)
+            return {"error": f"HTTP {e.response.status_code}: {e.response.text[:500]}"}
+        except httpx.RequestError as e:
+            print(f"Error: Jira request failed: {e}", file=sys.stderr)
+            return {"error": f"Request failed: {e}"}
+        except Exception as e:
+            print(f"Error: Jira get_issue_json failed: {e}", file=sys.stderr)
+            return {"error": f"{type(e).__name__}: {e}"}
+
+        f = issue.get("fields", {})
+
+        def _user_name(user_obj: dict | None) -> str:
+            if not user_obj:
+                return "Unassigned"
+            return user_obj.get("displayName", user_obj.get("name", ""))
+
+        def _name(val: dict | None) -> str:
+            return (val or {}).get("name", "")
+
+        # Extract subtasks
+        subtasks = []
+        for st in f.get("subtasks", []):
+            sf = st.get("fields", {})
+            subtasks.append({
+                "key": st.get("key", ""),
+                "summary": sf.get("summary", ""),
+                "status": (sf.get("status") or {}).get("name", ""),
+            })
+
+        # Extract issue links
+        issue_links = []
+        for link in f.get("issuelinks", []):
+            lt = link.get("type", {})
+            if "outwardIssue" in link:
+                linked = link["outwardIssue"]
+                lf = linked.get("fields") or {}
+                issue_links.append({
+                    "direction": lt.get("outward", lt.get("name", "")),
+                    "issue": {
+                        "key": linked.get("key", ""),
+                        "summary": lf.get("summary", ""),
+                        "status": (lf.get("status") or {}).get("name", ""),
+                    },
+                })
+            elif "inwardIssue" in link:
+                linked = link["inwardIssue"]
+                lf = linked.get("fields") or {}
+                issue_links.append({
+                    "direction": lt.get("inward", lt.get("name", "")),
+                    "issue": {
+                        "key": linked.get("key", ""),
+                        "summary": lf.get("summary", ""),
+                        "status": (lf.get("status") or {}).get("name", ""),
+                    },
+                })
+
+        # Extract attachments
+        attachments = []
+        for att in f.get("attachment", []):
+            attachments.append({
+                "id": att.get("id", ""),
+                "filename": att.get("filename", ""),
+                "size": att.get("size", 0),
+                "mime_type": att.get("mimeType", ""),
+                "author": _user_name(att.get("author")),
+                "created": att.get("created", ""),
+                "content_url": att.get("content", ""),
+            })
+
+        return {
+            "key": issue.get("key", ""),
+            "summary": f.get("summary", ""),
+            "issue_type": _name(f.get("issuetype")),
+            "status": _name(f.get("status")),
+            "priority": _name(f.get("priority")),
+            "resolution": _name(f.get("resolution")) or "Unresolved",
+            "assignee": _user_name(f.get("assignee")),
+            "reporter": _user_name(f.get("reporter")),
+            "created": f.get("created", ""),
+            "updated": f.get("updated", ""),
+            "description": f.get("description", ""),
+            "subtasks": subtasks,
+            "issue_links": issue_links,
+            "attachments": attachments,
+        }
+
     def get_issue(self, issue_key: str, **kwargs) -> str:
         err = self._validate_issue_key(issue_key)
         if err:
@@ -170,11 +288,7 @@ class JiraProvider:
 
         field_map = self._get_field_map()
         custom_fields = ",".join(field_map.keys())
-        fields_param = (
-            "summary,description,status,assignee,reporter,issuetype,"
-            "priority,labels,created,updated,subtasks,issuelinks,"
-            "attachment,parent,components,versions,fixVersions,duedate,resolution"
-        )
+        fields_param = _DEFAULT_FIELDS
         if custom_fields:
             fields_param += "," + custom_fields
 
@@ -335,9 +449,11 @@ class JiraProvider:
             for att in attachments:
                 size_mb = att.get("size", 0) / 1024 / 1024
                 author = (att.get("author") or {}).get("displayName", "")
+                att_id = att.get("id", "")
                 lines.append(
                     f"- {att.get('filename', '')} ({size_mb:.1f} MB) "
-                    f"by {author} - {att.get('created', '')}"
+                    f"by {author} - {att.get('created', '')} "
+                    f"[ID: {att_id}]"
                 )
 
         # ── 其他信息 (remaining custom fields) ──

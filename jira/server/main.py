@@ -23,6 +23,7 @@ from server.providers.jira import JiraProvider
 from server.tools.search_issues import register as register_search_issues
 from server.tools.get_issue import register as register_get_issue
 from server.tools.get_attachment import register as register_get_attachment
+from server.tools.export_issue import register as register_export_issue
 
 # Register Jira provider
 jira_provider = JiraProvider()
@@ -39,6 +40,7 @@ if os.environ.get("JIRA_URL") and os.environ.get("JIRA_USERNAME"):
     register_search_issues(mcp, default_provider="jira")
     register_get_issue(mcp, default_provider="jira")
     register_get_attachment(mcp, default_provider="jira")
+    register_export_issue(mcp, default_provider="jira")
 else:
     print(
         "Warning: JIRA_URL and/or JIRA_USERNAME not set. "

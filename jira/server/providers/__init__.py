@@ -21,6 +21,10 @@ class JiraProvider(Protocol):
         """Get full issue details and return formatted result string."""
         ...
 
+    def get_issue_json(self, issue_key: str, **kwargs) -> dict:
+        """Get full issue details and return structured JSON dictionary."""
+        ...
+
     def get_comments(
         self, issue_key: str, max_results: int = 50, start_at: int = 0, **kwargs
     ) -> str:
