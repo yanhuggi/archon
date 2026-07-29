@@ -233,4 +233,4 @@ jira/
 uv run pytest -v
 ```
 
-36 项测试全部 mock 外部 API，无需真实 Jira 连接。
+42 项测试全部 mock 外部 API，无需真实 Jira 连接。

@@ -194,18 +194,21 @@ def test_get_issue_with_links_and_subtasks(monkeypatch: pytest.MonkeyPatch) -> N
         },
     )
     mock_client.get.return_value.raise_for_status = MagicMock()
+    # Mock field map endpoint
+    field_resp = MagicMock()
+    field_resp.status_code = 200
+    field_resp.json.return_value = []
+    field_resp.raise_for_status = MagicMock()
+    mock_client.get.side_effect = [field_resp, mock_client.get.return_value]
     provider._client = mock_client
 
-    result = json.loads(provider.get_issue("PROJ-1"))
-    assert result["key"] == "PROJ-1"
-    assert len(result["issue_links"]) == 2
-    assert result["issue_links"][0]["direction"] == "outward"
-    assert result["issue_links"][0]["type"] == "Blocks"
-    assert result["issue_links"][1]["direction"] == "inward"
-    assert result["issue_links"][1]["type"] == "is blocked by"
-    assert len(result["subtasks"]) == 1
-    assert result["parent"]["key"] == "PROJ-100"
-    assert len(result["attachments"]) == 1
+    result = provider.get_issue("PROJ-1")
+    assert "# PROJ-1" in result
+    assert "Blocks PROJ-10" in result
+    assert "is blocked by PROJ-5" in result
+    assert "PROJ-2" in result
+    assert "PROJ-100" in result
+    assert "pic.png" in result
     provider.close()
 
 
@@ -241,11 +244,16 @@ def test_get_issue_description_truncation(monkeypatch: pytest.MonkeyPatch) -> No
         },
     )
     mock_client.get.return_value.raise_for_status = MagicMock()
+    field_resp = MagicMock()
+    field_resp.status_code = 200
+    field_resp.json.return_value = []
+    field_resp.raise_for_status = MagicMock()
+    mock_client.get.side_effect = [field_resp, mock_client.get.return_value]
     provider._client = mock_client
 
-    result = json.loads(provider.get_issue("PROJ-1"))
-    assert len(result["description"]) == _MAX_FIELD_LENGTH + 3  # +3 for "..."
-    assert result["description"].endswith("...")
+    result = provider.get_issue("PROJ-1")
+    assert "..." in result
+    assert result.count("x") == _MAX_FIELD_LENGTH
     provider.close()
 
 
@@ -276,17 +284,49 @@ def test_get_issue_missing_fields(monkeypatch: pytest.MonkeyPatch) -> None:
         },
     )
     mock_client.get.return_value.raise_for_status = MagicMock()
+    field_resp = MagicMock()
+    field_resp.status_code = 200
+    field_resp.json.return_value = []
+    field_resp.raise_for_status = MagicMock()
+    mock_client.get.side_effect = [field_resp, mock_client.get.return_value]
     provider._client = mock_client
 
-    result = json.loads(provider.get_issue("PROJ-1"))
-    assert result["description"] == ""
-    assert result["assignee"] == "Unassigned"
-    assert result["reporter"] == ""
-    assert result["priority"] == ""
-    assert result["issue_links"] == []
-    assert result["subtasks"] == []
-    assert result["attachments"] == []
-    assert result["parent"] is None
+    result = provider.get_issue("PROJ-1")
+    assert "# PROJ-1" in result
+    assert "未分配" in result  # unassigned shows as 未分配
+    assert "描述" not in result  # no description section when empty
+    provider.close()
+
+
+def test_get_issue_field_map_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_issue still returns standard fields when field map fetch fails."""
+    monkeypatch.setenv("JIRA_URL", "https://jira.example.com")
+    monkeypatch.setenv("JIRA_USERNAME", "user")
+    monkeypatch.setenv("JIRA_PASSWORD", "pass")
+
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    issue_resp = MagicMock(status_code=200)
+    issue_resp.json.return_value = {
+        "key": "PROJ-1",
+        "fields": {
+            "summary": "Test", "description": "Desc", "status": {"name": "Open"},
+            "assignee": {"displayName": "John"}, "reporter": None,
+            "issuetype": {"name": "Bug"}, "priority": {"name": "High"},
+            "labels": [], "created": "", "updated": "",
+            "subtasks": [], "issuelinks": [], "attachment": [],
+        },
+    }
+    issue_resp.raise_for_status = MagicMock()
+    field_resp = MagicMock(status_code=500)
+    field_resp.raise_for_status.side_effect = Exception("Server error")
+    mock_client.get.side_effect = [field_resp, issue_resp]
+    provider._client = mock_client
+
+    result = provider.get_issue("PROJ-1")
+    assert "# PROJ-1" in result
+    assert "John" in result
+    assert "其他信息" not in result  # no custom fields section when map fails
     provider.close()
 
 
@@ -450,12 +490,12 @@ def test_connection_error(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_get_issue_invalid_key() -> None:
     """get_issue rejects invalid issue key formats."""
     provider = JiraProvider()
-    result = json.loads(provider.get_issue("../../../admin"))
-    assert "error" in result
-    assert "Invalid issue key" in result["error"]
+    result = provider.get_issue("../../../admin")
+    assert "Error" in result
+    assert "Invalid issue key" in result
 
-    result = json.loads(provider.get_issue("123-BAD"))
-    assert "error" in result
+    result = provider.get_issue("123-BAD")
+    assert "Error" in result
     provider.close()
 
 

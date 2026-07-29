@@ -21,8 +21,8 @@ def register(mcp: FastMCP, default_provider: str = "jira") -> None:
             "when: the user wants to see all information about a specific issue; they need "
             "issue links (blocks, is-blocked-by, clones, etc.) with relationship types; "
             "they want sub-tasks or parent task information; they need the full description, "
-            "acceptance criteria, or custom fields. Returns comprehensive issue data "
-            "including links with direction/type, sub-tasks, parent, and attachment metadata."
+            "acceptance criteria, or custom fields. Returns a markdown-formatted summary "
+            "including metadata, user info, description, links, subtasks, and attachments."
         )
     )
     def get_issue(
@@ -36,7 +36,8 @@ def register(mcp: FastMCP, default_provider: str = "jira") -> None:
             provider: Jira provider backend to use.
 
         Returns:
-            JSON string with full issue details including links, subtasks, and attachments.
+            Markdown-formatted issue details including metadata, description,
+            links, subtasks, and attachments.
         """
         try:
             p = get_provider(provider)

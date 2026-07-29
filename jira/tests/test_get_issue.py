@@ -27,16 +27,10 @@ class _StubProvider:
         return "{}"
 
     def get_issue(self, issue_key: str, **kwargs) -> str:
-        return json.dumps({
-            "key": issue_key,
-            "summary": "stub issue",
-            "description": "",
-            "status": "Open",
-            "issue_links": [],
-            "subtasks": [],
-            "parent": None,
-            "attachments": [],
-        })
+        return (
+            f"# {issue_key} - stub issue\n\n"
+            "| 字段 | 值 |\n|---|---|\n| 状态 | Open |\n"
+        )
 
     def get_comments(self, issue_key: str, max_results: int = 50, start_at: int = 0, **kwargs) -> str:
         return "{}"
@@ -50,21 +44,17 @@ class _StubProviderWithLinks:
         return "{}"
 
     def get_issue(self, issue_key: str, **kwargs) -> str:
-        return json.dumps({
-            "key": issue_key,
-            "summary": "issue with links",
-            "issue_links": [
-                {"type": "Blocks", "direction": "outward", "linked_issue": {"key": "PROJ-10", "summary": "Deploy", "status": "Open"}},
-                {"type": "is blocked by", "direction": "inward", "linked_issue": {"key": "PROJ-5", "summary": "Migration", "status": "Done"}},
-            ],
-            "subtasks": [
-                {"key": "PROJ-2", "summary": "Sub task", "status": "Done"},
-            ],
-            "parent": {"key": "PROJ-100", "summary": "Epic"},
-            "attachments": [
-                {"id": "10001", "filename": "pic.png", "size": 1024, "mime_type": "image/png"},
-            ],
-        })
+        return (
+            f"# {issue_key} - issue with links\n\n"
+            "| 字段 | 值 |\n|---|---|\n| 状态 | Open |\n\n"
+            "**关联任务：**\n\n"
+            "- Blocks PROJ-10 Deploy (Open)\n"
+            "- is blocked by PROJ-5 Migration (Done)\n\n"
+            "**子任务：**\n\n"
+            "- PROJ-2 Sub (Done)\n\n"
+            "**附件：**\n\n"
+            "- pic.png (0.0 MB) by  - \n"
+        )
 
     def get_comments(self, issue_key: str, max_results: int = 50, start_at: int = 0, **kwargs) -> str:
         return "{}"
@@ -137,10 +127,10 @@ def test_get_issue_calls_provider() -> None:
     with patch("server.tools.get_issue.get_provider", wraps=None) as mock_get:
         mock_get.return_value = _StubProvider()
         result = func("PROJ-1")
-        data = json.loads(result)
 
     mock_get.assert_called_once_with("stub")
-    assert data["key"] == "PROJ-1"
+    assert "# PROJ-1" in result
+    assert "stub issue" in result
 
 
 def test_get_issue_with_links_and_subtasks() -> None:
@@ -148,14 +138,11 @@ def test_get_issue_with_links_and_subtasks() -> None:
     with patch("server.tools.get_issue.get_provider", wraps=None) as mock_get:
         mock_get.return_value = _StubProviderWithLinks()
         result = func("PROJ-1")
-        data = json.loads(result)
 
-    assert len(data["issue_links"]) == 2
-    assert data["issue_links"][0]["direction"] == "outward"
-    assert data["issue_links"][1]["direction"] == "inward"
-    assert len(data["subtasks"]) == 1
-    assert data["parent"]["key"] == "PROJ-100"
-    assert len(data["attachments"]) == 1
+    assert "Blocks PROJ-10" in result
+    assert "is blocked by PROJ-5" in result
+    assert "PROJ-2" in result
+    assert "pic.png" in result
 
 
 def test_get_issue_unknown_provider() -> None:
@@ -176,7 +163,8 @@ def test_real_provider_integration(monkeypatch: pytest.MonkeyPatch) -> None:
     register("jira", JiraProvider())
 
     mock_client = _make_mock_client()
-    mock_client.get.return_value = MagicMock(
+    # First call: get issue
+    issue_resp = MagicMock(
         status_code=200,
         json=lambda: {
             "key": "PROJ-1",
@@ -198,12 +186,18 @@ def test_real_provider_integration(monkeypatch: pytest.MonkeyPatch) -> None:
             },
         },
     )
-    mock_client.get.return_value.raise_for_status = MagicMock()
+    issue_resp.raise_for_status = MagicMock()
+    # Second call: field map
+    field_resp = MagicMock(status_code=200)
+    field_resp.json.return_value = [
+        {"id": "customfield_10204", "name": "开发人员", "custom": True},
+    ]
+    field_resp.raise_for_status = MagicMock()
+    mock_client.get.side_effect = [field_resp, issue_resp]
 
     func = _get_func("jira")
     with patch.object(JiraProvider, "_get_client", return_value=mock_client):
         result = func("PROJ-1", provider="jira")
-    data = json.loads(result)
 
-    assert data["key"] == "PROJ-1"
-    assert data["assignee"] == "John"
+    assert "# PROJ-1" in result
+    assert "John" in result

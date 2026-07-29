@@ -85,6 +85,21 @@ class JiraProvider:
             return f"Invalid attachment ID: {attachment_id!r}"
         return None
 
+    def _get_field_map(self) -> dict[str, str]:
+        """Fetch custom field ID → name mapping from Jira (always fresh)."""
+        try:
+            client = self._get_client()
+            resp = client.get("/rest/api/2/field")
+            resp.raise_for_status()
+            return {
+                f["id"]: f["name"]
+                for f in resp.json()
+                if f.get("custom", False)
+            }
+        except Exception as e:
+            print(f"Warning: failed to fetch field map: {e}", file=sys.stderr)
+            return {}
+
     # ── search_issues ──────────────────────────────────────────────
 
     def search_issues(
@@ -151,114 +166,199 @@ class JiraProvider:
     def get_issue(self, issue_key: str, **kwargs) -> str:
         err = self._validate_issue_key(issue_key)
         if err:
-            return json.dumps({"error": err}, ensure_ascii=False)
+            return f"Error: {err}"
 
-        fields = (
+        field_map = self._get_field_map()
+        custom_fields = ",".join(field_map.keys())
+        fields_param = (
             "summary,description,status,assignee,reporter,issuetype,"
             "priority,labels,created,updated,subtasks,issuelinks,"
-            "attachment,parent"
+            "attachment,parent,components,versions,fixVersions,duedate,resolution"
         )
+        if custom_fields:
+            fields_param += "," + custom_fields
+
         try:
             client = self._get_client()
-            resp = client.get(f"/rest/api/2/issue/{issue_key}", params={"fields": fields})
+            resp = client.get(f"/rest/api/2/issue/{issue_key}", params={"fields": fields_param})
             resp.raise_for_status()
             issue = resp.json()
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 401:
                 self._invalidate_client()
             print(f"Error: Jira HTTP {e.response.status_code}: {e.response.text[:200]}", file=sys.stderr)
-            return json.dumps({"error": f"HTTP {e.response.status_code}: {e.response.text[:500]}"}, ensure_ascii=False)
+            return f"Error: HTTP {e.response.status_code}: {e.response.text[:500]}"
         except httpx.RequestError as e:
             print(f"Error: Jira request failed: {e}", file=sys.stderr)
-            return json.dumps({"error": f"Request failed: {e}"}, ensure_ascii=False)
+            return f"Error: Request failed: {e}"
         except Exception as e:
             print(f"Error: Jira get_issue failed: {e}", file=sys.stderr)
-            return json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+            return f"Error: {type(e).__name__}: {e}"
 
         f = issue.get("fields", {})
+        key = issue.get("key", "")
+        summary = f.get("summary", "")
 
-        # Issue links normalization
-        issue_links = []
-        for link in f.get("issuelinks", []):
-            link_type = link.get("type", {})
-            if "outwardIssue" in link:
-                linked = link["outwardIssue"]
-                issue_links.append({
-                    "type": link_type.get("outward", link_type.get("name", "")),
-                    "direction": "outward",
-                    "linked_issue": {
-                        "key": linked.get("key", ""),
-                        "summary": (linked.get("fields") or {}).get("summary", ""),
-                        "status": ((linked.get("fields") or {}).get("status") or {}).get("name", ""),
-                    },
-                })
-            elif "inwardIssue" in link:
-                linked = link["inwardIssue"]
-                issue_links.append({
-                    "type": link_type.get("inward", link_type.get("name", "")),
-                    "direction": "inward",
-                    "linked_issue": {
-                        "key": linked.get("key", ""),
-                        "summary": (linked.get("fields") or {}).get("summary", ""),
-                        "status": ((linked.get("fields") or {}).get("status") or {}).get("name", ""),
-                    },
-                })
+        def _user_name(user_obj: dict | None) -> str:
+            if not user_obj:
+                return "未分配"
+            return user_obj.get("displayName", user_obj.get("name", ""))
 
-        # Subtasks
-        subtasks = []
-        for st in f.get("subtasks", []):
-            sf = st.get("fields", {})
-            subtasks.append({
-                "key": st.get("key", ""),
-                "summary": sf.get("summary", ""),
-                "status": (sf.get("status") or {}).get("name", ""),
-            })
+        def _name(val: dict | None) -> str:
+            return (val or {}).get("name", "")
 
-        # Parent
-        parent = None
-        if f.get("parent"):
-            pf = f["parent"]
-            parent = {
-                "key": pf.get("key", ""),
-                "summary": (pf.get("fields") or {}).get("summary", ""),
-            }
+        def _render_custom_field(fid: str) -> str | None:
+            val = f.get(fid)
+            if val is None:
+                return None
+            if isinstance(val, dict):
+                return val.get("displayName") or val.get("value") or str(val)
+            if isinstance(val, list):
+                items = [
+                    item.get("value") or item.get("name") if isinstance(item, dict) else str(item)
+                    for item in val
+                ]
+                return ", ".join(items)
+            text = str(val).strip()
+            return text if text and text != "None" else None
 
-        # Attachments metadata
-        attachments = []
-        for att in f.get("attachment", []):
-            attachments.append({
-                "id": att.get("id", ""),
-                "filename": att.get("filename", ""),
-                "size": att.get("size", 0),
-                "mime_type": att.get("mimeType", ""),
-                "author": (att.get("author") or {}).get("displayName", ""),
-                "created": att.get("created", ""),
-            })
+        lines = [f"# {key} - {summary}", ""]
 
-        description = f.get("description") or ""
-        if len(description) > _MAX_FIELD_LENGTH:
-            description = description[:_MAX_FIELD_LENGTH] + "..."
+        # ── 问题详情 ──
+        detail_rows = [
+            ("类型", _name(f.get("issuetype"))),
+            ("状态", _name(f.get("status"))),
+            ("优先级", _name(f.get("priority"))),
+            ("解决结果", _name(f.get("resolution")) or "未解决"),
+        ]
+        if f.get("versions"):
+            detail_rows.append(("影响版本", ", ".join(_name(v) for v in f["versions"])))
+        if f.get("fixVersions"):
+            detail_rows.append(("修复版本", ", ".join(_name(v) for v in f["fixVersions"])))
+        if f.get("components"):
+            detail_rows.append(("组件", ", ".join(_name(c) for c in f["components"])))
+        if f.get("labels"):
+            detail_rows.append(("标签", ", ".join(f["labels"])))
 
-        return json.dumps(
-            {
-                "key": issue.get("key", ""),
-                "summary": f.get("summary", ""),
-                "description": description,
-                "status": (f.get("status") or {}).get("name", ""),
-                "assignee": (f.get("assignee") or {}).get("displayName", "Unassigned"),
-                "reporter": (f.get("reporter") or {}).get("displayName", ""),
-                "issue_type": (f.get("issuetype") or {}).get("name", ""),
-                "priority": (f.get("priority") or {}).get("name", ""),
-                "labels": f.get("labels", []),
-                "created": f.get("created", ""),
-                "updated": f.get("updated", ""),
-                "parent": parent,
-                "subtasks": subtasks,
-                "issue_links": issue_links,
-                "attachments": attachments,
-            },
-            ensure_ascii=False,
-        )
+        lines += ["**问题详情**", ""]
+        lines += ["| 字段 | 值 |", "|---|---|"]
+        for label, value in detail_rows:
+            lines.append(f"| {label} | {value} |")
+
+        # ── 用户 ──
+        user_rows = [("经办人", _user_name(f.get("assignee")))]
+        if f.get("reporter"):
+            user_rows.append(("报告人", _user_name(f.get("reporter"))))
+        for fid in ("customfield_10400", "customfield_10204", "customfield_10401"):
+            label = field_map.get(fid)
+            if label:
+                val = _render_custom_field(fid)
+                if val:
+                    user_rows.append((label, val))
+
+        lines += ["", "**用户**", ""]
+        lines += ["| 字段 | 值 |", "|---|---|"]
+        for label, value in user_rows:
+            lines.append(f"| {label} | {value} |")
+
+        # ── 日期 ──
+        lines += ["", "**日期**", ""]
+        lines += ["| 字段 | 值 |", "|---|---|"]
+        if f.get("created"):
+            lines.append(f"| 创建时间 | {f['created']} |")
+        if f.get("updated"):
+            lines.append(f"| 更新时间 | {f['updated']} |")
+
+        # ── parent ──
+        parent = f.get("parent")
+        if parent:
+            lines += ["", "**父任务：**", f"- {parent.get('key', '')} {(parent.get('fields') or {}).get('summary', '')}"]
+
+        # ── description ──
+        description = (f.get("description") or "").strip()
+        if description:
+            lines += ["", "**描述：**", ""]
+            if len(description) > _MAX_FIELD_LENGTH:
+                description = description[:_MAX_FIELD_LENGTH] + "..."
+            lines.append(description)
+
+        # ── 测试说明 ──
+        test_desc = _render_custom_field("customfield_11122")
+        if test_desc:
+            lines += ["", "**测试说明：**", "", test_desc]
+
+        # ── 研发设计说明 ──
+        dev_desc = _render_custom_field("customfield_11145")
+        if dev_desc:
+            lines += ["", "**研发设计说明：**", "", dev_desc]
+
+        # ── issue links ──
+        links = f.get("issuelinks", [])
+        if links:
+            lines += ["", "**关联任务：**", ""]
+            for link in links:
+                lt = link.get("type", {})
+                if "outwardIssue" in link:
+                    linked = link["outwardIssue"]
+                    lf = linked.get("fields") or {}
+                    rel = lt.get("outward", lt.get("name", ""))
+                    lines.append(
+                        f"- {rel} {linked.get('key', '')} "
+                        f"{lf.get('summary', '')} "
+                        f"({(lf.get('status') or {}).get('name', '')})"
+                    )
+                elif "inwardIssue" in link:
+                    linked = link["inwardIssue"]
+                    lf = linked.get("fields") or {}
+                    rel = lt.get("inward", lt.get("name", ""))
+                    lines.append(
+                        f"- {rel} {linked.get('key', '')} "
+                        f"{lf.get('summary', '')} "
+                        f"({(lf.get('status') or {}).get('name', '')})"
+                    )
+
+        # ── subtasks ──
+        subtasks = f.get("subtasks", [])
+        if subtasks:
+            lines += ["", "**子任务：**", ""]
+            for st in subtasks:
+                sf = st.get("fields", {})
+                lines.append(
+                    f"- {st.get('key', '')} {sf.get('summary', '')} "
+                    f"({(sf.get('status') or {}).get('name', '')})"
+                )
+
+        # ── attachments ──
+        attachments = f.get("attachment", [])
+        if attachments:
+            lines += ["", "**附件：**", ""]
+            for att in attachments:
+                size_mb = att.get("size", 0) / 1024 / 1024
+                author = (att.get("author") or {}).get("displayName", "")
+                lines.append(
+                    f"- {att.get('filename', '')} ({size_mb:.1f} MB) "
+                    f"by {author} - {att.get('created', '')}"
+                )
+
+        # ── 其他信息 (remaining custom fields) ──
+        skip_fields = {
+            "customfield_10204", "customfield_10400", "customfield_10401",  # 用户区
+            "customfield_11122", "customfield_11145",                       # 测试/设计说明
+        }
+        other_rows = []
+        for fid, fname in sorted(field_map.items()):
+            if fid in skip_fields:
+                continue
+            val = _render_custom_field(fid)
+            if val:
+                other_rows.append((fname, val))
+        if other_rows:
+            lines += ["", "**其他信息**", ""]
+            lines += ["| 字段 | 值 |", "|---|---|"]
+            for label, value in other_rows:
+                lines.append(f"| {label} | {value} |")
+
+        return "\n".join(lines)
 
     # ── get_comments ───────────────────────────────────────────────
 
