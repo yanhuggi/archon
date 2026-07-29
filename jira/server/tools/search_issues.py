@@ -2,16 +2,16 @@
 
 import json
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from server.providers import get_provider
 
 
-def register(mcp: FastMCP, default_provider: str = "jira") -> None:
+def register(mcp: MCPServer, default_provider: str = "jira") -> None:
     """Register the search_issues tool on the given MCP server.
 
     Args:
-        mcp: The FastMCP instance.
+        mcp: The MCPServer instance.
         default_provider: Default Jira provider to use when not specified.
     """
 

@@ -2,16 +2,16 @@
 
 import json
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from server.providers import get_provider
 
 
-def register(mcp: FastMCP, default_provider: str = "tavily") -> None:
+def register(mcp: MCPServer, default_provider: str = "tavily") -> None:
     """Register the web_search tool on the given MCP server.
 
     Args:
-        mcp: The FastMCP instance.
+        mcp: The MCPServer instance.
         default_provider: Default search provider to use when not specified.
     """
 

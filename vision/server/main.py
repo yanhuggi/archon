@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 # Load .env — checks project dir, CWD, then global config
 for p in (
@@ -30,7 +30,7 @@ register_provider("mimo", mimo_provider)
 atexit.register(mimo_provider.close)
 
 # Create MCP server
-mcp = FastMCP("archon-vision")
+mcp = MCPServer("archon-vision")
 
 # Register the analyze_image tool only if API key is configured
 if os.environ.get("MIMO_API_KEY"):

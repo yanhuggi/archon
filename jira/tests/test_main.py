@@ -73,4 +73,4 @@ def test_fastmcp_name() -> None:
     import server.main as main_mod
 
     source = Path(main_mod.__file__).read_text()
-    assert 'FastMCP("archon-jira")' in source
+    assert 'MCPServer("archon-jira")' in source

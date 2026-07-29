@@ -81,7 +81,7 @@ class TestToolRegistration:
                         with patch(
                             "server.tools.analyze_image.register"
                         ) as mock_reg_tool:
-                            with patch("mcp.server.fastmcp.FastMCP"):
+                            with patch("mcp.server.MCPServer"):
                                 with patch("pathlib.Path.exists", return_value=False):
                                     with patch.dict(
                                         "os.environ",
@@ -99,7 +99,7 @@ class TestToolRegistration:
                         with patch(
                             "server.tools.analyze_image.register"
                         ) as mock_reg_tool:
-                            with patch("mcp.server.fastmcp.FastMCP"):
+                            with patch("mcp.server.MCPServer"):
                                 with patch("pathlib.Path.exists", return_value=False):
                                     # No MIMO_API_KEY in environ
                                     _reload_main()
@@ -112,7 +112,7 @@ class TestToolRegistration:
                 with patch("server.providers.mimo.MimoVisionProvider"):
                     with patch("server.providers.register"):
                         with patch("server.tools.analyze_image.register"):
-                            with patch("mcp.server.fastmcp.FastMCP"):
+                            with patch("mcp.server.MCPServer"):
                                 with patch("pathlib.Path.exists", return_value=False):
                                     _reload_main()
         captured = capsys.readouterr()
@@ -135,7 +135,7 @@ class TestAtexit:
                 with patch("server.providers.mimo.MimoVisionProvider"):
                     with patch("server.providers.register"):
                         with patch("server.tools.analyze_image.register"):
-                            with patch("mcp.server.fastmcp.FastMCP"):
+                            with patch("mcp.server.MCPServer"):
                                 with patch("pathlib.Path.exists", return_value=False):
                                     _reload_main()
                                     mock_atexit.assert_called_once()
@@ -153,7 +153,7 @@ class TestAtexit:
                 ):
                     with patch("server.providers.register"):
                         with patch("server.tools.analyze_image.register"):
-                            with patch("mcp.server.fastmcp.FastMCP"):
+                            with patch("mcp.server.MCPServer"):
                                 with patch("pathlib.Path.exists", return_value=False):
                                     _reload_main()
                                     mock_atexit.assert_called_once_with(
@@ -177,12 +177,12 @@ class TestFastMCP:
                     with patch("server.providers.register"):
                         with patch("server.tools.analyze_image.register"):
                             with patch(
-                                "mcp.server.fastmcp.FastMCP"
-                            ) as mock_fastmcp:
+                                "mcp.server.MCPServer"
+                            ) as mock_mcp_server:
                                 with patch(
                                     "pathlib.Path.exists", return_value=False
                                 ):
                                     _reload_main()
-                                    mock_fastmcp.assert_called_once_with(
+                                    mock_mcp_server.assert_called_once_with(
                                         "archon-vision"
                                     )

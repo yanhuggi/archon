@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 # Load .env — checks project dir, CWD, then global config
 for p in (
@@ -37,7 +37,7 @@ if duckduckgo_enabled:
               "Install it with: pip install \"archon-web[duckduckgo]\"", file=sys.stderr)
 
 # Create MCP server
-mcp = FastMCP("archon-web")
+mcp = MCPServer("archon-web")
 
 # Determine default provider:
 #   1. ARCHON_WEB_PROVIDER env var (explicit user choice)

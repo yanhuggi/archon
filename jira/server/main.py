@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 # Load .env — checks project dir, CWD, then global config
 for p in (
@@ -32,7 +32,7 @@ register_provider("jira", jira_provider)
 atexit.register(jira_provider.close)
 
 # Create MCP server
-mcp = FastMCP("archon-jira")
+mcp = MCPServer("archon-jira")
 
 # Register tools only if Jira connection is configured
 if os.environ.get("JIRA_URL") and os.environ.get("JIRA_USERNAME"):

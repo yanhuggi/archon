@@ -1,17 +1,18 @@
 """analyze_image tool definition."""
 
 import json
+import sys
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from server.providers import get_provider
 
 
-def register(mcp: FastMCP, default_provider: str = "mimo") -> None:
+def register(mcp: MCPServer, default_provider: str = "mimo") -> None:
     """Register the analyze_image tool on the given MCP server.
 
     Args:
-        mcp: The FastMCP instance.
+        mcp: The MCPServer instance.
         default_provider: Default image provider to use when not specified.
     """
 
