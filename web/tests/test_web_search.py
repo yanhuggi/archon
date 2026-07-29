@@ -182,13 +182,14 @@ def test_real_tavily_integration_via_tool(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr("server.providers.tavily.os.environ", {"TAVILY_API_KEY": "test-key"})
     register("tavily", TavilyProvider())
 
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.return_value.status_code = 200
-        mock_client.post.return_value.json.return_value = {
-            "results": [{"title": "T", "url": "https://t.com", "content": "c"}],
-        }
+    mock_client = MagicMock()
+    mock_client.is_closed = False
+    mock_client.post.return_value.status_code = 200
+    mock_client.post.return_value.json.return_value = {
+        "results": [{"title": "T", "url": "https://t.com", "content": "c"}],
+    }
 
+    with patch("server.providers.tavily.get_shared_http_client", return_value=mock_client):
         func = _get_web_search_func_from_registration("tavily")
         result = func("tavily test", provider="tavily")
         data = json.loads(result)
@@ -202,24 +203,25 @@ def test_real_deepseek_integration_via_tool(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr("server.providers.deepseek.os.environ", {"DEEPSEEK_API_KEY": "test-key"})
     register("deepseek", DeepSeekProvider())
 
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.return_value.status_code = 200
-        mock_client.post.return_value.json.return_value = {
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "Summary",
-                        "annotations": [
-                            {"type": "web_search_result", "title": "D", "url": "https://d.com"},
-                        ],
-                    },
+    mock_client = MagicMock()
+    mock_client.is_closed = False
+    mock_client.post.return_value.status_code = 200
+    mock_client.post.return_value.json.return_value = {
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Summary",
+                    "annotations": [
+                        {"type": "web_search_result", "title": "D", "url": "https://d.com"},
+                    ],
                 },
-            ],
-        }
+            },
+        ],
+    }
 
+    with patch("server.providers.deepseek.get_shared_http_client", return_value=mock_client):
         func = _get_web_search_func_from_registration("deepseek")
         result = func("deepseek test", provider="deepseek")
         data = json.loads(result)

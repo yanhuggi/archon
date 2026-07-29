@@ -2,7 +2,7 @@
 
 import json
 import os
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import httpx
 import pytest
@@ -13,6 +13,13 @@ from server.providers.deepseek import DeepSeekProvider
 @pytest.fixture
 def provider() -> DeepSeekProvider:
     return DeepSeekProvider()
+
+
+def _mock_http_client() -> MagicMock:
+    """Create a mock HTTP client."""
+    mock_client = MagicMock()
+    mock_client.is_closed = False
+    return mock_client
 
 
 # ---------------------------------------------------------------------------
@@ -43,11 +50,11 @@ def test_search_success(provider: DeepSeekProvider, deepseek_api_response: dict)
     """Successful search returns formatted results with summary."""
     _set_api_key()
 
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.return_value.status_code = 200
-        mock_client.post.return_value.json.return_value = deepseek_api_response
+    mock_client = _mock_http_client()
+    mock_client.post.return_value.status_code = 200
+    mock_client.post.return_value.json.return_value = deepseek_api_response
 
+    with patch("server.providers.deepseek.get_shared_http_client", return_value=mock_client):
         result = provider.search("test query")
         data = json.loads(result)
 
@@ -64,11 +71,11 @@ def test_search_success(provider: DeepSeekProvider, deepseek_api_response: dict)
 def test_search_sends_correct_payload(provider: DeepSeekProvider) -> None:
     """Verify the JSON payload sent to DeepSeek API (OpenAI format)."""
     _set_api_key()
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.return_value.status_code = 200
-        mock_client.post.return_value.json.return_value = {"choices": []}
+    mock_client = _mock_http_client()
+    mock_client.post.return_value.status_code = 200
+    mock_client.post.return_value.json.return_value = {"choices": []}
 
+    with patch("server.providers.deepseek.get_shared_http_client", return_value=mock_client):
         provider.search("hello", max_results=5, model="deepseek-v4-flash")
 
         call_kwargs = mock_client.post.call_args[1]
@@ -90,11 +97,11 @@ def test_search_custom_base_url(provider: DeepSeekProvider) -> None:
     custom_base = "https://custom.deepseek.com"
     expected_url = f"{custom_base}/v1/chat/completions"
     with patch.dict(os.environ, {"DEEPSEEK_BASE_URL": custom_base}):
-        with patch("httpx.Client") as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
-            mock_client.post.return_value.status_code = 200
-            mock_client.post.return_value.json.return_value = {"choices": []}
+        mock_client = _mock_http_client()
+        mock_client.post.return_value.status_code = 200
+        mock_client.post.return_value.json.return_value = {"choices": []}
 
+        with patch("server.providers.deepseek.get_shared_http_client", return_value=mock_client):
             provider.search("test")
             called_url = mock_client.post.call_args[0][0]
             assert called_url == expected_url
@@ -135,11 +142,11 @@ def test_thinking_enabled_in_body(provider: DeepSeekProvider) -> None:
     """When thinking is enabled, the body includes a thinking key."""
     _set_api_key()
     with patch.dict(os.environ, {"ARCHON_WEB_DEEPSEEK_THINKING": "true"}):
-        with patch("httpx.Client") as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
-            mock_client.post.return_value.status_code = 200
-            mock_client.post.return_value.json.return_value = {"content": []}
+        mock_client = _mock_http_client()
+        mock_client.post.return_value.status_code = 200
+        mock_client.post.return_value.json.return_value = {"content": []}
 
+        with patch("server.providers.deepseek.get_shared_http_client", return_value=mock_client):
             provider.search("test")
             body = mock_client.post.call_args[1]["json"]
             assert "thinking" in body
@@ -150,11 +157,11 @@ def test_thinking_disabled_in_body(provider: DeepSeekProvider) -> None:
     """When thinking is disabled, the body does NOT include a thinking key."""
     _set_api_key()
     with patch.dict(os.environ, {"ARCHON_WEB_DEEPSEEK_THINKING": "false"}):
-        with patch("httpx.Client") as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
-            mock_client.post.return_value.status_code = 200
-            mock_client.post.return_value.json.return_value = {"content": []}
+        mock_client = _mock_http_client()
+        mock_client.post.return_value.status_code = 200
+        mock_client.post.return_value.json.return_value = {"content": []}
 
+        with patch("server.providers.deepseek.get_shared_http_client", return_value=mock_client):
             provider.search("test")
             body = mock_client.post.call_args[1]["json"]
             assert "thinking" not in body
@@ -168,11 +175,11 @@ def test_thinking_disabled_in_body(provider: DeepSeekProvider) -> None:
 def test_search_empty_content(provider: DeepSeekProvider) -> None:
     """OpenAI response with no choices produces empty results."""
     _set_api_key()
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.return_value.status_code = 200
-        mock_client.post.return_value.json.return_value = {"choices": []}
+    mock_client = _mock_http_client()
+    mock_client.post.return_value.status_code = 200
+    mock_client.post.return_value.json.return_value = {"choices": []}
 
+    with patch("server.providers.deepseek.get_shared_http_client", return_value=mock_client):
         result = provider.search("test")
         data = json.loads(result)
 
@@ -194,11 +201,11 @@ def test_search_only_text_no_web_results(provider: DeepSeekProvider) -> None:
             }
         ]
     }
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.return_value.status_code = 200
-        mock_client.post.return_value.json.return_value = resp
+    mock_client = _mock_http_client()
+    mock_client.post.return_value.status_code = 200
+    mock_client.post.return_value.json.return_value = resp
 
+    with patch("server.providers.deepseek.get_shared_http_client", return_value=mock_client):
         result = provider.search("test")
         data = json.loads(result)
 
@@ -227,11 +234,11 @@ def test_search_only_web_results_no_text(provider: DeepSeekProvider) -> None:
             }
         ]
     }
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.return_value.status_code = 200
-        mock_client.post.return_value.json.return_value = resp
+    mock_client = _mock_http_client()
+    mock_client.post.return_value.status_code = 200
+    mock_client.post.return_value.json.return_value = resp
 
+    with patch("server.providers.deepseek.get_shared_http_client", return_value=mock_client):
         result = provider.search("test")
         data = json.loads(result)
 
@@ -256,11 +263,11 @@ def test_search_missing_title_and_url(provider: DeepSeekProvider) -> None:
             }
         ]
     }
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.return_value.status_code = 200
-        mock_client.post.return_value.json.return_value = resp
+    mock_client = _mock_http_client()
+    mock_client.post.return_value.status_code = 200
+    mock_client.post.return_value.json.return_value = resp
 
+    with patch("server.providers.deepseek.get_shared_http_client", return_value=mock_client):
         result = provider.search("test")
         data = json.loads(result)
 
@@ -276,14 +283,14 @@ def test_search_missing_title_and_url(provider: DeepSeekProvider) -> None:
 def test_search_http_401(provider: DeepSeekProvider) -> None:
     """HTTP 401 returns error JSON."""
     _set_api_key()
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.side_effect = httpx.HTTPStatusError(
-            "401 Unauthorized",
-            request=httpx.Request("POST", "https://api.deepseek.com/..."),
-            response=httpx.Response(401, text="Unauthorized"),
-        )
+    mock_client = _mock_http_client()
+    mock_client.post.side_effect = httpx.HTTPStatusError(
+        "401 Unauthorized",
+        request=httpx.Request("POST", "https://api.deepseek.com/..."),
+        response=httpx.Response(401, text="Unauthorized"),
+    )
 
+    with patch("server.providers.deepseek.get_shared_http_client", return_value=mock_client):
         result = provider.search("test")
         data = json.loads(result)
 
@@ -294,14 +301,14 @@ def test_search_http_401(provider: DeepSeekProvider) -> None:
 def test_search_http_500(provider: DeepSeekProvider) -> None:
     """HTTP 500 returns error JSON."""
     _set_api_key()
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.side_effect = httpx.HTTPStatusError(
-            "500 Server Error",
-            request=httpx.Request("POST", "https://api.deepseek.com/..."),
-            response=httpx.Response(500, text="Internal Server Error"),
-        )
+    mock_client = _mock_http_client()
+    mock_client.post.side_effect = httpx.HTTPStatusError(
+        "500 Server Error",
+        request=httpx.Request("POST", "https://api.deepseek.com/..."),
+        response=httpx.Response(500, text="Internal Server Error"),
+    )
 
+    with patch("server.providers.deepseek.get_shared_http_client", return_value=mock_client):
         result = provider.search("test")
         data = json.loads(result)
 
@@ -317,13 +324,13 @@ def test_search_http_500(provider: DeepSeekProvider) -> None:
 def test_search_timeout(provider: DeepSeekProvider) -> None:
     """Timeout triggers RequestError handling."""
     _set_api_key()
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.side_effect = httpx.TimeoutException(
-            "Connection timed out",
-            request=httpx.Request("POST", "https://api.deepseek.com/..."),
-        )
+    mock_client = _mock_http_client()
+    mock_client.post.side_effect = httpx.TimeoutException(
+        "Connection timed out",
+        request=httpx.Request("POST", "https://api.deepseek.com/..."),
+    )
 
+    with patch("server.providers.deepseek.get_shared_http_client", return_value=mock_client):
         result = provider.search("test")
         data = json.loads(result)
 
@@ -334,13 +341,13 @@ def test_search_timeout(provider: DeepSeekProvider) -> None:
 def test_search_connection_error(provider: DeepSeekProvider) -> None:
     """Connection error returns error JSON."""
     _set_api_key()
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.side_effect = httpx.RequestError(
-            "Connection refused",
-            request=httpx.Request("POST", "https://api.deepseek.com/..."),
-        )
+    mock_client = _mock_http_client()
+    mock_client.post.side_effect = httpx.RequestError(
+        "Connection refused",
+        request=httpx.Request("POST", "https://api.deepseek.com/..."),
+    )
 
+    with patch("server.providers.deepseek.get_shared_http_client", return_value=mock_client):
         result = provider.search("test")
         data = json.loads(result)
 
@@ -356,10 +363,10 @@ def test_search_connection_error(provider: DeepSeekProvider) -> None:
 def test_search_unexpected_exception(provider: DeepSeekProvider) -> None:
     """Any other exception is caught and returned as JSON error."""
     _set_api_key()
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.side_effect = RuntimeError("Something went wrong")
+    mock_client = _mock_http_client()
+    mock_client.post.side_effect = RuntimeError("Something went wrong")
 
+    with patch("server.providers.deepseek.get_shared_http_client", return_value=mock_client):
         result = provider.search("test")
         data = json.loads(result)
 
@@ -375,28 +382,28 @@ def test_search_unexpected_exception(provider: DeepSeekProvider) -> None:
 def test_output_json_schema(provider: DeepSeekProvider) -> None:
     """Verify the structure of the output JSON."""
     _set_api_key()
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.return_value.status_code = 200
-        mock_client.post.return_value.json.return_value = {
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "Summary.",
-                        "annotations": [
-                            {
-                                "type": "web_search_result",
-                                "title": "R1",
-                                "url": "https://r1.com",
-                            },
-                        ],
-                    },
+    mock_client = _mock_http_client()
+    mock_client.post.return_value.status_code = 200
+    mock_client.post.return_value.json.return_value = {
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Summary.",
+                    "annotations": [
+                        {
+                            "type": "web_search_result",
+                            "title": "R1",
+                            "url": "https://r1.com",
+                        },
+                    ],
                 },
-            ],
-        }
+            },
+        ],
+    }
 
+    with patch("server.providers.deepseek.get_shared_http_client", return_value=mock_client):
         result = provider.search("schema test")
         data = json.loads(result)
 

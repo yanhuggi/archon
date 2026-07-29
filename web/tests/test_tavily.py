@@ -2,7 +2,7 @@
 
 import json
 import os
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import httpx
 import pytest
@@ -13,6 +13,13 @@ from server.providers.tavily import TavilyProvider
 @pytest.fixture
 def provider() -> TavilyProvider:
     return TavilyProvider()
+
+
+def _mock_http_client() -> MagicMock:
+    """Create a mock HTTP client."""
+    mock_client = MagicMock()
+    mock_client.is_closed = False
+    return mock_client
 
 
 # ---------------------------------------------------------------------------
@@ -43,11 +50,11 @@ def test_search_success(provider: TavilyProvider, tavily_api_response: dict) -> 
     """Successful search returns formatted results."""
     _set_api_key()
 
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.return_value.status_code = 200
-        mock_client.post.return_value.json.return_value = tavily_api_response
+    mock_client = _mock_http_client()
+    mock_client.post.return_value.status_code = 200
+    mock_client.post.return_value.json.return_value = tavily_api_response
 
+    with patch("server.providers.tavily.get_shared_http_client", return_value=mock_client):
         result = provider.search("test query")
         data = json.loads(result)
 
@@ -65,11 +72,11 @@ def test_search_success(provider: TavilyProvider, tavily_api_response: dict) -> 
 def test_search_sends_correct_payload(provider: TavilyProvider) -> None:
     """Verify the JSON payload sent to Tavily API."""
     _set_api_key()
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.return_value.status_code = 200
-        mock_client.post.return_value.json.return_value = {"results": []}
+    mock_client = _mock_http_client()
+    mock_client.post.return_value.status_code = 200
+    mock_client.post.return_value.json.return_value = {"results": []}
 
+    with patch("server.providers.tavily.get_shared_http_client", return_value=mock_client):
         provider.search("hello", max_results=5, search_depth="advanced")
 
         call_kwargs = mock_client.post.call_args[1]
@@ -83,11 +90,11 @@ def test_search_custom_base_url(provider: TavilyProvider) -> None:
     """TAVILY_API_URL overrides the default endpoint."""
     _set_api_key()
     with patch.dict(os.environ, {"TAVILY_API_URL": "https://custom.tavily.com/search"}):
-        with patch("httpx.Client") as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
-            mock_client.post.return_value.status_code = 200
-            mock_client.post.return_value.json.return_value = {"results": []}
+        mock_client = _mock_http_client()
+        mock_client.post.return_value.status_code = 200
+        mock_client.post.return_value.json.return_value = {"results": []}
 
+        with patch("server.providers.tavily.get_shared_http_client", return_value=mock_client):
             provider.search("test")
             called_url = mock_client.post.call_args[0][0]
             assert called_url == "https://custom.tavily.com/search"
@@ -107,11 +114,11 @@ def test_search_missing_title_and_content(provider: TavilyProvider) -> None:
             {"title": None, "url": "https://y.com", "content": None},
         ]
     }
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.return_value.status_code = 200
-        mock_client.post.return_value.json.return_value = api_response
+    mock_client = _mock_http_client()
+    mock_client.post.return_value.status_code = 200
+    mock_client.post.return_value.json.return_value = api_response
 
+    with patch("server.providers.tavily.get_shared_http_client", return_value=mock_client):
         result = provider.search("test")
         data = json.loads(result)
 
@@ -123,11 +130,11 @@ def test_search_missing_title_and_content(provider: TavilyProvider) -> None:
 def test_search_no_results_key(provider: TavilyProvider) -> None:
     """API response missing 'results' key is handled."""
     _set_api_key()
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.return_value.status_code = 200
-        mock_client.post.return_value.json.return_value = {"not_results": []}
+    mock_client = _mock_http_client()
+    mock_client.post.return_value.status_code = 200
+    mock_client.post.return_value.json.return_value = {"not_results": []}
 
+    with patch("server.providers.tavily.get_shared_http_client", return_value=mock_client):
         result = provider.search("test")
         data = json.loads(result)
 
@@ -142,14 +149,14 @@ def test_search_no_results_key(provider: TavilyProvider) -> None:
 def test_search_http_401(provider: TavilyProvider) -> None:
     """HTTP 401 returns error JSON."""
     _set_api_key()
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.side_effect = httpx.HTTPStatusError(
-            "401 Unauthorized",
-            request=httpx.Request("POST", "https://api.tavily.com/search"),
-            response=httpx.Response(401, text="Unauthorized"),
-        )
+    mock_client = _mock_http_client()
+    mock_client.post.side_effect = httpx.HTTPStatusError(
+        "401 Unauthorized",
+        request=httpx.Request("POST", "https://api.tavily.com/search"),
+        response=httpx.Response(401, text="Unauthorized"),
+    )
 
+    with patch("server.providers.tavily.get_shared_http_client", return_value=mock_client):
         result = provider.search("test")
         data = json.loads(result)
 
@@ -161,14 +168,14 @@ def test_search_http_401(provider: TavilyProvider) -> None:
 def test_search_http_500(provider: TavilyProvider) -> None:
     """HTTP 500 returns error JSON."""
     _set_api_key()
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.side_effect = httpx.HTTPStatusError(
-            "500 Server Error",
-            request=httpx.Request("POST", "https://api.tavily.com/search"),
-            response=httpx.Response(500, text="Internal Server Error"),
-        )
+    mock_client = _mock_http_client()
+    mock_client.post.side_effect = httpx.HTTPStatusError(
+        "500 Server Error",
+        request=httpx.Request("POST", "https://api.tavily.com/search"),
+        response=httpx.Response(500, text="Internal Server Error"),
+    )
 
+    with patch("server.providers.tavily.get_shared_http_client", return_value=mock_client):
         result = provider.search("test")
         data = json.loads(result)
 
@@ -184,12 +191,12 @@ def test_search_http_500(provider: TavilyProvider) -> None:
 def test_search_timeout(provider: TavilyProvider) -> None:
     """Timeout triggers RequestError handling."""
     _set_api_key()
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.side_effect = httpx.TimeoutException(
-            "Connection timed out", request=httpx.Request("POST", "https://api.tavily.com/search")
-        )
+    mock_client = _mock_http_client()
+    mock_client.post.side_effect = httpx.TimeoutException(
+        "Connection timed out", request=httpx.Request("POST", "https://api.tavily.com/search")
+    )
 
+    with patch("server.providers.tavily.get_shared_http_client", return_value=mock_client):
         result = provider.search("test")
         data = json.loads(result)
 
@@ -200,12 +207,12 @@ def test_search_timeout(provider: TavilyProvider) -> None:
 def test_search_connection_error(provider: TavilyProvider) -> None:
     """Connection error returns error JSON."""
     _set_api_key()
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.side_effect = httpx.RequestError(
-            "Connection refused", request=httpx.Request("POST", "https://api.tavily.com/search")
-        )
+    mock_client = _mock_http_client()
+    mock_client.post.side_effect = httpx.RequestError(
+        "Connection refused", request=httpx.Request("POST", "https://api.tavily.com/search")
+    )
 
+    with patch("server.providers.tavily.get_shared_http_client", return_value=mock_client):
         result = provider.search("test")
         data = json.loads(result)
 
@@ -221,10 +228,10 @@ def test_search_connection_error(provider: TavilyProvider) -> None:
 def test_search_unexpected_exception(provider: TavilyProvider) -> None:
     """Any other exception is caught and returned as JSON error."""
     _set_api_key()
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.side_effect = RuntimeError("Something weird happened")
+    mock_client = _mock_http_client()
+    mock_client.post.side_effect = RuntimeError("Something weird happened")
 
+    with patch("server.providers.tavily.get_shared_http_client", return_value=mock_client):
         result = provider.search("test")
         data = json.loads(result)
 
@@ -281,15 +288,15 @@ def test_format_score_none(provider: TavilyProvider) -> None:
 def test_output_json_schema(provider: TavilyProvider) -> None:
     """Verify the structure of the output JSON."""
     _set_api_key()
-    with patch("httpx.Client") as mock_client_cls:
-        mock_client = mock_client_cls.return_value.__enter__.return_value
-        mock_client.post.return_value.status_code = 200
-        mock_client.post.return_value.json.return_value = {
-            "results": [
-                {"title": "R1", "url": "https://r1.com", "content": "c1"},
-            ]
-        }
+    mock_client = _mock_http_client()
+    mock_client.post.return_value.status_code = 200
+    mock_client.post.return_value.json.return_value = {
+        "results": [
+            {"title": "R1", "url": "https://r1.com", "content": "c1"},
+        ]
+    }
 
+    with patch("server.providers.tavily.get_shared_http_client", return_value=mock_client):
         result = provider.search("schema test")
         data = json.loads(result)
 

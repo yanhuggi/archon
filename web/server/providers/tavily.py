@@ -6,6 +6,8 @@ import sys
 
 import httpx
 
+from server.providers._http import get_shared_http_client
+
 TAVILY_API_URL = "https://api.tavily.com/search"
 
 # Maximum character length for individual text fields (title, snippet).
@@ -30,19 +32,19 @@ class TavilyProvider:
             print("Warning: invalid ARCHON_WEB_TIMEOUT value, falling back to 30s", file=sys.stderr)
             timeout = 30
         try:
-            with httpx.Client(timeout=timeout) as client:
-                resp = client.post(
-                    self._api_url(),
-                    json={
-                        "api_key": api_key,
-                        "query": query,
-                        "search_depth": kwargs.get("search_depth", "basic"),
-                        "max_results": max_results,
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                return self._format(query, data)
+            client = get_shared_http_client(timeout)
+            resp = client.post(
+                self._api_url(),
+                json={
+                    "api_key": api_key,
+                    "query": query,
+                    "search_depth": kwargs.get("search_depth", "basic"),
+                    "max_results": max_results,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return self._format(query, data)
 
         except httpx.HTTPStatusError as e:
             print(f"Error: Tavily HTTP {e.response.status_code}: {e.response.text[:200]}", file=sys.stderr)

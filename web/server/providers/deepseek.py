@@ -6,6 +6,8 @@ import sys
 
 import httpx
 
+from server.providers._http import get_shared_http_client
+
 # DeepSeek 官方 BASE_URL（OpenAI 兼容）: https://api.deepseek.com
 # 代码自动拼接 /v1/chat/completions 得到完整 API 路径。
 # 可通过 DEEPSEEK_BASE_URL 环境变量覆盖。
@@ -66,18 +68,18 @@ class DeepSeekProvider:
             print("Warning: invalid ARCHON_WEB_TIMEOUT value, falling back to 30s", file=sys.stderr)
             timeout = 30
         try:
-            with httpx.Client(timeout=timeout) as client:
-                resp = client.post(
-                    self._api_url(),
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=body,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                return self._format(query, data)
+            client = get_shared_http_client(timeout)
+            resp = client.post(
+                self._api_url(),
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return self._format(query, data)
 
         except httpx.HTTPStatusError as e:
             print(f"Error: DeepSeek HTTP {e.response.status_code}: {e.response.text[:200]}", file=sys.stderr)
