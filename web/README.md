@@ -1,234 +1,343 @@
 # archon-web
 
-MCP (Model Context Protocol) 服务器，为 AI 编程助手提供联网搜索能力。支持多搜索厂商切换。
+`archon-web` 是一个轻量级 MCP（Model Context Protocol）联网搜索服务。它通过 DuckDuckGo 提供公开网页搜索，无需 API Key，适合为 Claude Code、Codex 和其他 MCP 客户端补充实时信息检索能力。
 
-## 功能
+## 能力概览
 
-- **联网搜索** — 一个 `web_search` 工具，多个搜索后端
-- **多厂商支持** — Tavily、DeepSeek、DuckDuckGo，按需切换
-- **结构化响应** — 统一 JSON 格式 `{query, results[], result_count}`
-- **按需启用** — 未配置 API Key 的厂商自动隐藏工具
-- **可扩展** — 添加新搜索厂商只需一个文件 + 一行注册
+| MCP 能力 | 名称 | 说明 |
+|---|---|---|
+| Tool | `web_search` | 搜索公开网页，返回标题、URL 和摘要 |
+| Transport | `stdio` | 本地 MCP 客户端默认接入方式 |
+| Transport | `streamable-http` | 可选 HTTP 服务，默认端点 `/mcp` |
+| Transport | `sse` | 兼容旧客户端的 SSE 方式 |
 
-## 搜索厂商
+主要特性：
 
-| 厂商 | 配置 | 获取 Key | 特点 |
-|---|---|---|---|
-| **tavily** | `TAVILY_API_KEY` | [tavily.com](https://tavily.com) | 结构化搜索结果，有评分，免费 1000 次/月 |
-| **deepseek** | `DEEPSEEK_API_KEY` | [platform.deepseek.com](https://platform.deepseek.com) | 服务端原生搜索，返回 AI 总结答案（默认关闭 thinking，节省 token） |
-| **duckduckgo** | `ARCHON_WEB_DUCKDUCKGO_ENABLED=true` | 无需 Key | 免费，无 Key 即可使用（需 opt-in，带频率限制） |
+- 无需 API Key，安装后即可使用。
+- MCP server 内置使用边界、查询改写、来源核验和引用指引。
+- 工具参数包含长度/范围约束，并提供可选时间过滤。
+- 成功与失败均返回稳定 JSON 包络，便于模型和程序消费。
+- 内置同一用户下的跨进程请求间隔，多个自动启动的 stdio 服务共享限流状态。
+- 日志写入 `stderr`，不会污染 stdio MCP 的 JSON-RPC 通道。
+
+> DuckDuckGo 是公开上游服务，不提供可用性 SLA。搜索摘要适合发现和初步核验信息，不等同于完整网页内容。
 
 ## 快速开始
 
 ### 前置条件
 
-- Python >= 3.10
-- [uv](https://docs.astral.sh/uv/) 包管理器
+- Python 3.10+
+- [uv](https://docs.astral.sh/uv/)
 
-### 安装
-
-```bash
-# 从 Git 安装（推荐）
-uv tool install --force git+ssh://git@github.com/yanhuggi/archon.git@main#subdirectory=web
-
-# 或本地开发
-cd web
-uv sync --extra duckduckgo
-```
-
-### 配置
-
-复制环境变量模板并填入密钥：
+### 从 Git 安装
 
 ```bash
-cp .env.example .env
+# 稳定分支
+uv tool install --force \
+  git+ssh://git@github.com/yanhuggi/archon.git@main#subdirectory=web
+
+# 验证 dev 分支中的最新改动
+uv tool install --force \
+  git+ssh://git@github.com/yanhuggi/archon.git@dev#subdirectory=web
 ```
 
-至少配置一个搜索源：
-- **有 API Key** → 填入 `TAVILY_API_KEY` 或 `DEEPSEEK_API_KEY`
-- **无 API Key** → 设置 `ARCHON_WEB_DUCKDUCKGO_ENABLED=true`
-
-### 测试
+安装完成后确认命令可用：
 
 ```bash
-# 默认厂商
-bash test_mcp.sh "今天福州天气"
-
-# 指定厂商
-bash test_mcp.sh "今天福州天气" deepseek
-bash test_mcp.sh "今天福州天气" duckduckgo
+archon-web --help
 ```
 
-## 集成到 Claude Code
-
-### Git 安装（推荐）
+### 本地开发
 
 ```bash
-uv tool install --force git+ssh://git@github.com/yanhuggi/archon.git@main#subdirectory=web
+git clone git@github.com:yanhuggi/archon.git
+cd archon/web
+uv sync --group dev
+uv run archon-web --help
 ```
 
-配置 Claude Code：
+## 接入 MCP 客户端
+
+### Claude Code
+
+如果已通过 `uv tool install` 安装：
 
 ```bash
-# 使用 Tavily
-claude mcp add -s user archon-web \
-  --env TAVILY_API_KEY=tvly-xxx \
-  -- archon-web
-
-# 仅 DuckDuckGo（无需 Key）
-claude mcp add -s user archon-web \
-  --env ARCHON_WEB_DUCKDUCKGO_ENABLED=true \
-  -- archon-web
-
-# 混用
-claude mcp add -s user archon-web \
-  --env TAVILY_API_KEY=tvly-xxx \
-  --env ARCHON_WEB_DUCKDUCKGO_ENABLED=true \
-  -- archon-web
+claude mcp add -s user archon-web -- archon-web
 ```
 
-### 手动配置
+直接从本地源码运行：
 
-编辑 `~/.claude/mcp.json`：
+```bash
+claude mcp add -s project archon-web -- \
+  uv run --directory /absolute/path/to/archon/web archon-web
+```
+
+检查连接状态：
+
+```bash
+claude mcp list
+```
+
+### 通用 JSON 配置
 
 ```json
 {
   "mcpServers": {
     "archon-web": {
-      "command": "archon-web",
-      "env": {
-        "ARCHON_WEB_DUCKDUCKGO_ENABLED": "true"
-      }
+      "command": "archon-web"
     }
   }
 }
 ```
 
-### 提示词配置
+如果命令没有安装到客户端可见的 `PATH`，请把 `command` 改为 `archon-web` 的绝对路径。
 
-为了让模型主动调用 `web_search`（尤其是使用不支持内置搜索的后端模型时），在项目的 `CLAUDE.md` 或全局 `~/.claude/CLAUDE.md` 中添加：
+## `web_search` 工具
 
-```markdown
-# Tool Usage Policy
+### 参数
 
-## Web Search
-
-Use `web_search` for any real-time or externally verifiable information.
-```
-
-## 环境变量
-
-| 变量 | 默认值 | 说明 |
+| 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `TAVILY_API_KEY` | — | Tavily API Key |
-| `DEEPSEEK_API_KEY` | — | DeepSeek API Key |
-| `ARCHON_WEB_DUCKDUCKGO_ENABLED` | — | 设为 `true` 启用 DuckDuckGo |
-| `ARCHON_WEB_DUCKDUCKGO_INTERVAL` | `2.0` | DuckDuckGo 请求间隔（秒），防限流 |
-| `ARCHON_WEB_DEEPSEEK_THINKING` | `false` | 设为 `true` 启用 DeepSeek thinking（消耗额外 token） |
-| `ARCHON_WEB_PROVIDER` | 自动 | 强制指定默认厂商 `tavily`/`deepseek`/`duckduckgo` |
-| `TAVILY_API_URL` | 默认 API | 自定义 Tavily API 地址（完整 URL） |
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/anthropic` | DeepSeek BASE_URL，自动拼接 `/v1/messages` |
+| `query` | string | 必填 | 聚焦的搜索词，1–500 字符 |
+| `max_results` | integer | `8` | 返回数量，范围 1–20 |
+| `time_range` | string/null | `null` | 可选：`day`、`week`、`month`、`year` |
 
-### 默认厂商选择逻辑
+调用示例：
 
-1. `ARCHON_WEB_PROVIDER` 显式指定 → 使用指定值
-2. 有 `TAVILY_API_KEY` → `tavily`
-3. 有 `DEEPSEEK_API_KEY` → `deepseek`
-4. DuckDuckGo 已启用 → `duckduckgo`
-5. 无任何配置 → 工具隐藏，模型不可见
-
-### 模型调用时切换
-
-```python
-web_search(query="福州天气")                    # 走默认厂商
-web_search(query="福州天气", provider="deepseek") # 显式指定
-web_search(query="福州天气", provider="duckduckgo")
+```text
+web_search(query="MCP Python SDK 2.0 migration", max_results=8)
+web_search(query="福州天气 2026-07-30", max_results=5, time_range="day")
+web_search(query="site:docs.python.org asyncio TaskGroup", max_results=5)
 ```
 
-## 响应格式
+查询建议：
 
-统一返回 JSON 字符串：
+- 优先使用 3–8 个关键字，保留实体、主题、地点和日期。
+- “最新”“今天”等问题应加入明确日期，或设置 `time_range`。
+- 首次结果为空或偏题时，换一组实质不同的关键词重试一次。
+- 摘要只是线索；重要结论应比较多个来源，并在回答中保留 URL。
+
+### 成功响应
+
+工具返回 JSON 字符串：
 
 ```json
 {
-  "query": "福州天气",
+  "query": "MCP Python SDK 2.0 migration",
   "results": [
     {
-      "title": "福州天气预报",
-      "url": "https://...",
-      "snippet": "福州今天多云..."
+      "title": "MCP Python SDK documentation",
+      "url": "https://example.com/docs",
+      "snippet": "Migration notes and examples..."
     }
   ],
-  "result_count": 5
+  "result_count": 1
 }
 ```
 
-各厂商额外字段：
+### 失败响应
 
-| 厂商 | 额外字段 |
+失败仍使用同一包络，`results` 为空：
+
+```json
+{
+  "query": "example",
+  "results": [],
+  "result_count": 0,
+  "error": "DuckDuckGo search failed: ...",
+  "error_code": "upstream_error"
+}
+```
+
+常见 `error_code`：
+
+| 代码 | 含义 |
 |---|---|
-| tavily | `results[].score`（相关性评分） |
-| deepseek | `summary`（AI 生成的总结答案） |
+| `invalid_query` | 查询为空或超过长度限制 |
+| `invalid_max_results` | 返回数量不是有效整数 |
+| `provider_unavailable` | 搜索 provider 未注册 |
+| `invalid_provider_response` | 上游返回内容不符合 JSON 契约 |
+| `upstream_error` | DuckDuckGo 网络、限流或代理错误 |
+
+## 模型使用策略
+
+服务通过 MCP `instructions` 和 `web_search` 工具描述自动提供使用边界、查询建议和来源核验要求，不额外暴露研究工作流 Prompt。是否搜索、如何改写查询、是否进行语义重试以及如何组织引用，由模型根据当前任务决定。
+
+若希望在 Claude Code 的 Tool Search 场景中提高调用稳定性，可在项目的 `CLAUDE.md`、`AGENTS.md` 或等效系统提示词中加入以下策略。它不仅限定搜索工具，还用可观察条件明确何时必须在回答前搜索：
+
+```markdown
+## Web Search
+
+`web_search` is the only permitted web search tool. Do not use built-in web
+search, shell commands, browser automation, or other mechanisms as substitutes.
+
+Before answering, you MUST call `web_search` at least once when any of these
+conditions applies:
+
+- The user asks about current, latest, recent, today, or time-sensitive information.
+- The answer depends on software versions, release notes, current documentation,
+  API behavior, compatibility, deprecations, pricing, availability, or open issues.
+- The user asks to verify a claim or requests sources, citations, or links.
+- A factual claim depends on information outside the conversation and could have
+  changed since the model's knowledge cutoff.
+- You are uncertain whether remembered external information is accurate or current.
+
+For official documentation, include the product or project name and prefer a
+domain-qualified query such as `site:docs.example.com`.
+
+After searching:
+
+- Treat result snippets as leads, not conclusive evidence.
+- Compare multiple results for important or disputed claims.
+- Include the relevant result URLs in the answer.
+- If results are empty or irrelevant, retry once with materially different keywords.
+- If evidence remains insufficient, state that clearly instead of guessing.
+
+Do not search when the task only involves:
+
+- Rewriting, translating, summarizing, or transforming user-provided content.
+- Reasoning entirely from files or information already available in the conversation.
+- Stable facts that do not require current or external verification.
+
+If `web_search` is unavailable, report that limitation. Do not silently replace
+it with another search mechanism or present remembered information as verified.
+```
+
+`All web searches must use web_search` 只约束工具路由，并不能稳定触发搜索；上面的 `Before answering, you MUST call` 与具体触发条件共同定义了调用门槛。模型执行提示词仍具有概率性，且可能受更高优先级指令影响，因此无法保证每次都调用，但这种写法更利于 Tool Search 匹配并显著减少模型仅凭记忆回答的情况。
+
+## 运行方式
+
+### stdio（默认）
+
+```bash
+archon-web
+```
+
+这是 Claude Code 等本地 MCP 客户端的推荐方式。不要把普通日志写入 stdout；本服务已将日志保留在 stderr。
+
+客户端会按需自动启动和停止进程，无需手动维护常驻服务。多个本地客户端进程通过用户缓存目录中的时间戳文件共享 DuckDuckGo 请求间隔；该文件只保存最近一次请求时间，不包含查询内容。
+
+### Streamable HTTP
+
+```bash
+archon-web --transport streamable-http --host 127.0.0.1 --port 8000
+```
+
+端点默认为：
+
+```text
+http://127.0.0.1:8000/mcp
+```
+
+也可全部通过环境变量配置。服务未内置身份认证，因此除非外层已有可信反向代理和鉴权，不要直接绑定公网地址。
+
+### SSE（兼容模式）
+
+```bash
+archon-web --transport sse --host 127.0.0.1 --port 8000
+```
+
+新接入优先选择 stdio 或 Streamable HTTP。
+
+## 配置
+
+复制模板：
+
+```bash
+cp .env.example .env
+```
+
+查找顺序为 `web/.env`、当前工作目录 `.env`、`~/.config/archon-web/.env`，命中第一个后停止。MCP 客户端或 Shell 显式传入的环境变量优先于 `.env`。
+
+### 搜索配置
+
+| 环境变量 | 默认值 | 说明 |
+|---|---:|---|
+| `ARCHON_WEB_DUCKDUCKGO_INTERVAL` | `2.0` | 同一用户下请求开始时间的最小间隔，范围 0–60 秒 |
+| `ARCHON_WEB_TIMEOUT` | `10` | 上游请求超时，范围 1–120 秒 |
+| `ARCHON_WEB_PROXY` | 空 | HTTP/HTTPS/SOCKS5 代理 URL |
+| `ARCHON_WEB_RATE_LIMIT_FILE` | `~/.cache/archon-web/duckduckgo-rate-limit` | 跨进程限流状态文件，建议使用绝对路径 |
+
+### MCP 服务配置
+
+| 环境变量 | 默认值 | 说明 |
+|---|---:|---|
+| `ARCHON_WEB_TRANSPORT` | `stdio` | `stdio`、`streamable-http` 或 `sse` |
+| `ARCHON_WEB_HOST` | `127.0.0.1` | HTTP/SSE 监听地址 |
+| `ARCHON_WEB_PORT` | `8000` | HTTP/SSE 端口 |
+| `ARCHON_WEB_LOG_LEVEL` | `INFO` | `DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL` |
+| `ARCHON_WEB_STREAMABLE_HTTP_PATH` | `/mcp` | Streamable HTTP 路径 |
+| `ARCHON_WEB_STATELESS_HTTP` | `false` | 是否使用无状态 HTTP 模式 |
+| `ARCHON_WEB_SSE_PATH` | `/sse` | SSE 连接路径 |
+| `ARCHON_WEB_MESSAGE_PATH` | `/messages/` | SSE 消息路径 |
+
+命令行中的 `--transport`、`--host`、`--port` 会覆盖对应环境变量。
 
 ## 测试
 
+单元测试全部 mock 外部搜索，无需真实网络：
+
 ```bash
-uv run --directory web pytest web/tests -v
+cd web
+uv sync --group dev
+uv run pytest tests -q
 ```
 
-所有测试 mock 外部 API，无需真实 API Key。
+执行真实 stdio MCP + DuckDuckGo 冒烟测试：
+
+```bash
+cd web
+bash test_mcp.sh "MCP Python SDK 2.0" 5 week
+```
+
+该脚本使用 MCP `2026-07-28` 的 `server/discover` 完成能力协商并调用 `web_search`。它需要能够访问 DuckDuckGo。
+
+## 常见问题
+
+### 返回 `upstream_error` 或频繁被限流
+
+- 增大 `ARCHON_WEB_DUCKDUCKGO_INTERVAL`，例如设为 `3` 或 `5`。
+- 检查当前网络是否能访问 DuckDuckGo。
+- 如需代理，设置 `ARCHON_WEB_PROXY`。
+- 同一用户的多个本地进程会自动共享限流；不同主机、容器或用户仍各自计数。
+- 检查 `ARCHON_WEB_RATE_LIMIT_FILE` 的父目录是否可写；不可写时服务会降级为进程内限流。
+
+### 搜索结果为空或不相关
+
+- 缩短自然语言问题，改为实体 + 主题 + 日期/地点。
+- 对最新内容设置 `time_range`。
+- 用同义词或官方域名限定（例如 `site:docs.python.org`）重试一次。
+
+### MCP 客户端找不到 `archon-web`
+
+- 运行 `command -v archon-web` 检查安装路径。
+- 在 MCP JSON 配置中使用绝对路径。
+- 本地源码模式确认 `uv run --directory /absolute/path/to/archon/web archon-web --help` 可执行。
 
 ## 项目结构
 
-```
+```text
 web/
-├── pyproject.toml               # 项目配置
-├── .env                         # API Key（gitignored）
-├── .env.example                 # 环境变量模板
-├── .gitignore
+├── .env.example
 ├── README.md
+├── pyproject.toml
+├── test_mcp.sh
 ├── uv.lock
-├── test_mcp.sh                  # 快速集成测试
 ├── server/
-│   ├── main.py                  # MCP 入口
+│   ├── config.py                 # 环境变量解析与边界校验
+│   ├── main.py                   # MCP server、传输和 CLI 入口
+│   ├── instructions.py           # server instructions 与工具使用说明
 │   ├── providers/
-│   │   ├── __init__.py          # Provider 注册表
-│   │   ├── tavily.py
-│   │   ├── deepseek.py
-│   │   └── duckduckgo.py
+│   │   ├── __init__.py           # provider 注册表与协议
+│   │   └── duckduckgo.py         # 搜索、限流、超时和结果清洗
 │   └── tools/
-│       └── web_search.py
+│       └── web_search.py         # MCP 工具定义与稳定响应契约
 └── tests/
-    ├── conftest.py              # 共享 fixture
-    ├── test_providers_init.py   # 注册表测试（12 项）
-    ├── test_tavily.py           # Tavily 测试（14 项）
-    ├── test_deepseek.py         # DeepSeek 测试（24 项）
-    ├── test_duckduckgo.py       # DuckDuckGo 测试（12 项）
-    └── test_web_search.py       # 工具测试（10 项）
+    ├── test_config.py
+    ├── test_duckduckgo.py
+    ├── test_main.py
+    ├── test_instructions.py
+    ├── test_providers_init.py
+    └── test_web_search.py
 ```
-
-## 扩展：添加新的搜索厂商
-
-两步完成：
-
-1. 创建 `server/providers/xxx.py`：
-
-```python
-class XxxProvider:
-    def search(self, query: str, max_results: int = 10, **kwargs) -> str:
-        # 返回 JSON 字符串
-        return json.dumps({"query": query, "results": [...], "result_count": n})
-```
-
-2. 在 `server/main.py` 注册：
-
-```python
-from server.providers.xxx import XxxProvider
-register_provider("xxx", XxxProvider())
-```
-
-## 架构说明
-
-- **工具层**（`tools/`）：定义 MCP 工具，对外统一接口
-- **提供者层**（`providers/`）：封装不同搜索后端的 API 调用，通过 `SearchProvider` 协议统一
-- **注册表**（`providers/__init__.py`）：管理厂商注册与查找，厂商不可用时自动隐藏工具

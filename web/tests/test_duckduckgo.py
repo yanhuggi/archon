@@ -20,9 +20,11 @@ def reset_rate_limiter() -> None:
     """
     with ddg_module._lock:
         ddg_module._last_call = 0.0
+        ddg_module._rate_limit_warning_emitted = False
     yield
     with ddg_module._lock:
         ddg_module._last_call = 0.0
+        ddg_module._rate_limit_warning_emitted = False
 
 
 @pytest.fixture
@@ -73,6 +75,40 @@ def test_search_custom_max_results(provider: DuckDuckGoProvider, mock_ddgs: Magi
     mock_ddgs.return_value.__enter__.return_value.text.assert_called_once_with("q", max_results=5)
 
 
+def test_search_never_returns_more_than_requested(
+    provider: DuckDuckGoProvider, mock_ddgs: MagicMock
+) -> None:
+    """Defend against an upstream that ignores its max_results argument."""
+    mock_ddgs.return_value.__enter__.return_value.text.return_value = [
+        {"title": str(index), "href": f"https://example.com/{index}", "body": "body"}
+        for index in range(5)
+    ]
+    data = json.loads(provider.search("q", max_results=2))
+    assert data["result_count"] == 2
+
+
+def test_search_passes_time_range_as_ddgs_timelimit(
+    provider: DuckDuckGoProvider, mock_ddgs: MagicMock
+) -> None:
+    """Friendly MCP time ranges are translated to DuckDuckGo values."""
+    provider.search("recent release", time_range="week")
+    mock_ddgs.return_value.__enter__.return_value.text.assert_called_once_with(
+        "recent release", max_results=10, timelimit="w"
+    )
+
+
+def test_search_configures_timeout_and_proxy(
+    provider: DuckDuckGoProvider, mock_ddgs: MagicMock
+) -> None:
+    """Network settings are forwarded to the DDGS client."""
+    with patch.dict(
+        os.environ,
+        {"ARCHON_WEB_TIMEOUT": "25", "ARCHON_WEB_PROXY": "http://proxy.example:8080"},
+    ):
+        provider.search("query")
+    mock_ddgs.assert_called_once_with(timeout=25, proxy="http://proxy.example:8080")
+
+
 # ---------------------------------------------------------------------------
 # Output JSON schema
 # ---------------------------------------------------------------------------
@@ -119,6 +155,20 @@ def test_search_missing_fields(provider: DuckDuckGoProvider, mock_ddgs: MagicMoc
     assert data["results"][0]["snippet"] == ""
 
 
+def test_search_deduplicates_urls_and_rejects_unsafe_schemes(
+    provider: DuckDuckGoProvider, mock_ddgs: MagicMock
+) -> None:
+    mock_ddgs.return_value.__enter__.return_value.text.return_value = [
+        {"title": "A", "href": "https://example.com/a", "body": "one"},
+        {"title": "A duplicate", "href": "https://example.com/a", "body": "two"},
+        {"title": "Unsafe", "href": "javascript:alert(1)", "body": "three"},
+    ]
+
+    data = json.loads(provider.search("test"))
+    assert data["result_count"] == 2
+    assert data["results"][1]["url"] == ""
+
+
 # ---------------------------------------------------------------------------
 # Exception handling
 # ---------------------------------------------------------------------------
@@ -134,6 +184,8 @@ def test_search_ddgs_exception(provider: DuckDuckGoProvider, mock_ddgs: MagicMoc
     assert "error" in data
     assert "DuckDuckGo search failed" in data["error"]
     assert "DDG blocked us" in data["error"]
+    assert data["error_code"] == "upstream_error"
+    assert data["results"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +227,28 @@ def test_rate_limit_thread_safety() -> None:
     assert True  # reached without deadlock
 
 
+def test_rate_limit_is_shared_through_state_file(tmp_path) -> None:
+    """A persisted timestamp limits a later call even after local state resets."""
+    state_file = tmp_path / "rate-limit"
+    with patch("server.providers.duckduckgo.time.time", side_effect=[100.0, 100.0, 100.5, 102.0]):
+        with patch("server.providers.duckduckgo.time.sleep") as mock_sleep:
+            _rate_limit(2.0, state_file)
+            ddg_module._last_call = 0.0
+            _rate_limit(2.0, state_file)
+
+    mock_sleep.assert_called_once_with(1.5)
+    assert float(state_file.read_text().strip()) == 102.0
+
+
+def test_rate_limit_falls_back_when_state_file_is_unavailable(tmp_path) -> None:
+    """A state-file error must not make web search unavailable."""
+    unavailable = tmp_path / "directory"
+    unavailable.mkdir()
+    with patch("server.providers.duckduckgo.time.monotonic", side_effect=[10.0, 10.0]):
+        _rate_limit(2.0, unavailable)
+    assert ddg_module._last_call == 10.0
+
+
 def test_rate_limiter_applied_in_search(provider: DuckDuckGoProvider, mock_ddgs: MagicMock) -> None:
     """The rate limiter is called before the DDGS API call."""
     with patch("server.providers.duckduckgo._rate_limit") as mock_rl:
@@ -183,6 +257,7 @@ def test_rate_limiter_applied_in_search(provider: DuckDuckGoProvider, mock_ddgs:
         # Default interval is 2.0
         args = mock_rl.call_args[0]
         assert args[0] == 2.0
+        assert args[1].name == "rate-limit"
 
 
 def test_rate_limiter_custom_interval(provider: DuckDuckGoProvider, mock_ddgs: MagicMock) -> None:
@@ -190,7 +265,7 @@ def test_rate_limiter_custom_interval(provider: DuckDuckGoProvider, mock_ddgs: M
     with patch.dict(os.environ, {"ARCHON_WEB_DUCKDUCKGO_INTERVAL": "0.5"}):
         with patch("server.providers.duckduckgo._rate_limit") as mock_rl:
             provider.search("test")
-            mock_rl.assert_called_once_with(0.5)
+            assert mock_rl.call_args.args[0] == 0.5
 
 
 def test_rate_limiter_invalid_interval_falls_back(provider: DuckDuckGoProvider, mock_ddgs: MagicMock) -> None:
@@ -198,4 +273,4 @@ def test_rate_limiter_invalid_interval_falls_back(provider: DuckDuckGoProvider, 
     with patch.dict(os.environ, {"ARCHON_WEB_DUCKDUCKGO_INTERVAL": "not-a-float"}):
         with patch("server.providers.duckduckgo._rate_limit") as mock_rl:
             provider.search("test")
-            mock_rl.assert_called_once_with(2.0)
+            assert mock_rl.call_args.args[0] == 2.0

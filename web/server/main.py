@@ -1,84 +1,154 @@
 """archon-web MCP server entry point."""
 
-import sys
-import os
+from __future__ import annotations
+
+import argparse
+import logging
 from pathlib import Path
+from typing import Sequence
 
 from dotenv import load_dotenv
 from mcp.server import MCPServer
 
-# Load .env — checks project dir, CWD, then global config
-for p in (
-    Path(__file__).resolve().parent.parent / ".env",
-    Path.cwd() / ".env",
-    Path.home() / ".config/archon-web/.env",
-):
-    if p.exists():
-        load_dotenv(p, override=True)
-        break
-
-from server.providers import is_registered, register as register_provider
-from server.providers.tavily import TavilyProvider
-from server.providers.deepseek import DeepSeekProvider
+from server.config import SUPPORTED_TRANSPORTS, WebConfig
+from server.instructions import SERVER_INSTRUCTIONS
+from server.providers import register as register_provider
+from server.providers.duckduckgo import DuckDuckGoProvider
 from server.tools.web_search import register as register_web_search
 
-# Register built-in providers
-register_provider("tavily", TavilyProvider())
-register_provider("deepseek", DeepSeekProvider())
 
-# DuckDuckGo — opt-in, no API key required
-duckduckgo_enabled = os.environ.get("ARCHON_WEB_DUCKDUCKGO_ENABLED", "").lower() in ("true", "1", "yes")
-if duckduckgo_enabled:
-    try:
-        from server.providers.duckduckgo import DuckDuckGoProvider  # noqa: PLC0415
-        register_provider("duckduckgo", DuckDuckGoProvider())
-    except ModuleNotFoundError:
-        print("Warning: ARCHON_WEB_DUCKDUCKGO_ENABLED is set but duckduckgo-search is not installed. "
-              "Install it with: pip install \"archon-web[duckduckgo]\"", file=sys.stderr)
+SERVER_NAME = "archon-web"
+SERVER_VERSION = "0.1.0"
 
-# Create MCP server
-mcp = MCPServer("archon-web")
 
-# Determine default provider:
-#   1. ARCHON_WEB_PROVIDER env var (explicit user choice)
-#   2. Auto-detect: tavily → deepseek → duckduckgo
-has_tavily = bool(os.environ.get("TAVILY_API_KEY"))
-has_deepseek = bool(os.environ.get("DEEPSEEK_API_KEY"))
-has_duckduckgo = duckduckgo_enabled and is_registered("duckduckgo")
+def load_environment() -> Path | None:
+    """Load the first project/local configuration file that exists.
 
-provider_available = {"tavily": has_tavily, "deepseek": has_deepseek, "duckduckgo": has_duckduckgo}
+    ``override=False`` deliberately gives explicitly supplied process
+    environment variables precedence over values in ``.env``. This is safer
+    for MCP clients, which commonly pass secrets and deployment settings via
+    their own environment.
+    """
 
-explicit = os.environ.get("ARCHON_WEB_PROVIDER")
-if explicit and explicit in provider_available and provider_available[explicit]:
-    default_provider = explicit
-else:
-    if explicit:
-        # User specified a provider but it's not available
-        available = [k for k, v in provider_available.items() if v]
-        msg = f"Warning: ARCHON_WEB_PROVIDER={explicit} specified but not configured."
-        if available:
-            msg += f" Falling back to {available[0]}. Available: {available}"
-            print(msg, file=sys.stderr)
-        else:
-            msg += " No search tool will be registered."
-            print(msg, file=sys.stderr)
+    candidates = (
+        Path(__file__).resolve().parent.parent / ".env",
+        Path.cwd() / ".env",
+        Path.home() / ".config/archon-web/.env",
+    )
+    for path in candidates:
+        if path.exists():
+            load_dotenv(path, override=False)
+            return path
+    return None
 
-    if has_tavily:
-        default_provider = "tavily"
-    elif has_deepseek:
-        default_provider = "deepseek"
-    elif has_duckduckgo:
-        default_provider = "duckduckgo"
+
+# Load .env before constructing the server, but keep registration in a factory
+# so tests and embedders can create an isolated MCP server instance.
+load_environment()
+
+
+def create_server(config: WebConfig | None = None) -> MCPServer:
+    """Create and configure an archon-web MCP server instance."""
+
+    config = config or WebConfig.from_env()
+    register_provider("duckduckgo", DuckDuckGoProvider())
+
+    server = MCPServer(
+        name=SERVER_NAME,
+        title="Archon Web Search",
+        description="MCP server for focused public-web searches.",
+        instructions=SERVER_INSTRUCTIONS,
+        version=SERVER_VERSION,
+        log_level=config.log_level,
+    )
+    register_web_search(server)
+    return server
+
+
+# Kept as a public module attribute for MCP clients and existing integrations
+# that import ``server.main.mcp``.
+mcp = create_server()
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run the archon-web MCP server")
+    parser.add_argument(
+        "--transport",
+        choices=SUPPORTED_TRANSPORTS,
+        default=None,
+        help="MCP transport (default: ARCHON_WEB_TRANSPORT or stdio)",
+    )
+    parser.add_argument(
+        "--host",
+        default=None,
+        help="HTTP bind address (default: ARCHON_WEB_HOST or 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="HTTP port (default: ARCHON_WEB_PORT or 8000)",
+    )
+    return parser
+
+
+def _config_from_args(args: argparse.Namespace, base: WebConfig) -> WebConfig:
+    """Apply command-line overrides without mutating the environment."""
+
+    values = {
+        "transport": args.transport if args.transport is not None else base.transport,
+        "host": args.host if args.host is not None else base.host,
+        "port": args.port if args.port is not None else base.port,
+    }
+    if not 1 <= values["port"] <= 65535:
+        raise ValueError("--port must be between 1 and 65535")
+    return WebConfig(
+        interval=base.interval,
+        timeout=base.timeout,
+        proxy=base.proxy,
+        rate_limit_file=base.rate_limit_file,
+        transport=values["transport"],
+        host=values["host"],
+        port=values["port"],
+        log_level=base.log_level,
+        streamable_http_path=base.streamable_http_path,
+        sse_path=base.sse_path,
+        message_path=base.message_path,
+        stateless_http=base.stateless_http,
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Run the MCP server, using stdio by default."""
+
+    args = _build_parser().parse_args(argv)
+    config = _config_from_args(args, WebConfig.from_env())
+    logging.basicConfig(
+        level=getattr(logging, config.log_level),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    # Use a fresh instance so command-line configuration (especially log level)
+    # is reflected in the low-level MCP server metadata/settings.
+    server = create_server(config)
+    if config.transport == "stdio":
+        server.run(transport="stdio")
+    elif config.transport == "sse":
+        server.run(
+            transport="sse",
+            host=config.host,
+            port=config.port,
+            sse_path=config.sse_path,
+            message_path=config.message_path,
+        )
     else:
-        default_provider = "tavily"
-
-if has_tavily or has_deepseek or has_duckduckgo:
-    register_web_search(mcp, default_provider=default_provider)
-
-
-def main() -> None:
-    """Run the MCP server on stdio transport."""
-    mcp.run(transport="stdio")
+        server.run(
+            transport="streamable-http",
+            host=config.host,
+            port=config.port,
+            streamable_http_path=config.streamable_http_path,
+            stateless_http=config.stateless_http,
+        )
 
 
 if __name__ == "__main__":

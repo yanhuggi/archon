@@ -71,24 +71,12 @@ def test_registry_is_isolated(clear_env) -> None:  # noqa: ARG001
     assert _providers == {}
 
 
-@pytest.mark.parametrize(
-    ("name", "cls"),
-    [
-        ("tavily", "server.providers.tavily.TavilyProvider"),
-        ("duckduckgo", "server.providers.duckduckgo.DuckDuckGoProvider"),
-        ("deepseek", "server.providers.deepseek.DeepSeekProvider"),
-    ],
-)
-def test_real_provider_registration(name: str, cls: str) -> None:
-    """Verify that known providers satisfy the SearchProvider protocol."""
+def test_duckduckgo_provider_satisfies_protocol() -> None:
+    """Verify that DuckDuckGoProvider satisfies the SearchProvider protocol."""
     from server.providers import SearchProvider
+    from server.providers.duckduckgo import DuckDuckGoProvider
 
-    # Import and resolve the class
-    mod_path, _, class_name = cls.rpartition(".")
-    import importlib
-    mod = importlib.import_module(mod_path)
-    provider_cls = getattr(mod, class_name)
-    instance = provider_cls()
+    instance = DuckDuckGoProvider()
     assert isinstance(instance, SearchProvider), (
-        f"{cls} does not satisfy the SearchProvider protocol"
+        "DuckDuckGoProvider does not satisfy the SearchProvider protocol"
     )

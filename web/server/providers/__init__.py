@@ -1,8 +1,4 @@
-"""Search provider registry.
-
-.. note::
-    The image provider registry is in ``vision/server/providers/__init__.py``.
-"""
+"""Search provider registry."""
 
 from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
