@@ -135,16 +135,12 @@ def test_analyze_image_default_provider() -> None:
     mock_get.assert_called_once_with("custom_stub")
 
 
-def test_analyze_image_custom_provider_arg() -> None:
-    """analyze_image accepts a provider argument overriding the default."""
-    register("custom_stub", _StubProvider("custom_stub"))
+def test_analyze_image_does_not_expose_provider_argument() -> None:
+    """Provider routing remains an internal server concern."""
+    import inspect
+
     func = _get_analyze_image_func_from_registration("stub")
-
-    with patch("server.tools.analyze_image.get_provider") as mock_get:
-        mock_get.return_value = _StubProvider("custom_stub")
-        func("https://example.com/img.jpg", provider="custom_stub")
-
-    mock_get.assert_called_once_with("custom_stub")
+    assert "provider" not in inspect.signature(func).parameters
 
 
 def test_analyze_image_custom_prompt() -> None:
@@ -165,10 +161,11 @@ def test_analyze_image_custom_prompt() -> None:
 
 def test_analyze_image_unknown_provider() -> None:
     """analyze_image returns JSON error for an unknown provider."""
-    func = _get_analyze_image_func()
-    result = func("https://example.com/img.jpg", provider="nonexistent")
+    func = _get_analyze_image_func_from_registration("nonexistent")
+    result = func("https://example.com/img.jpg")
     data = json.loads(result)
     assert data["error"].startswith("Unknown image provider")
+    assert data["error_code"] == "provider_unavailable"
     assert data["image_url"] == "https://example.com/img.jpg"
     assert data["understanding"] == ""
 
@@ -189,9 +186,24 @@ def test_real_mimo_integration_via_tool(mimo_api_response: dict) -> None:
             mock_client.post.return_value.json.return_value = mimo_api_response
 
             func = _get_analyze_image_func_from_registration("mimo")
-            result = func("https://example.com/sunset.jpg", provider="mimo")
+            result = func("https://example.com/sunset.jpg")
             data = json.loads(result)
 
     assert data["image_url"] == "https://example.com/sunset.jpg"
     assert "日落" in data["understanding"]
     assert data["model"] == "mimo-v2.5"
+
+
+def test_analyze_image_rejects_empty_prompt() -> None:
+    func = _get_analyze_image_func()
+    data = json.loads(func("https://example.com/img.jpg", prompt="   "))
+    assert data["error_code"] == "invalid_prompt"
+
+
+def test_analyze_image_handles_invalid_provider_json() -> None:
+    func = _get_analyze_image_func()
+    provider = MagicMock()
+    provider.understand.return_value = "not-json"
+    with patch("server.tools.analyze_image.get_provider", return_value=provider):
+        data = json.loads(func("https://example.com/img.jpg"))
+    assert data["error_code"] == "invalid_provider_response"

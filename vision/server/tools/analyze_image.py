@@ -1,69 +1,113 @@
-"""analyze_image tool definition."""
+"""The public ``analyze_image`` MCP tool."""
+
+from __future__ import annotations
 
 import json
-import sys
+import logging
+from typing import Annotated
 
 from mcp.server import MCPServer
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
+from server.instructions import ANALYZE_IMAGE_DESCRIPTION
 from server.providers import get_provider
+from server.providers.mimo import DEFAULT_PROMPT, display_image_source
+
+
+LOGGER = logging.getLogger(__name__)
+MAX_PROMPT_LENGTH = 4000
+
+
+def _error_response(image_source: object, prompt: object, code: str, message: str) -> str:
+    return json.dumps(
+        {
+            "image_url": display_image_source(image_source if isinstance(image_source, str) else ""),
+            "prompt": prompt if isinstance(prompt, str) else "",
+            "understanding": "",
+            "error": message,
+            "error_code": code,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _ensure_response(raw: object, image_source: str, prompt: str) -> str:
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return _error_response(image_source, prompt, "invalid_provider_response", "Provider returned invalid JSON")
+    elif isinstance(raw, dict):
+        data = raw
+    else:
+        return _error_response(
+            image_source,
+            prompt,
+            "invalid_provider_response",
+            "Provider returned an unsupported response",
+        )
+    if not isinstance(data, dict):
+        return _error_response(image_source, prompt, "invalid_provider_response", "Provider response must be an object")
+    data.setdefault("image_url", display_image_source(image_source))
+    data.setdefault("prompt", prompt)
+    data.setdefault("understanding", "")
+    return json.dumps(data, ensure_ascii=False)
 
 
 def register(mcp: MCPServer, default_provider: str = "mimo") -> None:
-    """Register the analyze_image tool on the given MCP server.
-
-    Args:
-        mcp: The MCPServer instance.
-        default_provider: Default image provider to use when not specified.
-    """
+    """Register the single-provider image analysis tool."""
 
     @mcp.tool(
-        description=(
-            "Analyze and describe images: photos, screenshots, diagrams, charts, "
-            "UI mockups, scanned documents, or any visual content. Supports image "
-            "URLs, base64 data URIs, and local file paths (@prefix). "
-            "MUST use this tool when the user: provides an image URL or file path "
-            "and asks about its content; asks 'what's in this image' or similar; "
-            "shares a screenshot for debugging or review; wants OCR text extraction "
-            "from an image; needs a diagram, chart, or UI mockup described. "
-            "Use the 'prompt' parameter to ask specific questions about the image "
-            "(e.g. 'What objects are in this photo?', 'Read the error message')."
-        )
+        name="analyze_image",
+        title="Analyze Image",
+        description=ANALYZE_IMAGE_DESCRIPTION,
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+        structured_output=False,
     )
     def analyze_image(
-        image_source: str,
-        prompt: str = "请详细描述这张图片的内容",
-        provider: str = default_provider,
+        image_source: Annotated[
+            str,
+            Field(min_length=1, description="Image URL, base64 data URI, or authorized JPEG/PNG path."),
+        ],
+        prompt: Annotated[
+            str,
+            Field(min_length=1, max_length=MAX_PROMPT_LENGTH, description="Focused visual question."),
+        ] = DEFAULT_PROMPT,
     ) -> str:
-        """Analyze an image and return a textual description of its content.
+        """Analyze one image and return a stable JSON result envelope."""
 
-        Args:
-            image_source: The image to analyze. Can be an HTTP/HTTPS URL,
-                a base64 data URI (data:image/...;base64,...), or a local file
-                path optionally prefixed with @ (e.g. @screenshot.png).
-            prompt: Question or instruction about the image content.
-            provider: Vision backend to use. Currently only "mimo" is supported.
-
-        Returns:
-            JSON string with image_url, prompt, understanding, model, and
-            optional reasoning_content.
-        """
-        try:
-            p = get_provider(provider)
-        except ValueError as e:
-            return json.dumps({
-                "image_url": image_source,
-                "prompt": prompt,
-                "understanding": "",
-                "error": str(e),
-            }, ensure_ascii=False)
+        if not isinstance(image_source, str) or not image_source.strip():
+            return _error_response(image_source, prompt, "invalid_image_source", "image_source must not be empty")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return _error_response(image_source, prompt, "invalid_prompt", "prompt must not be empty")
+        normalized_prompt = prompt.strip()
+        if len(normalized_prompt) > MAX_PROMPT_LENGTH:
+            return _error_response(
+                image_source,
+                normalized_prompt,
+                "invalid_prompt",
+                f"prompt must be at most {MAX_PROMPT_LENGTH} characters",
+            )
 
         try:
-            return p.understand(image_source, prompt=prompt)
-        except Exception as e:
-            print(f"Error: analyze_image failed: {e}", file=sys.stderr)
-            return json.dumps({
-                "image_url": image_source,
-                "prompt": prompt,
-                "understanding": "",
-                "error": f"{type(e).__name__}: {e}",
-            }, ensure_ascii=False)
+            provider = get_provider(default_provider)
+        except ValueError as exc:
+            return _error_response(image_source, normalized_prompt, "provider_unavailable", str(exc))
+
+        try:
+            raw = provider.understand(image_source.strip(), prompt=normalized_prompt)
+        except Exception as exc:  # pragma: no cover - defensive provider boundary
+            LOGGER.exception("analyze_image provider failed")
+            return _error_response(
+                image_source,
+                normalized_prompt,
+                "provider_error",
+                f"Image provider failed: {type(exc).__name__}: {exc}",
+            )
+        return _ensure_response(raw, image_source, normalized_prompt)

@@ -19,7 +19,18 @@ def clear_env(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
     from server.providers import _providers
 
     _providers.clear()
-    for k in ("MIMO_API_KEY", "MIMO_BASE_URL", "MIMO_MODEL"):
+    for k in (
+        "MIMO_API_KEY",
+        "MIMO_BASE_URL",
+        "MIMO_MODEL",
+        "MIMO_TIMEOUT",
+        "MIMO_MAX_TOKENS",
+        "MIMO_MAX_IMAGE_MB",
+        "ARCHON_VISION_TRANSPORT",
+        "ARCHON_VISION_HOST",
+        "ARCHON_VISION_PORT",
+        "ARCHON_VISION_LOG_LEVEL",
+    ):
         monkeypatch.delenv(k, raising=False)
 
     # Relax the allowed directory for tests so tmp_path works

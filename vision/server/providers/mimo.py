@@ -1,338 +1,359 @@
-"""MiMo vision provider — image understanding via 小米 MiMo API."""
+"""MiMo image-understanding provider."""
+
+from __future__ import annotations
 
 import base64
+import binascii
 import json
+import logging
 import os
+import re
 import stat
-import sys
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
 
 import httpx
 
-# MiMo 官方 BASE_URL（OpenAI 兼容）: https://api.xiaomimimo.com/v1
-# 代码自动拼接 /chat/completions 得到完整 API 路径。
-# 可通过 MIMO_BASE_URL 环境变量覆盖。
-_MIMO_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-DEFAULT_MODEL = "mimo-v2.5"
+from server.config import DEFAULT_MAX_IMAGE_MB, DEFAULT_MODEL, VisionConfig
+
+
+LOGGER = logging.getLogger(__name__)
 DEFAULT_PROMPT = "请详细描述这张图片的内容"
-
-# MiMo API limit: 50 MB per image (raw file size, before Base64 encoding).
-# Base64 expands payload by ~1.37×, but the limit applies to the original
-# file on disk, not the encoded data URI. Keep this as-is.
-_MAX_IMAGE_SIZE = 50 * 1024 * 1024
-
-# Max size for inline data URIs (base64-decoded size) — prevents malicious
-# or accidentally-huge inline payloads from being processed.
-_MAX_DATA_URI_SIZE = 20 * 1024 * 1024
-
-# Supported image formats and their MIME types
+_MAX_IMAGE_SIZE = DEFAULT_MAX_IMAGE_MB * 1024 * 1024
 _IMAGE_EXT_MIME = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".png": "image/png",
 }
-
-# Warning shown when a local file is uploaded to a third-party API
-_LOCAL_FILE_UPLOAD_WARNING = (
-    "You are about to read a local file and send its content to a third-party API "
-    "(小米 MiMo). Only proceed if the file does not contain sensitive information."
-)
+_DATA_URI_RE = re.compile(r"^data:(image/(?:jpeg|png));base64,([A-Za-z0-9+/]*={0,2})$")
+_WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
-def _get_allowed_dir() -> Path:
-    """Return the allowed base directory for local file reads.
+def display_image_source(source: str) -> str:
+    """Return a compact, non-payload representation for MCP responses."""
 
-    Reads MIMO_ALLOWED_DIR from environment at call time (not import time),
-    so runtime changes to the env var take effect.
-
-    When MIMO_ALLOWED_DIR is set, only paths under that directory are allowed.
-    When it is not set, path restriction is disabled — any readable local file
-    can be processed. This is a local-only MCP tool; the user has full control
-    over which files are passed to it.
-    """
-    raw = os.environ.get("MIMO_ALLOWED_DIR", "").strip()
-    if raw:
-        return Path(os.path.realpath(raw))
-    return Path("/")
+    value = source[1:] if source.startswith("@") else source
+    if value.startswith("data:"):
+        header, separator, _payload = value.partition(",")
+        return f"{header},<omitted>" if separator else "data:<invalid>"
+    return value
 
 
-def _validate_path_safe(resolved: Path) -> None:
-    """Validate that a resolved path is within the allowed directory.
+def _get_allowed_dir(config: VisionConfig | None = None) -> Path:
+    """Return the configured local-file boundary."""
 
-    Args:
-        resolved: A real, resolved absolute Path.
+    return (config or VisionConfig.from_env()).allowed_dir
 
-    Raises:
-        ValueError: If the path escapes the allowed directory.
-    """
-    allowed = _get_allowed_dir()
+
+def _validate_path_safe(resolved: Path, config: VisionConfig | None = None) -> None:
+    allowed = _get_allowed_dir(config)
     if not resolved.is_relative_to(allowed):
         raise ValueError(
             f"Access denied: path '{resolved}' is outside the allowed directory "
-            f"'{allowed}'. Set MIMO_ALLOWED_DIR to a broader scope if needed."
+            f"'{allowed}'. Set MIMO_ALLOWED_DIR to the required directory."
         )
 
 
-def process_image_source(source: str) -> str:
-    """Normalize an image source to a URL or data URI usable by the API.
+def _local_path_from_file_url(source: str) -> str:
+    parsed = urlparse(source)
+    if os.name == "nt":  # pragma: no cover - exercised on Windows
+        path = url2pathname(unquote(parsed.path))
+        return f"//{parsed.netloc}{path}" if parsed.netloc else path
+    if parsed.netloc not in {"", "localhost"}:
+        raise ValueError("Remote file URLs are not supported")
+    return unquote(parsed.path)
 
-    Handles three input types:
-    1. HTTP/HTTPS URLs → pass through as-is
-    2. Base64 data URIs → pass through as-is (with size validation)
-    3. Local file paths → resolve, validate scope, read, encode as base64 data URI
 
-    Also strips a leading ``@`` prefix if present (common in MCP tool calls).
+def _validate_image_signature(data: bytes, mime: str) -> None:
+    if mime == "image/jpeg" and not data.startswith(b"\xff\xd8\xff"):
+        raise ValueError("File content does not match JPEG format")
+    if mime == "image/png" and not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("File content does not match PNG format")
 
-    SECURITY: Local files are read and encoded, then sent to a third-party API
-    (小米 MiMo). This is deliberate — the caller is responsible for ensuring
-    the file does not contain sensitive information.
 
-    Args:
-        source: Image URL, data URI, or local file path.
+def process_image_source(source: str, config: VisionConfig | None = None) -> str:
+    """Validate an image source and convert local files to base64 data URIs."""
 
-    Returns:
-        A URL string (http/https) or base64 data URI (data:image/...;base64,...).
-
-    Raises:
-        FileNotFoundError: If a local file path does not exist.
-        ValueError: If the file format is not supported, path escapes the
-                    allowed directory, or the data URI is too large.
-    """
-    # Strip @ prefix if present (common from MCP clients like Claude Desktop)
+    config = config or VisionConfig.from_env()
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("Image source must not be empty")
+    source = source.strip()
     if source.startswith("@"):
         source = source[1:]
 
-    # Already a data URI — validate size and pass through
     if source.startswith("data:"):
+        match = _DATA_URI_RE.fullmatch(source)
+        if match is None:
+            raise ValueError("Invalid data URI; only base64 JPEG and PNG images are supported")
+        mime, encoded = match.groups()
+        if not encoded:
+            raise ValueError("Empty data URI payload")
+        max_encoded_size = ((config.max_image_size + 2) // 3) * 4
+        if len(encoded) > max_encoded_size:
+            raise ValueError(
+                f"Data URI payload too large. Maximum decoded size: "
+                f"{config.max_image_size / 1024 / 1024:.0f} MB."
+            )
         try:
-            header, _, encoded = source.partition(",")
-            if not encoded:
-                raise ValueError("Empty data URI payload")
-            # Rough base64 decoded size estimate: len(encoded) * 0.75
-            decoded_size = int(len(encoded) * 0.75)
-            if decoded_size > _MAX_DATA_URI_SIZE:
-                raise ValueError(
-                    f"Data URI payload too large: ~{decoded_size / 1024 / 1024:.1f} MB. "
-                    f"Maximum allowed: {_MAX_DATA_URI_SIZE / 1024 / 1024:.0f} MB."
-                )
-        except (ValueError, IndexError):
-            raise ValueError(f"Invalid data URI format")
+            decoded = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("Invalid base64 image payload") from exc
+        if len(decoded) > config.max_image_size:
+            raise ValueError(
+                f"Data URI payload too large. Maximum decoded size: "
+                f"{config.max_image_size / 1024 / 1024:.0f} MB."
+            )
+        _validate_image_signature(decoded, mime)
         return source
 
-    # HTTP/HTTPS URL — pass through (MiMo API accepts URLs directly)
-    if source.startswith(("http://", "https://")):
-        return source
-
-    # file:// URL — extract local path and process as local file
     if source.startswith("file://"):
-        import urllib.parse
-        source = urllib.parse.urlparse(source).path
-        # Fall through to local file handling below
+        source = _local_path_from_file_url(source)
+    else:
+        parsed = urlparse(source)
+        is_windows_path = os.name == "nt" and _WINDOWS_DRIVE_PATH_RE.match(source) is not None
+        if parsed.scheme and not is_windows_path:
+            if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("Image URL must use http or https")
+            return source
 
-    # Local file path — resolve, validate scope, warn, then open
-    print(_LOCAL_FILE_UPLOAD_WARNING, file=sys.stderr)
     resolved = Path(os.path.realpath(source))
+    _validate_path_safe(resolved, config)
 
-    # Validate path safety BEFORE any format-specific checks
-    _validate_path_safe(resolved)
-
-    # Open the file, then verify it's the same inode we resolved — this
-    # prevents TOCTOU (the file at `resolved` could have been swapped
-    # between our validation and open). After opening, the fd pins the
-    # inode so no further race exists.
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     try:
-        fd = os.open(str(resolved), os.O_RDONLY)
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Local image file does not exist: {source}")
-    except OSError as e:
-        raise ValueError(f"Cannot open file: {e}")
+        fd = os.open(str(resolved), flags)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Local image file does not exist: {source}") from exc
+    except OSError as exc:
+        raise ValueError(f"Cannot open local image: {exc}") from exc
 
     try:
         opened_stat = os.fstat(fd)
-        resolved_stat = os.stat(resolved)
-        if (opened_stat.st_dev, opened_stat.st_ino) != (resolved_stat.st_dev, resolved_stat.st_ino):
-            raise ValueError(f"File changed after validation (possible symlink swap): {resolved}")
-        _validate_path_safe(Path(os.path.realpath(resolved)))
-
-        mode = os.fstat(fd).st_mode
-        if not stat.S_ISREG(mode):
+        if not stat.S_ISREG(opened_stat.st_mode):
             raise ValueError(f"Not a regular file: {resolved}")
 
-        # Check file extension and MIME type
+        # Confirm that validation and opening resolved to the same file.
+        current_stat = os.stat(resolved)
+        if (opened_stat.st_dev, opened_stat.st_ino) != (current_stat.st_dev, current_stat.st_ino):
+            raise ValueError(f"File changed while being opened: {resolved}")
+        _validate_path_safe(Path(os.path.realpath(resolved)), config)
+
         ext = resolved.suffix.lower()
         if not ext:
             raise ValueError(
-                f"Local file has no extension: {source!r}. "
-                f"Supported formats: {', '.join(_IMAGE_EXT_MIME)}"
+                f"Local file has no extension: {source!r}. Supported formats: "
+                f"{', '.join(_IMAGE_EXT_MIME)}"
             )
         mime = _IMAGE_EXT_MIME.get(ext)
         if mime is None:
             raise ValueError(f"Unsupported image format: {ext}. Supported: {', '.join(_IMAGE_EXT_MIME)}")
-
-        file_size = os.fstat(fd).st_size
-        if file_size > _MAX_IMAGE_SIZE:
+        if opened_stat.st_size > config.max_image_size:
             raise ValueError(
-                f"Image file too large: {file_size / 1024 / 1024:.1f} MB. "
-                f"MiMo API limit is {_MAX_IMAGE_SIZE / 1024 / 1024:.0f} MB."
+                f"Image file too large: {opened_stat.st_size / 1024 / 1024:.1f} MB. "
+                f"Maximum allowed: {config.max_image_size / 1024 / 1024:.0f} MB."
             )
-        image_data = os.read(fd, file_size)
+
+        chunks: list[bytes] = []
+        remaining = opened_stat.st_size
+        while remaining:
+            chunk = os.read(fd, min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        image_data = b"".join(chunks)
+        if len(image_data) != opened_stat.st_size:
+            raise ValueError("Local image changed or could not be read completely")
+        _validate_image_signature(image_data, mime)
     finally:
         os.close(fd)
 
-    encoded = base64.b64encode(image_data).decode("utf-8")
+    encoded = base64.b64encode(image_data).decode("ascii")
     return f"data:{mime};base64,{encoded}"
 
 
+def _error_response(
+    image_source: str,
+    prompt: str,
+    model: str,
+    code: str,
+    message: str,
+) -> str:
+    return json.dumps(
+        {
+            "image_url": display_image_source(image_source),
+            "prompt": prompt,
+            "understanding": "",
+            "model": model,
+            "error": message,
+            "error_code": code,
+        },
+        ensure_ascii=False,
+    )
+
+
 class MimoVisionProvider:
-    """Image understanding provider backed by 小米 MiMo vision model.
+    """Image understanding through MiMo's OpenAI-compatible endpoint."""
 
-    Uses the OpenAI-compatible chat completions endpoint with image support.
-    Requires MIMO_API_KEY environment variable.
-    """
-
-    def __init__(self) -> None:
+    def __init__(self, config: VisionConfig | None = None) -> None:
+        self._fixed_config = config
         self._http_client: httpx.Client | None = None
+        self._client_timeout: float | None = None
         self._client_lock = threading.Lock()
 
+    def _config(self) -> VisionConfig:
+        return self._fixed_config or VisionConfig.from_env()
+
     def close(self) -> None:
-        """Close the underlying HTTP client and release pooled connections."""
         with self._client_lock:
             if self._http_client is not None:
                 self._http_client.close()
                 self._http_client = None
+                self._client_timeout = None
 
-    def _get_client(self) -> httpx.Client:
-        """Return (or lazily create) the shared HTTP client with connection pooling."""
+    def _get_client(self, config: VisionConfig | None = None) -> httpx.Client:
+        config = config or self._config()
         with self._client_lock:
-            if self._http_client is None:
-                self._http_client = httpx.Client(timeout=120)
+            if self._http_client is None or self._client_timeout != config.timeout:
+                if self._http_client is not None:
+                    self._http_client.close()
+                self._http_client = httpx.Client(timeout=config.timeout)
+                self._client_timeout = config.timeout
             return self._http_client
 
     def _api_url(self) -> str:
-        base = os.environ.get("MIMO_BASE_URL") or _MIMO_DEFAULT_BASE_URL
-        return base.rstrip("/") + "/chat/completions"
+        return self._config().base_url.rstrip("/") + "/chat/completions"
 
-    def _model(self, **kwargs) -> str:
-        return kwargs.get("model") or os.environ.get("MIMO_MODEL") or DEFAULT_MODEL
+    def _model(self, **kwargs: object) -> str:
+        value = kwargs.get("model")
+        return str(value).strip() if value else self._config().model
 
     def _api_key(self) -> str | None:
-        return os.environ.get("MIMO_API_KEY")
+        return self._config().api_key
 
-    def understand(self, image_source: str, prompt: str = DEFAULT_PROMPT, **kwargs) -> str:
-        """Analyze an image and return understanding.
+    def understand(self, image_source: str, prompt: str = DEFAULT_PROMPT, **kwargs: object) -> str:
+        """Analyze one validated image and return a stable JSON envelope."""
 
-        Args:
-            image_source: Image URL (http/https), data URI (data:image/...;base64,...),
-                          or local file path. Local paths may be prefixed with ``@``
-                          (e.g. ``@screenshot.png`` or ``@/path/to/image.jpg``).
-            prompt: Question or instruction about the image.
-            **kwargs: Additional options including 'model'.
-
-        Returns:
-            JSON string with image_url, prompt, understanding, and model.
-        """
-        # response_source: used for display in response (strip @ prefix only)
-        # processed_url: actual URL/data URI sent to the API
-        response_source = image_source.lstrip("@")
-
-        api_key = self._api_key()
-        if not api_key:
-            return json.dumps({
-                "image_url": response_source,
-                "prompt": prompt,
-                "understanding": "",
-                "error": "MIMO_API_KEY not set",
-            }, ensure_ascii=False)
-        try:
-            processed_url = process_image_source(image_source)
-        except (FileNotFoundError, ValueError, OSError) as e:
-            return json.dumps({
-                "image_url": response_source,
-                "prompt": prompt,
-                "understanding": "",
-                "error": f"Image source error: {e}",
-            }, ensure_ascii=False)
-
+        config = self._config()
         model = self._model(**kwargs)
+        prompt = prompt.strip() if isinstance(prompt, str) else ""
+        if not prompt:
+            return _error_response(image_source, prompt, model, "invalid_prompt", "prompt must not be empty")
+        if not config.api_key:
+            return _error_response(
+                image_source,
+                prompt,
+                model,
+                "configuration_error",
+                "MIMO_API_KEY is not configured",
+            )
 
+        try:
+            processed_url = process_image_source(image_source, config)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            return _error_response(
+                image_source,
+                prompt,
+                model,
+                "invalid_image_source",
+                f"Image source error: {exc}",
+            )
+
+        max_tokens_value = kwargs.get("max_tokens", config.max_completion_tokens)
+        try:
+            max_tokens = min(max(int(max_tokens_value), 1), 16384)
+        except (TypeError, ValueError, OverflowError):
+            max_tokens = config.max_completion_tokens
         body: dict[str, Any] = {
             "model": model,
             "messages": [
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": processed_url},
-                        },
+                        {"type": "image_url", "image_url": {"url": processed_url}},
                         {"type": "text", "text": prompt},
                     ],
                 }
             ],
-            "max_completion_tokens": kwargs.get("max_tokens", 2048),
+            "max_completion_tokens": max_tokens,
         }
 
         try:
-            client = self._get_client()
-            resp = client.post(
-                self._api_url(),
+            response = self._get_client(config).post(
+                config.base_url.rstrip("/") + "/chat/completions",
                 headers={
-                    "api-key": api_key,
+                    "api-key": config.api_key,
+                    "Accept": "application/json",
                     "Content-Type": "application/json",
                 },
                 json=body,
             )
-            resp.raise_for_status()
-            data = resp.json()
-            return self._format(response_source, prompt, model, data)
+            response.raise_for_status()
+            data = response.json()
+            return self._format(image_source, prompt, model, data)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            code = "authentication_error" if status in {401, 403} else "rate_limited" if status == 429 else "upstream_error"
+            LOGGER.warning("MiMo returned HTTP %d", status)
+            return _error_response(image_source, prompt, model, code, f"MiMo returned HTTP {status}")
+        except httpx.RequestError as exc:
+            LOGGER.warning("MiMo request failed: %s", exc)
+            return _error_response(image_source, prompt, model, "upstream_error", f"Request failed: {exc}")
+        except Exception as exc:
+            LOGGER.exception("MiMo image analysis failed")
+            return _error_response(
+                image_source,
+                prompt,
+                model,
+                "provider_error",
+                f"{type(exc).__name__}: {exc}",
+            )
 
-        except httpx.HTTPStatusError as e:
-            print(f"Error: MiMo HTTP {e.response.status_code}: {e.response.text[:200]}", file=sys.stderr)
-            return json.dumps({
-                "image_url": response_source,
-                "prompt": prompt,
-                "understanding": "",
-                "error": f"HTTP {e.response.status_code}: {e.response.text[:500]}",
-            }, ensure_ascii=False)
-        except httpx.RequestError as e:
-            print(f"Error: MiMo request failed: {e}", file=sys.stderr)
-            return json.dumps({
-                "image_url": response_source,
-                "prompt": prompt,
-                "understanding": "",
-                "error": f"Request failed: {e}",
-            }, ensure_ascii=False)
-        except Exception as e:
-            print(f"Error: MiMo vision failed: {e}", file=sys.stderr)
-            return json.dumps({
-                "image_url": response_source,
-                "prompt": prompt,
-                "understanding": "",
-                "error": f"{type(e).__name__}: {e}",
-            }, ensure_ascii=False)
-
-    def _format(self, image_source: str, prompt: str, model: str, data: dict) -> str:
-        """Extract the text response from MiMo API result."""
-        understanding = ""
-        reasoning_content = ""
-
-        choices = data.get("choices", [])
-        if choices:
-            message = choices[0].get("message", {})
-            understanding = (message.get("content") or "").strip()
-            reasoning = message.get("reasoning_content")
-            if reasoning:
-                reasoning_content = reasoning.strip()
+    def _format(self, image_source: str, prompt: str, model: str, data: object) -> str:
+        if not isinstance(data, Mapping):
+            return _error_response(
+                image_source,
+                prompt,
+                model,
+                "invalid_provider_response",
+                "MiMo returned a non-object response",
+            )
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):
+            return _error_response(
+                image_source,
+                prompt,
+                model,
+                "invalid_provider_response",
+                "MiMo response contains no usable choice",
+            )
+        message = choices[0].get("message")
+        if not isinstance(message, Mapping):
+            return _error_response(
+                image_source,
+                prompt,
+                model,
+                "invalid_provider_response",
+                "MiMo response contains no message",
+            )
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return _error_response(
+                image_source,
+                prompt,
+                model,
+                "invalid_provider_response",
+                "MiMo response contains no analysis text",
+            )
 
         result = {
-            "image_url": image_source,
+            "image_url": display_image_source(image_source),
             "prompt": prompt,
-            "understanding": understanding,
+            "understanding": content.strip(),
             "model": model,
         }
-        if reasoning_content:
-            result["reasoning_content"] = reasoning_content
-
         return json.dumps(result, ensure_ascii=False)

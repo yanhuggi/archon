@@ -33,6 +33,11 @@ def test_process_url_passthrough() -> None:
     assert process_image_source("http://pic.com/photo.png") == "http://pic.com/photo.png"
 
 
+def test_process_rejects_unsupported_url_scheme() -> None:
+    with pytest.raises(ValueError, match="http or https"):
+        process_image_source("ftp://example.com/image.png")
+
+
 def test_process_strips_at_prefix_url() -> None:
     """@ prefix is stripped from URLs."""
     assert process_image_source("@https://example.com/img.jpg") == "https://example.com/img.jpg"
@@ -42,6 +47,18 @@ def test_process_data_uri_passthrough() -> None:
     """Base64 data URIs pass through unchanged."""
     uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNjN9GQAAAABJRU5ErkJggg=="
     assert process_image_source(uri) == uri
+
+
+def test_process_data_uri_rejects_non_image_and_bad_base64() -> None:
+    with pytest.raises(ValueError, match="only base64 JPEG and PNG"):
+        process_image_source("data:text/plain;base64,aGVsbG8=")
+    with pytest.raises(ValueError, match="only base64 JPEG and PNG"):
+        process_image_source("data:image/png;base64,not-valid!")
+
+
+def test_process_data_uri_rejects_mismatched_signature() -> None:
+    with pytest.raises(ValueError, match="does not match PNG"):
+        process_image_source("data:image/png;base64,aGVsbG8=")
 
 
 def test_process_strips_at_prefix_data_uri() -> None:
@@ -132,7 +149,8 @@ def test_missing_api_key(provider: MimoVisionProvider) -> None:
     """understand returns error JSON when MIMO_API_KEY is not set."""
     result = provider.understand("https://example.com/img.jpg")
     data = json.loads(result)
-    assert data["error"] == "MIMO_API_KEY not set"
+    assert data["error"] == "MIMO_API_KEY is not configured"
+    assert data["error_code"] == "configuration_error"
     assert data["understanding"] == ""
 
 
@@ -141,7 +159,7 @@ def test_missing_api_key_custom_prompt(provider: MimoVisionProvider) -> None:
     result = provider.understand("https://example.com/img.jpg", prompt="图中有什么？")
     data = json.loads(result)
     assert data["prompt"] == "图中有什么？"
-    assert data["error"] == "MIMO_API_KEY not set"
+    assert data["error"] == "MIMO_API_KEY is not configured"
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +188,7 @@ def test_successful_understanding_with_reasoning(
     provider: MimoVisionProvider,
     mimo_api_response_with_reasoning: dict,
 ) -> None:
-    """understand includes reasoning_content when present."""
+    """Provider reasoning is not exposed in the public result."""
     with patch.dict("os.environ", {"MIMO_API_KEY": "test-key"}):
         with patch("httpx.Client") as mock_client_cls:
             mock_client = mock_client_cls.return_value
@@ -180,8 +198,8 @@ def test_successful_understanding_with_reasoning(
             result = provider.understand("https://example.com/sunset.jpg")
             data = json.loads(result)
 
-    assert "reasoning_content" in data
-    assert data["reasoning_content"] == "用户展示了一张图片，我需要分析其内容..."
+    assert "reasoning_content" not in data
+    assert "日落" in data["understanding"]
 
 
 def test_custom_prompt(provider: MimoVisionProvider,
@@ -227,7 +245,7 @@ def test_base64_image(provider: MimoVisionProvider,
             result = provider.understand(data_uri)
             data = json.loads(result)
 
-    assert data["image_url"] == data_uri
+    assert data["image_url"] == "data:image/png;base64,<omitted>"
     assert "日落" in data["understanding"]
 
 
@@ -447,6 +465,7 @@ def test_http_401_error(provider: MimoVisionProvider) -> None:
     assert "401" in data["error"]
     assert data["understanding"] == ""
     assert data["image_url"] == "https://example.com/img.jpg"
+    assert data["error_code"] == "authentication_error"
 
 
 def test_http_429_error(provider: MimoVisionProvider) -> None:
@@ -465,6 +484,7 @@ def test_http_429_error(provider: MimoVisionProvider) -> None:
             data = json.loads(result)
 
     assert "429" in data["error"]
+    assert data["error_code"] == "rate_limited"
 
 
 def test_request_error(provider: MimoVisionProvider) -> None:
@@ -492,6 +512,7 @@ def test_empty_response(provider: MimoVisionProvider) -> None:
             data = json.loads(result)
 
     assert data["understanding"] == ""
+    assert data["error_code"] == "invalid_provider_response"
 
 
 def test_empty_choices(provider: MimoVisionProvider) -> None:
@@ -510,6 +531,7 @@ def test_empty_choices(provider: MimoVisionProvider) -> None:
             data = json.loads(result)
 
     assert data["understanding"] == ""
+    assert data["error_code"] == "invalid_provider_response"
 
 
 # ---------------------------------------------------------------------------
@@ -675,4 +697,3 @@ def test_provider_protocol_runtime_checkable() -> None:
 
     provider = MimoVisionProvider()
     assert isinstance(provider, ImageProvider)
-
