@@ -17,6 +17,18 @@ class JiraProvider(Protocol):
         """Execute a JQL search and return formatted result string."""
         ...
 
+    def search_jql_fields(
+        self, query: str = "", max_results: int = 50, start_at: int = 0, refresh: bool = False, **kwargs
+    ) -> str:
+        """Discover JQL field metadata from the current Jira instance."""
+        ...
+
+    def get_jql_value_suggestions(
+        self, field: str, query: str = "", max_results: int = 50, refresh: bool = False, **kwargs
+    ) -> str:
+        """Get Jira-provided candidate values for one JQL field."""
+        ...
+
     def get_issue(self, issue_key: str, **kwargs) -> str:
         """Get full issue details and return formatted result string."""
         ...

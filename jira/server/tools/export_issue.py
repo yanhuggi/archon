@@ -1,160 +1,192 @@
-"""export_issue tool definition."""
+"""The public ``export_issue`` MCP tool."""
+
+from __future__ import annotations
 
 import json
+import re
 import tempfile
 from pathlib import Path
+from typing import Annotated
 
 from docx import Document
-from docx.shared import Pt
 from mcp.server import MCPServer
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
-from server.providers import get_provider
+from server.config import JiraConfig
+from server.files import OutputPathError, commit_output_file, resolve_output_path
+from server.instructions import EXPORT_ISSUE_DESCRIPTION
+from server.tools._common import error_response, provider_or_error
+from server.tools.get_issue import ISSUE_KEY_RE
+
+MAX_EMBEDDED_TEXT_CHARS = 200_000
+_INVALID_XML_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
-def register(mcp: MCPServer, default_provider: str = "jira") -> None:
-    """Register the export_issue tool on the given MCP server.
+def _text(value: object) -> str:
+    return "" if value is None else _INVALID_XML_CHARS_RE.sub("", str(value))
 
-    Args:
-        mcp: The MCPServer instance.
-        default_provider: Default Jira provider to use when not specified.
-    """
 
+def register(
+    mcp: MCPServer,
+    default_provider: str = "jira",
+    config: JiraConfig | None = None,
+) -> None:
     @mcp.tool(
-        description=(
-            "Export a Jira issue to a .docx file with all details and attachment content. "
-            "Use this tool when: the user wants to save issue information as a Word document; "
-            "they need to include all issue details, descriptions, links, and attachment content "
-            "in a formatted document; they need an offline copy of the issue for review or sharing. "
-            "The export includes issue metadata, description, subtasks, issue links, and attachment "
-            "content (text files are embedded, binary files are referenced)."
-        )
+        name="export_issue",
+        title="Export Jira Issue",
+        description=EXPORT_ISSUE_DESCRIPTION,
+        annotations=ToolAnnotations(
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
+        structured_output=False,
     )
     def export_issue(
-        issue_key: str,
-        save_to: str,
+        issue_key: Annotated[str, Field(min_length=3, max_length=100)],
+        save_to: Annotated[str, Field(min_length=1, max_length=4096, description="Authorized local .docx path.")],
         include_attachments: bool = True,
-        provider: str = default_provider,
     ) -> str:
-        """Export a Jira issue to a .docx file.
+        normalized_key = issue_key.strip().upper() if isinstance(issue_key, str) else ""
+        if not ISSUE_KEY_RE.fullmatch(normalized_key):
+            return error_response("invalid_issue_key", f"Invalid issue key: {issue_key!r}", issue_key=normalized_key)
 
-        Args:
-            issue_key: Jira issue key (e.g. 'PROJ-123').
-            save_to: Local file path to save the .docx file to.
-            include_attachments: Whether to include attachment content in the document.
-            provider: Jira provider backend to use.
-
-        Returns:
-            JSON string with saved_to path, filename, size, and summary of exported content.
-        """
+        runtime_config = config or JiraConfig.from_env()
         try:
-            p = get_provider(provider)
-        except ValueError as e:
-            return json.dumps({"error": str(e)}, ensure_ascii=False)
+            save_path = resolve_output_path(save_to, runtime_config, suffix=".docx")
+        except OutputPathError as exc:
+            return error_response("invalid_output_path", str(exc), issue_key=normalized_key)
 
-        save_path = Path(save_to).with_suffix(".docx")
-
-        # Get issue details
-        issue_json = p.get_issue_json(issue_key)
-        if "error" in issue_json:
-            return json.dumps(issue_json, ensure_ascii=False)
-
+        provider, error = provider_or_error(default_provider)
+        if error:
+            return error_response("provider_unavailable", "Jira provider is unavailable", issue_key=normalized_key)
         try:
-            doc = Document()
+            issue = provider.get_issue_json(normalized_key)
+        except Exception as exc:  # noqa: BLE001 - provider boundary
+            return error_response(
+                "provider_error",
+                f"Jira provider failed: {type(exc).__name__}: {exc}",
+                issue_key=normalized_key,
+            )
+        if not isinstance(issue, dict):
+            return error_response(
+                "invalid_provider_response",
+                "Jira provider returned an invalid issue object",
+                issue_key=normalized_key,
+            )
+        if "error" in issue:
+            issue.setdefault("issue_key", normalized_key)
+            issue.setdefault("error_code", "provider_error")
+            return json.dumps(issue, ensure_ascii=False)
 
-            # Title
-            doc.add_heading(f"{issue_key} - {issue_json.get('summary', '')}", 0)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_doc: Path | None = None
+        try:
+            document = Document()
+            document.add_heading(f"{normalized_key} - {_text(issue.get('summary'))}", 0)
 
-            # Metadata section
-            doc.add_heading("Issue Details", level=1)
-            table = doc.add_table(rows=0, cols=2)
-            table.style = 'Table Grid'
-
-            metadata = [
-                ("Type", issue_json.get("issue_type", "")),
-                ("Status", issue_json.get("status", "")),
-                ("Priority", issue_json.get("priority", "")),
-                ("Assignee", issue_json.get("assignee", "Unassigned")),
-                ("Reporter", issue_json.get("reporter", "")),
-                ("Created", issue_json.get("created", "")),
-                ("Updated", issue_json.get("updated", "")),
-                ("Resolution", issue_json.get("resolution", "Unresolved")),
-            ]
-
+            document.add_heading("Issue Details", level=1)
+            table = document.add_table(rows=0, cols=2)
+            table.style = "Table Grid"
+            metadata = (
+                ("Type", issue.get("issue_type")),
+                ("Status", issue.get("status")),
+                ("Priority", issue.get("priority")),
+                ("Assignee", issue.get("assignee", "Unassigned")),
+                ("Reporter", issue.get("reporter")),
+                ("Created", issue.get("created")),
+                ("Updated", issue.get("updated")),
+                ("Resolution", issue.get("resolution", "Unresolved")),
+            )
             for label, value in metadata:
                 row = table.add_row()
                 row.cells[0].text = label
-                row.cells[1].text = value
+                row.cells[1].text = _text(value)
 
-            # Description section
-            description = issue_json.get("description", "")
+            description = _text(issue.get("description"))
             if description:
-                doc.add_heading("Description", level=1)
-                doc.add_paragraph(description)
+                document.add_heading("Description", level=1)
+                document.add_paragraph(description)
 
-            # Subtasks section
-            subtasks = issue_json.get("subtasks", [])
+            subtasks = issue.get("subtasks") or []
             if subtasks:
-                doc.add_heading("Subtasks", level=1)
-                for st in subtasks:
-                    doc.add_paragraph(
-                        f"{st.get('key', '')} - {st.get('summary', '')} ({st.get('status', '')})",
-                        style='List Bullet'
-                    )
+                document.add_heading("Subtasks", level=1)
+                for subtask in subtasks:
+                    if isinstance(subtask, dict):
+                        document.add_paragraph(
+                            f"{_text(subtask.get('key'))} - {_text(subtask.get('summary'))} "
+                            f"({_text(subtask.get('status'))})",
+                            style="List Bullet",
+                        )
 
-            # Issue links section
-            issue_links = issue_json.get("issue_links", [])
+            issue_links = issue.get("issue_links") or []
             if issue_links:
-                doc.add_heading("Related Issues", level=1)
+                document.add_heading("Related Issues", level=1)
                 for link in issue_links:
-                    direction = link.get("direction", "")
-                    linked_issue = link.get("issue", {})
-                    rel_type = link.get("relationship", "")
-                    doc.add_paragraph(
-                        f"{rel_type} {linked_issue.get('key', '')} - {linked_issue.get('summary', '')} ({linked_issue.get('status', '')})",
-                        style='List Bullet'
+                    if not isinstance(link, dict):
+                        continue
+                    linked_issue = link.get("issue") or link.get("linked_issue") or {}
+                    if not isinstance(linked_issue, dict):
+                        continue
+                    relationship = link.get("direction") or link.get("relationship") or "Related to"
+                    document.add_paragraph(
+                        f"{_text(relationship)} {_text(linked_issue.get('key'))} - "
+                        f"{_text(linked_issue.get('summary'))} ({_text(linked_issue.get('status'))})",
+                        style="List Bullet",
                     )
 
-            # Attachments section
-            attachments = issue_json.get("attachments", [])
+            attachments = issue.get("attachments") or []
             if attachments and include_attachments:
-                doc.add_heading("Attachments", level=1)
+                document.add_heading("Attachments", level=1)
+                with tempfile.TemporaryDirectory(prefix=".archon-jira-", dir=save_path.parent) as temp_dir:
+                    for index, attachment in enumerate(attachments):
+                        if not isinstance(attachment, dict):
+                            continue
+                        attachment_id = _text(attachment.get("id"))
+                        filename = _text(attachment.get("filename"))
+                        mime_type = _text(attachment.get("mime_type"))
+                        document.add_heading(filename or f"Attachment {attachment_id}", level=2)
+                        document.add_paragraph(f"ID: {attachment_id}")
+                        document.add_paragraph(f"Size: {int(attachment.get('size') or 0) / 1024 / 1024:.2f} MB")
+                        document.add_paragraph(f"Author: {_text(attachment.get('author'))}")
+                        document.add_paragraph(f"Created: {_text(attachment.get('created'))}")
+                        document.add_paragraph(f"MIME Type: {mime_type}")
 
-                for att in attachments:
-                    att_id = att.get("id", "")
-                    filename = att.get("filename", "")
-
-                    doc.add_heading(filename, level=2)
-                    doc.add_paragraph(f"ID: {att_id}")
-                    doc.add_paragraph(f"Size: {att.get('size', 0) / 1024 / 1024:.2f} MB")
-                    doc.add_paragraph(f"Author: {att.get('author', '')}")
-                    doc.add_paragraph(f"Created: {att.get('created', '')}")
-                    doc.add_paragraph(f"MIME Type: {att.get('mime_type', '')}")
-
-                    # Try to download and include content for text-based attachments
-                    if att.get("mime_type", "").startswith("text/") or filename.endswith(('.md', '.txt', '.json', '.csv', '.xml', '.yaml', '.yml')):
-                        temp_file = Path(tempfile.gettempdir()) / f"temp_{att_id}_{filename}"
+                        is_text = mime_type.startswith("text/") or Path(filename).suffix.lower() in {
+                            ".md", ".txt", ".json", ".csv", ".xml", ".yaml", ".yml"
+                        }
+                        if not is_text or not attachment_id.isdigit():
+                            continue
+                        temp_file = Path(temp_dir) / f"attachment-{index}-{attachment_id}.txt"
                         try:
-                            result = p.get_attachment(att_id, str(temp_file))
-                            result_data = json.loads(result)
+                            result = json.loads(provider.get_attachment(attachment_id, str(temp_file)))
+                            if "error" not in result and temp_file.exists():
+                                content = temp_file.read_text(encoding="utf-8", errors="replace")
+                                if len(content) > MAX_EMBEDDED_TEXT_CHARS:
+                                    content = content[:MAX_EMBEDDED_TEXT_CHARS] + "\n[truncated]"
+                                document.add_paragraph("Content:")
+                                document.add_paragraph(_text(content))
+                            elif "error" in result:
+                                document.add_paragraph(f"(Attachment content unavailable: {result['error']})")
+                        except Exception as exc:  # noqa: BLE001 - attachment enrichment is optional
+                            document.add_paragraph(f"(Attachment content unavailable: {type(exc).__name__}: {exc})")
 
-                            if "error" not in result_data and temp_file.exists():
-                                content = temp_file.read_text(encoding='utf-8', errors='ignore')
-                                doc.add_paragraph("Content:")
-                                doc.add_paragraph(content)
-                        except Exception as e:
-                            doc.add_paragraph(f"(Could not load attachment content: {e})")
-                        finally:
-                            if temp_file.exists():
-                                temp_file.unlink(missing_ok=True)
-
-            # Save document
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            doc.save(str(save_path.resolve()))
-
+            with tempfile.NamedTemporaryFile(
+                prefix=".archon-jira-",
+                suffix=".docx.tmp",
+                dir=save_path.parent,
+                delete=False,
+            ) as handle:
+                temporary_doc = Path(handle.name)
+            document.save(str(temporary_doc))
+            commit_output_file(temporary_doc, save_path, runtime_config)
+            temporary_doc = None
             return json.dumps(
                 {
-                    "issue_key": issue_key,
-                    "saved_to": str(save_path.resolve()),
+                    "issue_key": normalized_key,
+                    "saved_to": str(save_path),
                     "filename": save_path.name,
                     "size": save_path.stat().st_size,
                     "includes_attachments": include_attachments,
@@ -162,6 +194,14 @@ def register(mcp: MCPServer, default_provider: str = "jira") -> None:
                 },
                 ensure_ascii=False,
             )
-
-        except Exception as e:
-            return json.dumps({"error": f"Export failed: {e}"}, ensure_ascii=False)
+        except OutputPathError as exc:
+            return error_response("invalid_output_path", str(exc), issue_key=normalized_key)
+        except Exception as exc:  # noqa: BLE001 - export errors need a stable tool response
+            return error_response(
+                "export_failed",
+                f"Export failed: {type(exc).__name__}: {exc}",
+                issue_key=normalized_key,
+            )
+        finally:
+            if temporary_doc is not None:
+                temporary_doc.unlink(missing_ok=True)

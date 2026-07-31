@@ -1,20 +1,20 @@
-"""Tests for export_issue tool."""
+"""Tests for the export_issue MCP tool."""
 
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
-import pytest
+from docx import Document
 
+from server.config import JiraConfig
 from server.providers import register
-from server.tools.export_issue import register as register_export
+from server.tools.export_issue import register as register_tool
 
 
-class _StubProvider:
-    """Minimal provider that returns canned data."""
-
-    def get_issue_json(self, issue_key: str, **kwargs):
+class StubProvider:
+    def get_issue_json(self, issue_key: str, **kwargs) -> dict:
         return {
-            "key": "TEST-123",
+            "key": issue_key,
             "summary": "Test Issue",
             "issue_type": "Bug",
             "status": "Open",
@@ -22,238 +22,117 @@ class _StubProvider:
             "resolution": "Unresolved",
             "assignee": "Test User",
             "reporter": "Reporter",
-            "created": "2026-01-01T00:00:00",
-            "updated": "2026-01-02T00:00:00",
-            "description": "Test description content",
-            "subtasks": [
-                {"key": "TEST-124", "summary": "Subtask 1", "status": "Done"},
-            ],
-            "issue_links": [
-                {
-                    "direction": "is blocked by",
-                    "issue": {
-                        "key": "TEST-125",
-                        "summary": "Blocking Issue",
-                        "status": "Open",
-                    },
-                },
-            ],
-            "attachments": [
-                {
-                    "id": "10001",
-                    "filename": "test.md",
-                    "size": 1024,
-                    "mime_type": "text/markdown",
-                    "author": "Test User",
-                    "created": "2026-01-01T12:00:00",
-                    "content_url": "http://example.com/attachment",
-                },
-            ],
+            "created": "2026-01-01",
+            "updated": "2026-01-02",
+            "description": "Test description",
+            "subtasks": [{"key": "TEST-2", "summary": "Subtask", "status": "Done"}],
+            "issue_links": [{
+                "direction": "is blocked by",
+                "issue": {"key": "TEST-3", "summary": "Blocker", "status": "Open"},
+            }],
+            "attachments": [{
+                "id": "10001",
+                "filename": "notes.md",
+                "size": 12,
+                "mime_type": "text/markdown",
+                "author": "Test User",
+                "created": "2026-01-01",
+            }],
         }
 
-
-class _ErrorProvider:
-    """Provider whose get_issue_json returns an error."""
-
-    def get_issue_json(self, issue_key: str, **kwargs):
-        return {"error": "Issue not found"}
+    def get_attachment(self, attachment_id: str, save_to: str, **kwargs) -> str:
+        Path(save_to).write_text("Attachment content", encoding="utf-8")
+        return json.dumps({"id": attachment_id, "saved_to": save_to})
 
 
-class _MockMCP:
-    """Mock MCP server to capture tool registration."""
-
-    def __init__(self):
-        self.tools = {}
-
-    def tool(self, description: str):
-        def decorator(func):
-            self.tools[func.__name__] = func
-            return func
-        return decorator
+def get_func(provider: str = "stub", config: JiraConfig | None = None):
+    inner = MagicMock()
+    mcp = MagicMock(spec=["tool"])
+    mcp.tool = lambda **kwargs: inner
+    register_tool(mcp, default_provider=provider, config=config)
+    return inner.call_args[0][0]
 
 
-def _make_mcp():
-    """Create a mock MCP server and register tools, ensuring provider is set up first."""
-    register("test_provider", _StubProvider())
-    mcp = _MockMCP()
-    register_export(mcp, default_provider="test_provider")
-    return mcp
+def test_export_creates_docx_with_issue_and_attachment(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JIRA_ALLOWED_OUTPUT_DIR", str(tmp_path))
+    register("stub", StubProvider())
+    destination = tmp_path / "issue.docx"
+    result = json.loads(get_func()("test-1", str(destination), include_attachments=True))
+    assert result["issue_key"] == "TEST-1"
+    assert destination.exists()
+    document = Document(destination)
+    text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+    assert "Test description" in text
+    assert "Attachment content" in text
+    assert "is blocked by TEST-3" in text
 
 
-class TestExportIssue:
-    """Test cases for export_issue tool."""
+def test_export_converts_suffix_to_docx(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JIRA_ALLOWED_OUTPUT_DIR", str(tmp_path))
+    register("stub", StubProvider())
+    result = json.loads(get_func()("TEST-1", str(tmp_path / "issue.txt"), include_attachments=False))
+    assert result["filename"] == "issue.docx"
+    assert (tmp_path / "issue.docx").exists()
 
-    def test_tool_registration(self):
-        """Verify tool is registered correctly."""
-        mcp = _make_mcp()
-        assert "export_issue" in mcp.tools
 
-    def test_tool_has_description(self):
-        """Verify tool has a description."""
-        mcp = _make_mcp()
-        assert mcp.tools["export_issue"].__doc__ is not None
+def test_export_rejects_path_outside_allowed_directory(tmp_path, monkeypatch) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    monkeypatch.setenv("JIRA_ALLOWED_OUTPUT_DIR", str(allowed))
+    data = json.loads(get_func()("TEST-1", str(tmp_path / "outside.docx")))
+    assert data["error_code"] == "invalid_output_path"
 
-    def test_export_creates_docx_file(self, tmp_path):
-        """Verify export creates a valid .docx file."""
-        mcp = _make_mcp()
-        save_path = tmp_path / "test_export.docx"
 
-        result_str = mcp.tools["export_issue"](
-            issue_key="TEST-123",
-            save_to=str(save_path),
-            include_attachments=True,
-        )
+def test_export_uses_server_config_instead_of_environment(tmp_path, monkeypatch) -> None:
+    allowed = tmp_path / "allowed"
+    environment_directory = tmp_path / "environment"
+    allowed.mkdir()
+    environment_directory.mkdir()
+    monkeypatch.setenv("JIRA_ALLOWED_OUTPUT_DIR", str(environment_directory))
+    register("stub", StubProvider())
 
-        result = json.loads(result_str)
-
-        assert "error" not in result
-        assert result["issue_key"] == "TEST-123"
-        assert result["filename"] == "test_export.docx"
-        assert result["saved_to"] == str(save_path)
-        assert result["includes_attachments"] is True
-        assert result["attachment_count"] == 1
-
-        assert save_path.exists()
-        assert save_path.stat().st_size > 0
-
-    def test_export_with_txt_extension_converts_to_docx(self, tmp_path):
-        """Verify export converts non-.docx extensions to .docx."""
-        mcp = _make_mcp()
-        save_path = tmp_path / "test.txt"
-
-        result_str = mcp.tools["export_issue"](
-            issue_key="TEST-123",
-            save_to=str(save_path),
+    destination = allowed / "issue.docx"
+    data = json.loads(
+        get_func(config=JiraConfig(output_dir=allowed))(
+            "TEST-1",
+            str(destination),
             include_attachments=False,
         )
+    )
 
-        result = json.loads(result_str)
+    assert "error" not in data
+    assert destination.exists()
 
-        assert "error" not in result
-        expected_path = tmp_path / "test.docx"
-        assert expected_path.exists()
 
-    def test_export_rejects_non_convertible_extension(self, tmp_path):
-        """Verify export rejects extensions that can't be safely converted to .docx."""
-        mcp = _make_mcp()
-        save_path = tmp_path / "test.pdf"
+def test_export_refuses_overwrite_by_default(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JIRA_ALLOWED_OUTPUT_DIR", str(tmp_path))
+    existing = tmp_path / "issue.docx"
+    existing.write_bytes(b"existing")
+    data = json.loads(get_func()("TEST-1", str(existing)))
+    assert data["error_code"] == "invalid_output_path"
+    assert existing.read_bytes() == b"existing"
 
-        result_str = mcp.tools["export_issue"](
-            issue_key="TEST-123",
-            save_to=str(save_path),
-        )
 
-        result = json.loads(result_str)
+def test_export_reports_provider_error(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JIRA_ALLOWED_OUTPUT_DIR", str(tmp_path))
+    provider = StubProvider()
+    provider.get_issue_json = MagicMock(return_value={"error": "not found", "error_code": "not_found"})
+    register("error", provider)
+    data = json.loads(get_func("error")("TEST-1", str(tmp_path / "issue.docx")))
+    assert data["error_code"] == "not_found"
 
-        # .pdf should be converted to .docx (all extensions are converted)
-        assert "error" not in result
-        expected_path = tmp_path / "test.docx"
-        assert expected_path.exists()
 
-    def test_export_without_attachments(self, tmp_path):
-        """Verify export works without attachments."""
-        mcp = _make_mcp()
-        save_path = tmp_path / "no_attachments.docx"
-
-        result_str = mcp.tools["export_issue"](
-            issue_key="TEST-123",
-            save_to=str(save_path),
-            include_attachments=False,
-        )
-
-        result = json.loads(result_str)
-
-        assert "error" not in result
-        assert result["includes_attachments"] is False
-        assert save_path.exists()
-
-    def test_export_creates_parent_directory(self, tmp_path):
-        """Verify export creates parent directory if it doesn't exist."""
-        mcp = _make_mcp()
-        save_path = tmp_path / "subdir" / "deep" / "export.docx"
-
-        result_str = mcp.tools["export_issue"](
-            issue_key="TEST-123",
-            save_to=str(save_path),
-        )
-
-        result = json.loads(result_str)
-
-        assert "error" not in result
-        assert save_path.exists()
-
-    def test_export_handles_invalid_provider(self, tmp_path):
-        """Verify export handles invalid provider error."""
-        mcp = _MockMCP()
-        register_export(mcp, default_provider="invalid_provider")
-
-        save_path = tmp_path / "test.docx"
-
-        result_str = mcp.tools["export_issue"](
-            issue_key="TEST-123",
-            save_to=str(save_path),
-        )
-
-        result = json.loads(result_str)
-
-        assert "error" in result
-        assert "Unknown provider" in result["error"]
-
-    def test_export_propagates_issue_not_found(self, tmp_path):
-        """Verify export propagates error when issue is not found."""
-        register("error_provider", _ErrorProvider())
-        mcp = _MockMCP()
-        register_export(mcp, default_provider="error_provider")
-
-        save_path = tmp_path / "missing.docx"
-
-        result_str = mcp.tools["export_issue"](
-            issue_key="INVALID-999",
-            save_to=str(save_path),
-        )
-
-        result = json.loads(result_str)
-
-        assert "error" in result
-        assert "Issue not found" in result["error"]
-        assert not save_path.exists()
-
-    def test_export_includes_attachment_content(self, tmp_path):
-        """Verify text attachment content is embedded in the document."""
-        mcp = _make_mcp()
-        save_path = tmp_path / "with_content.docx"
-
-        # Override the stub provider's get_attachment to return content
-        class _ProviderWithAttachment(_StubProvider):
-            def get_attachment(self, attachment_id: str, save_to: str, **kwargs):
-                from pathlib import Path as P
-                P(save_to).write_text("# Attachment Title\nHello world", encoding='utf-8')
-                import json
-                return json.dumps({
-                    "id": attachment_id,
-                    "filename": "test.md",
-                    "saved_to": save_to,
-                    "size": 1024,
-                    "mime_type": "text/markdown",
-                })
-
-        register("attach_provider", _ProviderWithAttachment())
-        mcp2 = _MockMCP()
-        register_export(mcp2, default_provider="attach_provider")
-
-        result_str = mcp2.tools["export_issue"](
-            issue_key="TEST-123",
-            save_to=str(save_path),
-            include_attachments=True,
-        )
-
-        result = json.loads(result_str)
-
-        assert "error" not in result
-        assert save_path.exists()
-
-        # Verify the content was embedded in the document
-        from docx import Document
-        doc = Document(str(save_path))
-        all_text = "\n".join(p.text for p in doc.paragraphs)
-        assert "Hello world" in all_text
+def test_export_uses_controlled_temp_attachment_name(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JIRA_ALLOWED_OUTPUT_DIR", str(tmp_path))
+    provider = StubProvider()
+    issue = provider.get_issue_json("TEST-1")
+    issue["attachments"][0]["filename"] = "../../outside.txt"
+    provider.get_issue_json = MagicMock(return_value=issue)
+    provider.get_attachment = MagicMock(side_effect=provider.get_attachment)
+    register("unsafe-name", provider)
+    result = json.loads(get_func("unsafe-name")("TEST-1", str(tmp_path / "issue.docx")))
+    assert "error" not in result
+    requested_path = Path(provider.get_attachment.call_args.args[1])
+    assert requested_path.name.startswith("attachment-")
+    assert requested_path.is_relative_to(tmp_path)
+    assert not (tmp_path.parent / "outside.txt").exists()

@@ -1,5 +1,6 @@
 """Shared fixtures for archon-jira tests."""
 
+import os
 from collections.abc import Generator
 from unittest.mock import patch
 
@@ -16,7 +17,11 @@ def clear_env() -> Generator[None, None, None]:
     from server.providers import _providers
 
     _providers.clear()
-    with patch.dict("os.environ", clear=True):
+    with patch.dict(
+        "os.environ",
+        {"JIRA_ALLOWED_OUTPUT_DIR": os.path.abspath(os.sep)},
+        clear=True,
+    ):
         yield
     _providers.clear()
 

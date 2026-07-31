@@ -7,14 +7,13 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from server.providers import get_provider, is_registered, register
+from server.config import JiraConfig
 from server.providers.jira import (
     _DEFAULT_MAX_ATTACHMENT_SIZE,
     _MAX_FIELD_LENGTH,
     _MAX_SEARCH_RESULTS,
     JiraProvider,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -257,6 +256,38 @@ def test_get_issue_description_truncation(monkeypatch: pytest.MonkeyPatch) -> No
     provider.close()
 
 
+def test_get_issue_custom_field_truncation() -> None:
+    """get_issue bounds custom fields before returning model context."""
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    field_resp = MagicMock(status_code=200)
+    field_resp.json.return_value = [
+        {"id": "customfield_99999", "name": "Long field", "custom": True}
+    ]
+    field_resp.raise_for_status = MagicMock()
+    issue_resp = MagicMock(status_code=200)
+    issue_resp.json.return_value = {
+        "key": "PROJ-1",
+        "fields": {
+            "summary": "Test",
+            "description": None,
+            "status": {"name": "Open"},
+            "issuetype": {"name": "Task"},
+            "customfield_99999": "x" * (_MAX_FIELD_LENGTH + 100),
+        },
+    }
+    issue_resp.raise_for_status = MagicMock()
+    mock_client.get.side_effect = [field_resp, issue_resp]
+    provider._client = mock_client
+
+    result = provider.get_issue("PROJ-1")
+
+    assert "Long field" in result
+    assert result.count("x") == _MAX_FIELD_LENGTH
+    assert "..." in result
+    provider.close()
+
+
 def test_get_issue_missing_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     """get_issue handles issues with missing optional fields gracefully."""
     monkeypatch.setenv("JIRA_URL", "https://jira.example.com")
@@ -491,11 +522,12 @@ def test_get_issue_invalid_key() -> None:
     """get_issue rejects invalid issue key formats."""
     provider = JiraProvider()
     result = provider.get_issue("../../../admin")
-    assert "Error" in result
-    assert "Invalid issue key" in result
+    data = json.loads(result)
+    assert data["error_code"] == "invalid_issue_key"
+    assert "Invalid issue key" in data["error"]
 
     result = provider.get_issue("123-BAD")
-    assert "Error" in result
+    assert json.loads(result)["error_code"] == "invalid_issue_key"
     provider.close()
 
 
@@ -559,3 +591,304 @@ def test_jira_timeout_invalid_falls_back(monkeypatch: pytest.MonkeyPatch) -> Non
         client = provider._get_client()
     assert client is not None
     provider.close()
+
+
+def test_missing_configuration_returns_stable_error() -> None:
+    data = json.loads(JiraProvider(JiraConfig()).search_issues("project = TEST"))
+    assert data["error_code"] == "configuration_error"
+    assert data["results"] == []
+
+
+def test_context_path_is_preserved_in_client_base_url(tmp_path) -> None:
+    config = JiraConfig(
+        url="https://jira.example.com/context",
+        username="user",
+        password="pass",
+        output_dir=tmp_path,
+    )
+    provider = JiraProvider(config)
+    with patch("server.providers.jira.httpx.Client") as client_class:
+        client = client_class.return_value
+        client.is_closed = False
+        with patch.object(provider, "_login"):
+            provider._get_client()
+    assert client_class.call_args.kwargs["base_url"] == "https://jira.example.com/context/"
+
+
+def test_attachment_rejects_cross_origin_download(tmp_path) -> None:
+    config = JiraConfig(
+        url="https://jira.example.com",
+        username="user",
+        password="pass",
+        output_dir=tmp_path,
+    )
+    provider = JiraProvider(config)
+    client = _make_mock_client()
+    metadata = MagicMock()
+    metadata.raise_for_status = MagicMock()
+    metadata.json.return_value = {
+        "filename": "file.txt",
+        "size": 4,
+        "mimeType": "text/plain",
+        "content": "https://evil.example/file.txt",
+    }
+    client.get.return_value = metadata
+    provider._client = client
+    data = json.loads(provider.get_attachment("10001", str(tmp_path / "file.txt")))
+    assert data["error_code"] == "invalid_attachment_url"
+    client.stream.assert_not_called()
+
+
+def test_attachment_enforces_actual_stream_size_and_cleans_partial_file(tmp_path) -> None:
+    config = JiraConfig(
+        url="https://jira.example.com",
+        username="user",
+        password="pass",
+        max_attachment_size=5,
+        output_dir=tmp_path,
+    )
+    provider = JiraProvider(config)
+    client = _make_mock_client()
+    metadata = MagicMock()
+    metadata.raise_for_status = MagicMock()
+    metadata.json.return_value = {
+        "filename": "file.txt",
+        "size": 4,
+        "mimeType": "text/plain",
+        "content": "https://jira.example.com/file.txt",
+    }
+    client.get.return_value = metadata
+    stream = MagicMock()
+    stream.__enter__.return_value = stream
+    stream.__exit__.return_value = False
+    stream.raise_for_status = MagicMock()
+    stream.iter_bytes.return_value = [b"123", b"456"]
+    client.stream.return_value = stream
+    provider._client = client
+
+    destination = tmp_path / "file.txt"
+    data = json.loads(provider.get_attachment("10001", str(destination)))
+    assert data["error_code"] == "attachment_too_large"
+    assert not destination.exists()
+    assert list(tmp_path.glob(".archon-jira-*.part")) == []
+
+
+def test_login_failure_discards_unusable_client(tmp_path) -> None:
+    config = JiraConfig(
+        url="https://jira.example.com",
+        username="user",
+        password="bad",
+        output_dir=tmp_path,
+    )
+    provider = JiraProvider(config)
+    request = httpx.Request("POST", "https://jira.example.com/rest/auth/1/session")
+    response = httpx.Response(401, request=request, json={"message": "Unauthorized"})
+    with patch("server.providers.jira.httpx.Client") as client_class:
+        client = client_class.return_value
+        client.is_closed = False
+        client.post.return_value.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "Unauthorized",
+            request=request,
+            response=response,
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            provider._get_client()
+    client.close.assert_called_once()
+    assert provider._client is None
+
+
+def test_http_error_extracts_structured_jira_message() -> None:
+    provider = JiraProvider()
+    client = _make_mock_client()
+    request = httpx.Request("GET", "https://jira.example.com/rest/api/2/search")
+    response = httpx.Response(
+        400,
+        request=request,
+        json={"errorMessages": ["Invalid JQL field"]},
+    )
+    client.get.return_value.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "Bad request",
+        request=request,
+        response=response,
+    )
+    provider._client = client
+    data = json.loads(provider.search_issues("bad jql"))
+    assert data["error_code"] == "invalid_jql"
+    assert "Invalid JQL field" in data["error"]
+
+
+def test_invalid_jql_marks_metadata_cache_stale() -> None:
+    provider = JiraProvider()
+    provider._jql_cache.invalidate = MagicMock()
+    client = _make_mock_client()
+    request = httpx.Request("GET", "https://jira.example.com/rest/api/2/search")
+    response = httpx.Response(400, request=request, json={"errorMessages": ["Bad field"]})
+    client.get.return_value.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "Bad request", request=request, response=response
+    )
+    provider._client = client
+
+    provider.search_issues("bad jql")
+
+    provider._jql_cache.invalidate.assert_called_once_with()
+
+
+def test_search_jql_fields_merges_field_and_autocomplete_metadata(tmp_path) -> None:
+    config = JiraConfig(
+        url="https://jira.example.com",
+        username="user",
+        password="pass",
+        jql_disk_cache_enabled=False,
+        jql_cache_dir=tmp_path,
+    )
+    provider = JiraProvider(config)
+    client = _make_mock_client()
+    fields_response = MagicMock()
+    fields_response.raise_for_status = MagicMock()
+    fields_response.json.return_value = [
+        {
+            "id": "customfield_11122",
+            "name": "测试阶段",
+            "custom": True,
+            "searchable": True,
+            "orderable": True,
+            "clauseNames": ["测试阶段"],
+            "schema": {"type": "option"},
+        }
+    ]
+    autocomplete_response = MagicMock()
+    autocomplete_response.raise_for_status = MagicMock()
+    autocomplete_response.json.return_value = {
+        "visibleFieldNames": [
+            {
+                "value": "测试阶段",
+                "displayName": "测试阶段",
+                "cfid": "customfield_11122",
+                "operators": ["=", "IN"],
+                "types": ["java.lang.String"],
+                "searchable": "true",
+            }
+        ]
+    }
+    client.get.side_effect = [fields_response, autocomplete_response]
+    provider._client = client
+
+    data = json.loads(provider.search_jql_fields("测试"))
+
+    assert data["result_count"] == 1
+    assert data["fields"][0]["id"] == "customfield_11122"
+    assert data["fields"][0]["schema_type"] == "option"
+    assert data["fields"][0]["operators"] == ["=", "IN"]
+    assert "cf[11122]" in data["fields"][0]["clause_names"]
+    assert data["fields"][0]["jql_clause"] == "cf[11122]"
+    assert data["cache"]["source"] == "jira"
+
+    cached = json.loads(provider.search_jql_fields("测试"))
+    assert cached["cache"]["source"] == "memory"
+    assert client.get.call_count == 2
+
+
+def test_get_jql_value_suggestions_uses_resolved_clause_and_cache(tmp_path) -> None:
+    config = JiraConfig(
+        url="https://jira.example.com",
+        username="user",
+        password="pass",
+        jql_disk_cache_enabled=False,
+        jql_cache_dir=tmp_path,
+    )
+    provider = JiraProvider(config)
+    client = _make_mock_client()
+    fields_response = MagicMock()
+    fields_response.raise_for_status = MagicMock()
+    fields_response.json.return_value = [
+        {
+            "id": "customfield_11122",
+            "name": "测试阶段",
+            "custom": True,
+            "searchable": True,
+            "clauseNames": ["测试阶段"],
+            "schema": {"type": "option"},
+        }
+    ]
+    autocomplete_response = MagicMock()
+    autocomplete_response.raise_for_status = MagicMock()
+    autocomplete_response.json.return_value = {"visibleFieldNames": []}
+    suggestions_response = MagicMock()
+    suggestions_response.raise_for_status = MagicMock()
+    suggestions_response.json.return_value = {
+        "results": [{"value": "待回归", "displayName": "待回归"}]
+    }
+    client.get.side_effect = [fields_response, autocomplete_response, suggestions_response]
+    provider._client = client
+
+    data = json.loads(provider.get_jql_value_suggestions("测试阶段", "回归"))
+
+    assert data["field"]["jql_clause"] == "cf[11122]"
+    assert data["suggestions"][0]["jql_literal"] == '"待回归"'
+    assert client.get.call_args.kwargs["params"] == {
+        "fieldName": "cf[11122]",
+        "fieldValue": "回归",
+    }
+
+    cached = json.loads(provider.get_jql_value_suggestions("测试阶段", "回归"))
+    assert cached["cache"]["source"] == "memory"
+    assert client.get.call_count == 3
+
+
+def test_get_jql_value_suggestions_reports_unknown_field(tmp_path) -> None:
+    config = JiraConfig(
+        url="https://jira.example.com",
+        username="user",
+        password="pass",
+        jql_disk_cache_enabled=False,
+        jql_cache_dir=tmp_path,
+    )
+    provider = JiraProvider(config)
+    provider._jql_cache.get_fields = MagicMock(
+        return_value=MagicMock(
+            data={"fields": []},
+            metadata=lambda: {"source": "memory", "stale": False},
+        )
+    )
+
+    data = json.loads(provider.get_jql_value_suggestions("不存在"))
+
+    assert data["error_code"] == "unknown_jql_field"
+    assert data["suggestions"] == []
+
+
+def test_get_jql_value_suggestions_reports_unsupported_endpoint(tmp_path) -> None:
+    config = JiraConfig(
+        url="https://jira.example.com",
+        username="user",
+        password="pass",
+        jql_disk_cache_enabled=False,
+        jql_cache_dir=tmp_path,
+    )
+    provider = JiraProvider(config)
+    field = {
+        "id": "status",
+        "name": "Status",
+        "clause_names": ["status"],
+        "schema_type": "status",
+    }
+    provider._jql_cache.get_fields = MagicMock(
+        return_value=MagicMock(
+            data={"fields": [field]},
+            metadata=lambda: {"source": "memory", "stale": False},
+        )
+    )
+    client = _make_mock_client()
+    request = httpx.Request(
+        "GET",
+        "https://jira.example.com/rest/api/2/jql/autocompletedata/suggestions",
+    )
+    response = httpx.Response(404, request=request)
+    client.get.return_value.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "Not found", request=request, response=response
+    )
+    provider._client = client
+
+    data = json.loads(provider.get_jql_value_suggestions("status"))
+
+    assert data["error_code"] == "metadata_unsupported"

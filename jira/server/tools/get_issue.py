@@ -1,47 +1,50 @@
-"""get_issue tool definition."""
+"""The public ``get_issue`` MCP tool."""
 
-import json
+import re
+from typing import Annotated
 
 from mcp.server import MCPServer
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
-from server.providers import get_provider
+from server.instructions import GET_ISSUE_DESCRIPTION
+from server.tools._common import (
+    ensure_markdown_result,
+    error_response,
+    provider_or_error,
+)
+
+ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
 
 
 def register(mcp: MCPServer, default_provider: str = "jira") -> None:
-    """Register the get_issue tool on the given MCP server.
-
-    Args:
-        mcp: The MCPServer instance.
-        default_provider: Default Jira provider to use when not specified.
-    """
-
     @mcp.tool(
-        description=(
-            "Get full details of a Jira issue by its key (e.g. 'PROJ-123'). Use this tool "
-            "when: the user wants to see all information about a specific issue; they need "
-            "issue links (blocks, is-blocked-by, clones, etc.) with relationship types; "
-            "they want sub-tasks or parent task information; they need the full description, "
-            "acceptance criteria, or custom fields. Returns a markdown-formatted summary "
-            "including metadata, user info, description, links, subtasks, and attachments."
-        )
+        name="get_issue",
+        title="Get Jira Issue",
+        description=GET_ISSUE_DESCRIPTION,
+        annotations=ToolAnnotations(
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+        structured_output=False,
     )
     def get_issue(
-        issue_key: str,
-        provider: str = default_provider,
+        issue_key: Annotated[str, Field(min_length=3, max_length=100, description="Jira issue key, for example PROJ-123.")],
     ) -> str:
-        """Get full details of a Jira issue.
-
-        Args:
-            issue_key: Jira issue key (e.g. 'PROJ-123').
-            provider: Jira provider backend to use.
-
-        Returns:
-            Markdown-formatted issue details including metadata, description,
-            links, subtasks, and attachments.
-        """
+        normalized_key = issue_key.strip().upper() if isinstance(issue_key, str) else ""
+        if not ISSUE_KEY_RE.fullmatch(normalized_key):
+            return error_response("invalid_issue_key", f"Invalid issue key: {issue_key!r}", issue_key=normalized_key)
+        provider, error = provider_or_error(default_provider)
+        if error:
+            return error_response("provider_unavailable", "Jira provider is unavailable", issue_key=normalized_key)
         try:
-            p = get_provider(provider)
-        except ValueError as e:
-            return json.dumps({"error": str(e)}, ensure_ascii=False)
-
-        return p.get_issue(issue_key)
+            raw = provider.get_issue(normalized_key)
+        except Exception as exc:  # noqa: BLE001 - provider boundary
+            return error_response(
+                "provider_error",
+                f"Jira provider failed: {type(exc).__name__}: {exc}",
+                issue_key=normalized_key,
+            )
+        return ensure_markdown_result(raw, issue_key=normalized_key)
