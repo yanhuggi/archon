@@ -6,8 +6,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=2.0.0,<3",
-    "duckduckgo-search>=7,<9",
     "python-dotenv>=1.0.0,<2",
+    "ddgs>=9,<10",
 ]
 
 [dependency-groups]

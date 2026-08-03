@@ -1,4 +1,4 @@
-"""DuckDuckGo search provider — no API key required."""
+"""No-key public web search provider built on the ``ddgs`` package."""
 
 from __future__ import annotations
 
@@ -8,14 +8,13 @@ import math
 import os
 import threading
 import time
-import warnings
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Iterator
 from urllib.parse import urlparse
 
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 from server.config import WebConfig
 
@@ -27,12 +26,23 @@ LOGGER = logging.getLogger(__name__)
 MAX_TITLE_LENGTH = 300
 MAX_FIELD_LENGTH = 2000
 MAX_RESULTS = 20
+# ``ddgs`` auto selection is randomized, making latency and relevance unstable.
+SEARCH_BACKEND = "brave"
 TIME_RANGE_TO_TIMELIMIT = {
     "day": "d",
     "week": "w",
     "month": "m",
     "year": "y",
 }
+
+
+def _region_for_query(query: str) -> str:
+    """Use Chinese-localized results when the query contains Han text."""
+
+    if any("\u3400" <= char <= "\u9fff" for char in query):
+        return "cn-zh"
+    return "us-en"
+
 
 # The thread lock coordinates calls inside one server process. The state file
 # and OS file lock below extend the same start-to-start interval across all
@@ -169,7 +179,7 @@ def _error_response(query: str, message: str, code: str = "search_failed") -> st
 
 
 class DuckDuckGoProvider:
-    """Search provider backed by DuckDuckGo.
+    """Search provider backed by a stable no-key ``ddgs`` text engine.
 
     No API key is required. Request spacing, timeout, and proxy settings are
     controlled by :class:`server.config.WebConfig` environment variables.
@@ -183,7 +193,7 @@ class DuckDuckGoProvider:
         time_range: str | None = None,
         **kwargs: object,
     ) -> str:
-        """Search DuckDuckGo and return a compact JSON result envelope."""
+        """Search the public web and return a compact JSON result envelope."""
 
         normalized_query = " ".join(query.split()) if isinstance(query, str) else ""
         if not normalized_query:
@@ -203,21 +213,18 @@ class DuckDuckGoProvider:
             text_kwargs["timelimit"] = timelimit
 
         try:
-            # duckduckgo-search 8 emits a rename warning while the project can
-            # still need the compatibility package. Suppress only that known
-            # advisory; real runtime warnings remain visible to callers.
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message=r"This package \(`duckduckgo_search`\) has been renamed.*",
-                    category=RuntimeWarning,
-                )
-                ddgs_kwargs: dict[str, object] = {"timeout": config.timeout}
-                if config.proxy:
-                    ddgs_kwargs["proxy"] = config.proxy
-                with DDGS(**ddgs_kwargs) as ddgs:
-                    raw_results = ddgs.text(normalized_query, **text_kwargs)
-                    results = _format_results(raw_results, limit=normalized_limit)
+            ddgs_kwargs: dict[str, object] = {"timeout": config.timeout}
+            if config.proxy:
+                ddgs_kwargs["proxy"] = config.proxy
+            text_kwargs.update(
+                {
+                    "backend": SEARCH_BACKEND,
+                    "region": _region_for_query(normalized_query),
+                }
+            )
+            with DDGS(**ddgs_kwargs) as ddgs:
+                raw_results = ddgs.text(normalized_query, **text_kwargs)
+                results = _format_results(raw_results, limit=normalized_limit)
             return json.dumps(
                 {
                     "query": normalized_query,
@@ -227,16 +234,16 @@ class DuckDuckGoProvider:
                 ensure_ascii=False,
             )
         except Exception as exc:
-            LOGGER.error("DuckDuckGo search failed: %s", exc)
+            LOGGER.error("Web search provider failed: %s", exc)
             return _error_response(
                 normalized_query,
-                f"DuckDuckGo search failed: {exc}",
+                f"Web search provider failed: {exc}",
                 "upstream_error",
             )
 
 
 def _format_results(raw_results: object, *, limit: int = MAX_RESULTS) -> list[dict[str, str]]:
-    """Normalize, de-duplicate, and bound raw DuckDuckGo results."""
+    """Normalize, de-duplicate, and bound raw search results."""
 
     if not isinstance(raw_results, Iterable) or isinstance(raw_results, (str, bytes, Mapping)):
         return []

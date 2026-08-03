@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import server.providers.duckduckgo as ddg_module
-from server.providers.duckduckgo import DuckDuckGoProvider, _rate_limit
+from server.providers.duckduckgo import DuckDuckGoProvider, _rate_limit, _region_for_query
 
 
 @pytest.fixture(autouse=True)
@@ -65,14 +65,16 @@ def test_search_success(provider: DuckDuckGoProvider, mock_ddgs: MagicMock) -> N
 
     # Verify max_results is passed through
     mock_ddgs.return_value.__enter__.return_value.text.assert_called_once_with(
-        "test query", max_results=10
+        "test query", max_results=10, backend="brave", region="us-en"
     )
 
 
 def test_search_custom_max_results(provider: DuckDuckGoProvider, mock_ddgs: MagicMock) -> None:
     """max_results parameter is forwarded to DDGS.text()."""
     provider.search("q", max_results=5)
-    mock_ddgs.return_value.__enter__.return_value.text.assert_called_once_with("q", max_results=5)
+    mock_ddgs.return_value.__enter__.return_value.text.assert_called_once_with(
+        "q", max_results=5, backend="brave", region="us-en"
+    )
 
 
 def test_search_never_returns_more_than_requested(
@@ -93,7 +95,28 @@ def test_search_passes_time_range_as_ddgs_timelimit(
     """Friendly MCP time ranges are translated to DuckDuckGo values."""
     provider.search("recent release", time_range="week")
     mock_ddgs.return_value.__enter__.return_value.text.assert_called_once_with(
-        "recent release", max_results=10, timelimit="w"
+        "recent release", max_results=10, timelimit="w", backend="brave", region="us-en"
+    )
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("福州天气预报 今天", "cn-zh"),
+        ("MCP Python SDK", "us-en"),
+    ],
+)
+def test_search_selects_region_from_query(query: str, expected: str) -> None:
+    assert _region_for_query(query) == expected
+
+
+def test_search_uses_chinese_region(provider: DuckDuckGoProvider, mock_ddgs: MagicMock) -> None:
+    provider.search("福州天气预报 今天")
+    mock_ddgs.return_value.__enter__.return_value.text.assert_called_once_with(
+        "福州天气预报 今天",
+        max_results=10,
+        backend="brave",
+        region="cn-zh",
     )
 
 
@@ -182,7 +205,7 @@ def test_search_ddgs_exception(provider: DuckDuckGoProvider, mock_ddgs: MagicMoc
     data = json.loads(result)
 
     assert "error" in data
-    assert "DuckDuckGo search failed" in data["error"]
+    assert "Web search provider failed" in data["error"]
     assert "DDG blocked us" in data["error"]
     assert data["error_code"] == "upstream_error"
     assert data["results"] == []
