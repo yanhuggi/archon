@@ -43,15 +43,15 @@ def display_image_source(source: str) -> str:
     return value
 
 
-def _get_allowed_dir(config: VisionConfig | None = None) -> Path:
-    """Return the configured local-file boundary."""
+def _get_allowed_dir(config: VisionConfig | None = None) -> Path | None:
+    """Return the optional configured local-file boundary."""
 
     return (config or VisionConfig.from_env()).allowed_dir
 
 
 def _validate_path_safe(resolved: Path, config: VisionConfig | None = None) -> None:
     allowed = _get_allowed_dir(config)
-    if not resolved.is_relative_to(allowed):
+    if allowed is not None and not resolved.is_relative_to(allowed):
         raise ValueError(
             f"Access denied: path '{resolved}' is outside the allowed directory "
             f"'{allowed}'. Set MIMO_ALLOWED_DIR to the required directory."

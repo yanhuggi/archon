@@ -45,7 +45,6 @@ def test_non_finite_timeout_uses_default(monkeypatch) -> None:
     assert VisionConfig.from_env().timeout == 120
 
 
-def test_default_allowed_dir_is_current_working_directory(monkeypatch, tmp_path: Path) -> None:
+def test_default_allowed_dir_is_unrestricted(monkeypatch) -> None:
     monkeypatch.delenv("MIMO_ALLOWED_DIR", raising=False)
-    monkeypatch.chdir(tmp_path)
-    assert VisionConfig.from_env().allowed_dir == tmp_path.resolve()
+    assert VisionConfig.from_env().allowed_dir is None

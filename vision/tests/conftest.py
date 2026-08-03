@@ -26,15 +26,13 @@ def clear_env(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
         "MIMO_TIMEOUT",
         "MIMO_MAX_TOKENS",
         "MIMO_MAX_IMAGE_MB",
+        "MIMO_ALLOWED_DIR",
         "ARCHON_VISION_TRANSPORT",
         "ARCHON_VISION_HOST",
         "ARCHON_VISION_PORT",
         "ARCHON_VISION_LOG_LEVEL",
     ):
         monkeypatch.delenv(k, raising=False)
-
-    # Relax the allowed directory for tests so tmp_path works
-    monkeypatch.setenv("MIMO_ALLOWED_DIR", "/")
 
     yield
     _providers.clear()

@@ -207,9 +207,9 @@ that unobserved visual details were verified.
 | `MIMO_TIMEOUT` | `120` | 上游超时，范围 1–300 秒 |
 | `MIMO_MAX_TOKENS` | `2048` | 最大输出 token，范围 1–16384 |
 | `MIMO_MAX_IMAGE_MB` | `50` | 图片解码后最大大小，范围 1–50 MB |
-| `MIMO_ALLOWED_DIR` | MCP 进程当前工作目录 | 允许读取本地图片的根目录 |
+| `MIMO_ALLOWED_DIR` | 空（不限制） | 可选的本地图片读取根目录 |
 
-本地文件在解析符号链接后的真实路径必须位于 `MIMO_ALLOWED_DIR` 内。Linux/macOS 可使用 `/home/name/Pictures`；Windows 建议在 `.env` 中使用 `C:/Users/name/Pictures`。URL 图片和 data URI 不受本地目录设置影响。
+默认允许读取任意本地路径。设置 `MIMO_ALLOWED_DIR` 后，本地文件在解析符号链接后的真实路径必须位于该目录内。Linux/macOS 可使用 `/home/name/Pictures`；Windows 建议在 `.env` 中使用 `C:/Users/name/Pictures`。URL 图片和 data URI 不受本地目录设置影响。
 
 ### MCP 服务配置
 
@@ -270,7 +270,7 @@ uv run pytest tests -q
 
 ### 本地图片返回 `Access denied`
 
-默认只允许 MCP 进程当前工作目录。将 `MIMO_ALLOWED_DIR` 设为图片所在目录或共同父目录；不要为了方便直接授权整个用户目录或磁盘根目录。
+这表示配置了 `MIMO_ALLOWED_DIR`，而图片真实路径位于该目录之外。可将其改为图片所在目录或共同父目录；删除或留空该配置则不限制本地路径。
 
 ### URL 图片分析失败
 

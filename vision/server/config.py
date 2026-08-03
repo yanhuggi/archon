@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -75,12 +75,6 @@ def _read_path(name: str, default: str) -> str:
     return value if value.startswith("/") else f"/{value}"
 
 
-def default_allowed_dir() -> Path:
-    """Use the MCP client's working directory as the local-file boundary."""
-
-    return Path.cwd().resolve()
-
-
 @dataclass(frozen=True, slots=True)
 class VisionConfig:
     """Configuration shared by the MCP server and MiMo provider."""
@@ -91,7 +85,7 @@ class VisionConfig:
     timeout: float = DEFAULT_TIMEOUT
     max_completion_tokens: int = DEFAULT_MAX_TOKENS
     max_image_size: int = DEFAULT_MAX_IMAGE_MB * 1024 * 1024
-    allowed_dir: Path = field(default_factory=default_allowed_dir)
+    allowed_dir: Path | None = None
     transport: str = DEFAULT_TRANSPORT
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
@@ -112,7 +106,7 @@ class VisionConfig:
 
         model = os.environ.get("MIMO_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
         allowed_raw = os.environ.get("MIMO_ALLOWED_DIR", "").strip()
-        allowed_dir = Path(allowed_raw).expanduser().resolve() if allowed_raw else default_allowed_dir()
+        allowed_dir = Path(allowed_raw).expanduser().resolve() if allowed_raw else None
 
         transport = os.environ.get("ARCHON_VISION_TRANSPORT", DEFAULT_TRANSPORT).strip().lower()
         if transport not in SUPPORTED_TRANSPORTS:

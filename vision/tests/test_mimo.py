@@ -625,6 +625,17 @@ def test_path_within_allowed_accepted(tmp_path: Path) -> None:
     assert result.startswith("data:image/jpeg;base64,")
 
 
+def test_path_is_unrestricted_by_default(tmp_path: Path, monkeypatch) -> None:
+    """Local files are accepted without a configured directory boundary."""
+    img = tmp_path / "unrestricted.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+    monkeypatch.delenv("MIMO_ALLOWED_DIR", raising=False)
+
+    result = process_image_source(str(img))
+
+    assert result.startswith("data:image/jpeg;base64,")
+
+
 # ---------------------------------------------------------------------------
 # unexpected exception in understand
 # ---------------------------------------------------------------------------
