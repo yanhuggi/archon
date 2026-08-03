@@ -44,10 +44,6 @@
 # 稳定分支
 uv tool install --force \
   git+ssh://git@github.com/yanhuggi/archon.git@main#subdirectory=jira
-
-# 验证 dev 分支中的最新改动
-uv tool install --force \
-  git+ssh://git@github.com/yanhuggi/archon.git@dev#subdirectory=jira
 ```
 
 确认命令可用：

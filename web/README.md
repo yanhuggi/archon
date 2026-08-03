@@ -35,10 +35,6 @@
 # 稳定分支
 uv tool install --force \
   git+ssh://git@github.com/yanhuggi/archon.git@main#subdirectory=web
-
-# 验证 dev 分支中的最新改动
-uv tool install --force \
-  git+ssh://git@github.com/yanhuggi/archon.git@dev#subdirectory=web
 ```
 
 安装完成后确认命令可用：
