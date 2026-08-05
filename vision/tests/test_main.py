@@ -58,7 +58,22 @@ def test_main_runs_streamable_http_with_cli_overrides() -> None:
         port=9000,
         streamable_http_path="/mcp",
         stateless_http=False,
+        max_request_body_size=VisionConfig().max_request_body_size,
     )
+
+
+def test_streamable_http_body_limit_fits_a_maximum_image() -> None:
+    """The HTTP body limit must accept a base64 image at max_image_size."""
+    fake_server = MagicMock()
+    config = VisionConfig(api_key="key", max_image_size=8 * 1024 * 1024)
+    with patch("server.main.VisionConfig.from_env", return_value=config):
+        with patch("server.main.create_server", return_value=fake_server):
+            main(["--transport", "streamable-http"])
+
+    limit = fake_server.run.call_args.kwargs["max_request_body_size"]
+    base64_size = ((config.max_image_size + 2) // 3) * 4
+    assert limit > base64_size, "body limit must leave room for base64 inflation"
+    assert limit > 4 * 1024 * 1024, "must exceed the SDK's 4 MiB default"
 
 
 def test_main_builds_exactly_one_server() -> None:

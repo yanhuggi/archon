@@ -46,6 +46,9 @@ def create_server(config: VisionConfig | None = None) -> MCPServer:
 
     config = config or VisionConfig.from_env()
     provider = MimoVisionProvider(config)
+    # The registry stays populated for callers that resolve providers by name,
+    # but this server's tool holds the instance directly, so a later
+    # create_server cannot redirect it to a different key or model.
     register_provider("mimo", provider)
     atexit.register(provider.close)
 
@@ -57,7 +60,7 @@ def create_server(config: VisionConfig | None = None) -> MCPServer:
         version=SERVER_VERSION,
         log_level=config.log_level,
     )
-    register_analyze_image(server, config=config)
+    register_analyze_image(server, config=config, provider=provider)
     return server
 
 
@@ -138,6 +141,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             port=config.port,
             streamable_http_path=config.streamable_http_path,
             stateless_http=config.stateless_http,
+            max_request_body_size=config.max_request_body_size,
         )
 
 

@@ -23,6 +23,18 @@ DEFAULT_PORT = 8000
 DEFAULT_LOG_LEVEL = "INFO"
 SUPPORTED_TRANSPORTS = ("stdio", "sse", "streamable-http")
 
+# Base64 inflates payloads by 4/3, and the image rides inside a JSON-RPC
+# envelope. Without this headroom the SDK's 4 MiB default would reject a
+# roughly 3 MB image over HTTP even though max_image_size permits far more.
+_BASE64_OVERHEAD = 4 / 3
+_JSON_ENVELOPE_HEADROOM = 256 * 1024
+
+
+def request_body_limit(max_image_size: int) -> int:
+    """Return the HTTP body limit needed to carry ``max_image_size`` as base64."""
+
+    return int(max_image_size * _BASE64_OVERHEAD) + _JSON_ENVELOPE_HEADROOM
+
 
 def _read_int(name: str, default: int, minimum: int, maximum: int) -> int:
     raw = os.environ.get(name)
@@ -94,6 +106,12 @@ class VisionConfig:
     sse_path: str = "/sse"
     message_path: str = "/messages/"
     stateless_http: bool = False
+
+    @property
+    def max_request_body_size(self) -> int:
+        """HTTP body limit sized to accept a maximum-size base64 image."""
+
+        return request_body_limit(self.max_image_size)
 
     @classmethod
     def from_env(cls) -> "VisionConfig":

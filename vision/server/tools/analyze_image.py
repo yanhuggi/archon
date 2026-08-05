@@ -12,7 +12,7 @@ from pydantic import Field
 
 from server.config import VisionConfig
 from server.instructions import ANALYZE_IMAGE_DESCRIPTION
-from server.providers import get_provider
+from server.providers import ImageProvider, get_provider
 from server.providers.mimo import DEFAULT_PROMPT, display_image_source
 
 
@@ -104,12 +104,23 @@ def register(
     mcp: MCPServer,
     default_provider: str = "mimo",
     config: VisionConfig | None = None,
+    provider: ImageProvider | None = None,
 ) -> None:
     """Register the single-provider image analysis tool.
 
     ``config`` should be the same configuration the provider was built with, so
     that tool-layer envelopes report the model the server actually uses.
+
+    ``provider`` binds this tool to one backend instance. Prefer it over
+    ``default_provider``: the name-based registry is process-global, so two
+    servers created in one process would otherwise share whichever provider
+    registered last, along with its API key, model, and limits.
     """
+
+    def _resolve_provider() -> ImageProvider:
+        if provider is not None:
+            return provider
+        return get_provider(default_provider)
 
     @mcp.tool(
         name="analyze_image",
@@ -123,14 +134,24 @@ def register(
         ),
         structured_output=False,
     )
+    # The bounds below are advertised in the JSON schema but deliberately not
+    # enforced by Field(min_length/max_length): a schema rejection raises a
+    # generic ToolError instead of the documented JSON envelope. The function
+    # body enforces them so every failure has the same shape.
     def analyze_image(
         image_source: Annotated[
             str,
-            Field(min_length=1, description="Image URL, base64 data URI, or authorized JPEG/PNG path."),
+            Field(
+                description="Image URL, base64 data URI, or authorized JPEG/PNG path.",
+                json_schema_extra={"minLength": 1},
+            ),
         ],
         prompt: Annotated[
             str,
-            Field(min_length=1, max_length=MAX_PROMPT_LENGTH, description="Focused visual question."),
+            Field(
+                description="Focused visual question.",
+                json_schema_extra={"minLength": 1, "maxLength": MAX_PROMPT_LENGTH},
+            ),
         ] = DEFAULT_PROMPT,
     ) -> str:
         """Analyze one image and return a stable JSON result envelope."""
@@ -162,7 +183,7 @@ def register(
             )
 
         try:
-            provider = get_provider(default_provider)
+            active_provider = _resolve_provider()
         except ValueError as exc:
             return _error_response(
                 image_source,
@@ -173,7 +194,7 @@ def register(
             )
 
         try:
-            raw = provider.understand(image_source.strip(), prompt=normalized_prompt)
+            raw = active_provider.understand(image_source.strip(), prompt=normalized_prompt)
         except Exception as exc:  # pragma: no cover - defensive provider boundary
             LOGGER.exception("analyze_image provider failed")
             return _error_response(

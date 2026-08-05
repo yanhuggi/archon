@@ -108,6 +108,8 @@ claude mcp list
 | `image_source` | string | 必填 | HTTP/HTTPS URL、JPEG/PNG data URI 或授权的本地路径 |
 | `prompt` | string | `请详细描述这张图片的内容` | 聚焦的视觉问题，最长 4000 字符 |
 
+参数边界在 JSON Schema 中声明，同时由服务在运行时校验。越界输入（空 `prompt`、超长 `prompt`、空 `image_source`）返回下文的标准错误 JSON，而不是通用的协议层报错。
+
 调用示例：
 
 ```text
@@ -257,6 +259,8 @@ archon-vision --transport streamable-http --host 127.0.0.1 --port 8000
 ```
 
 默认端点为 `http://127.0.0.1:8000/mcp`。服务未内置身份认证，不要直接绑定公网地址。
+
+请求体上限按 `MIMO_MAX_IMAGE_MB` 自动推算（Base64 有 4/3 膨胀，另加 JSON 包装余量），因此 data URI 形式的图片在 HTTP 模式下和 stdio 模式下有相同的体积上限。超过该上限的请求会在传输层返回 HTTP 413，不会进入 `analyze_image`。
 
 ### SSE（兼容模式）
 

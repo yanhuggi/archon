@@ -293,6 +293,108 @@ def test_create_server_wires_config_into_the_tool() -> None:
     assert mock_register.call_args.kwargs["config"] is config
 
 
+# ---------------------------------------------------------------------------
+# Server isolation
+# ---------------------------------------------------------------------------
+
+
+def test_two_servers_do_not_share_a_provider() -> None:
+    """A second create_server must not redirect the first server's calls."""
+    import asyncio
+
+    with patch("server.main.atexit.register"):
+        srv_a = create_server(VisionConfig(api_key="key-a", model="model-a"))
+        create_server(VisionConfig(api_key="key-b", model="model-b"))
+
+    sent: dict[str, str] = {}
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return {
+                "choices": [
+                    {"finish_reason": "stop", "message": {"role": "assistant", "content": "一张图"}}
+                ]
+            }
+
+    def _post(url, **kwargs):
+        sent["api_key"] = kwargs["headers"]["api-key"]
+        sent["model"] = kwargs["json"]["model"]
+        return _Response()
+
+    with patch("httpx.Client") as mock_client_cls:
+        mock_client_cls.return_value.post = _post
+        result = asyncio.run(
+            srv_a.call_tool("analyze_image", {"image_source": "https://e.com/a.png", "prompt": "描述"})
+        )
+
+    assert sent["api_key"] == "key-a", "server A used another server's credentials"
+    assert sent["model"] == "model-a"
+    assert "model-a" in str(result)
+
+
+def test_explicit_provider_beats_the_global_registry() -> None:
+    """An injected provider is used even when the registry names another one."""
+    register("mimo", _StubProvider("registry"))
+    injected = _StubProvider("injected")
+
+    mcp = MagicMock(spec=["tool"])
+    inner_decorator = MagicMock()
+    mcp.tool = lambda **kwargs: inner_decorator
+    register_tool(mcp, default_provider="mimo", provider=injected)
+    func = inner_decorator.call_args[0][0]
+
+    with patch.object(injected, "understand", wraps=injected.understand) as spy:
+        func("https://example.com/img.jpg", prompt="描述")
+
+    spy.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Schema bounds must not bypass the JSON envelope
+# ---------------------------------------------------------------------------
+
+
+def test_schema_advertises_bounds_without_hard_validation() -> None:
+    """Bounds stay visible to clients but are enforced in the function body."""
+    import asyncio
+
+    with patch("server.main.atexit.register"):
+        server = create_server(VisionConfig(api_key="key"))
+    tools = asyncio.run(server.list_tools())
+    schema = tools[0].input_schema["properties"]
+
+    assert schema["prompt"]["maxLength"] == 4000
+    assert schema["prompt"]["minLength"] == 1
+    assert schema["image_source"]["minLength"] == 1
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_code"),
+    [
+        ({"image_source": "https://e.com/a.png", "prompt": ""}, "invalid_prompt"),
+        ({"image_source": "https://e.com/a.png", "prompt": "a" * 4001}, "invalid_prompt"),
+        ({"image_source": "https://e.com/a.png", "prompt": "   "}, "invalid_prompt"),
+        ({"image_source": "", "prompt": "描述"}, "invalid_image_source"),
+        ({"image_source": "   ", "prompt": "描述"}, "invalid_image_source"),
+    ],
+)
+def test_out_of_bounds_arguments_return_the_json_envelope(kwargs: dict, expected_code: str) -> None:
+    """Boundary rejections must be envelopes, not generic SDK tool errors."""
+    import asyncio
+
+    with patch("server.main.atexit.register"):
+        server = create_server(VisionConfig(api_key="key"))
+
+    result = asyncio.run(server.call_tool("analyze_image", kwargs))
+    payload = json.loads(result.content[0].text)
+
+    assert payload["error_code"] == expected_code
+    assert set(payload) == _ERROR_KEYS
+
+
 def test_provider_error_envelope_is_complete() -> None:
     """An exception inside the provider still yields the full envelope."""
     func = _get_analyze_image_func()
