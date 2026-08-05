@@ -61,6 +61,44 @@ def test_main_runs_streamable_http_with_cli_overrides() -> None:
     )
 
 
+def test_main_builds_exactly_one_server() -> None:
+    """Startup must not build a second, unused server via module import."""
+    import server.main as module
+
+    with patch.object(module, "create_server", return_value=MagicMock()) as mock_create:
+        with patch("server.main.VisionConfig.from_env", return_value=VisionConfig(api_key="key")):
+            main([])
+    assert mock_create.call_count == 1
+
+
+def test_module_level_mcp_is_lazy_and_cached() -> None:
+    """The `mcp` CLI entry point resolves on demand, then memoizes."""
+    import server.main as module
+
+    globals_dict = vars(module)
+    had_mcp = "mcp" in globals_dict
+    previous = globals_dict.get("mcp")
+    globals_dict.pop("mcp", None)
+    try:
+        sentinel = MagicMock()
+        with patch.object(module, "create_server", return_value=sentinel) as mock_create:
+            first = module.mcp
+            second = module.mcp
+        assert first is sentinel and second is sentinel
+        assert mock_create.call_count == 1
+    finally:
+        globals_dict.pop("mcp", None)
+        if had_mcp:
+            globals_dict["mcp"] = previous
+
+
+def test_module_getattr_still_rejects_unknown_names() -> None:
+    import server.main as module
+
+    with pytest.raises(AttributeError, match="no attribute 'nope'"):
+        module.nope
+
+
 def test_cli_rejects_invalid_port() -> None:
     args = _build_parser().parse_args(["--port", "0"])
     with pytest.raises(ValueError, match="between 1 and 65535"):

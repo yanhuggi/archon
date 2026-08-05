@@ -16,8 +16,9 @@
 - 支持 HTTP/HTTPS URL、JPEG/PNG Base64 data URI 和授权目录内的本地 JPEG/PNG。
 - MCP server instructions 和工具描述包含调用边界、提示词写法及不确定性要求。
 - `analyze_image` 始终可发现；未配置 API Key 时返回稳定的配置错误。
-- 本地路径、文件类型、文件签名和大小在上传前校验。
+- 本地路径、文件类型、文件签名和大小在上传前校验；FIFO 等特殊文件被立即拒绝，不会阻塞服务线程。
 - 完整 Base64 不会回显到结果中，避免无意义地占用模型上下文。
+- 上游输出被 token 上限截断时会显式标记，不会把半截答案当成完整结果。
 - 日志写入 `stderr`，不会污染 stdio MCP 的 JSON-RPC 通道。
 
 > 本地图片内容会发送给第三方小米 MiMo API。不要提交未获授权或包含无关敏感信息的文件。模型输出也可能存在 OCR、数值和细节识别错误，不应被无条件视为事实。
@@ -132,6 +133,21 @@ analyze_image(image_source="C:/work/ui.png", prompt="比较左右两栏，只描
 
 对于 Base64 输入，`image_url` 只返回 `data:image/png;base64,<omitted>`，不会重复完整载荷。
 
+如果模型输出撞上 `MIMO_MAX_TOKENS` 上限被截断，响应会额外带上 `truncated: true` 和 `finish_reason: "length"`：
+
+```json
+{
+  "image_url": "/project/screenshots/error.png",
+  "prompt": "完整读取错误信息",
+  "understanding": "错误对话框的第一行是 Connection ref",
+  "model": "mimo-v2.5",
+  "truncated": true,
+  "finish_reason": "length"
+}
+```
+
+出现这两个字段时 `understanding` 是不完整的答案，不应作为完整 OCR 文本或最终数值使用。可以提高 `MIMO_MAX_TOKENS`，或改用更聚焦的 `prompt` 缩小输出范围。
+
 ### 失败响应
 
 ```json
@@ -145,6 +161,8 @@ analyze_image(image_source="C:/work/ui.png", prompt="比较左右两栏，只描
 }
 ```
 
+失败响应的字段集合固定不变，与哪一层拒绝了调用无关，调用方可以用同一套逻辑解析。
+
 常见 `error_code`：
 
 | 代码 | 含义 |
@@ -155,7 +173,7 @@ analyze_image(image_source="C:/work/ui.png", prompt="比较左右两栏，只描
 | `authentication_error` | MiMo API 鉴权失败 |
 | `rate_limited` | MiMo API 返回 429 |
 | `upstream_error` | MiMo 网络或其他 HTTP 错误 |
-| `invalid_provider_response` | 上游响应不符合契约 |
+| `invalid_provider_response` | 上游响应不符合契约，或返回了非 JSON 内容 |
 | `provider_error` | provider 出现未预期异常 |
 
 ## Claude Code 模型策略

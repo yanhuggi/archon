@@ -18,12 +18,11 @@ from urllib.request import url2pathname
 
 import httpx
 
-from server.config import DEFAULT_MAX_IMAGE_MB, DEFAULT_MODEL, VisionConfig
+from server.config import VisionConfig
 
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_PROMPT = "请详细描述这张图片的内容"
-_MAX_IMAGE_SIZE = DEFAULT_MAX_IMAGE_MB * 1024 * 1024
 _IMAGE_EXT_MIME = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -31,6 +30,13 @@ _IMAGE_EXT_MIME = {
 }
 _DATA_URI_RE = re.compile(r"^data:(image/(?:jpeg|png));base64,([A-Za-z0-9+/]*={0,2})$")
 _WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_BASE64_WHITESPACE_RE = re.compile(r"\s+")
+
+# Opening a FIFO or other blocking special file must never park the calling
+# thread: the MCP tool runs in a bounded worker pool, so a parked thread is a
+# permanently lost worker. O_NONBLOCK makes such an open return immediately;
+# the fstat S_ISREG check below then rejects the file.
+_NONBLOCK_FLAG = getattr(os, "O_NONBLOCK", 0)
 
 
 def display_image_source(source: str) -> str:
@@ -68,6 +74,24 @@ def _local_path_from_file_url(source: str) -> str:
     return unquote(parsed.path)
 
 
+def _clear_nonblock(fd: int) -> None:
+    """Drop O_NONBLOCK once the descriptor is known to be a regular file.
+
+    Regular-file reads ignore the flag, but clearing it keeps ``os.read``
+    semantics identical to a plain blocking open.
+    """
+
+    if not _NONBLOCK_FLAG:  # pragma: no cover - Windows has no O_NONBLOCK
+        return
+    try:
+        import fcntl
+
+        current = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, current & ~_NONBLOCK_FLAG)
+    except (ImportError, OSError) as exc:  # pragma: no cover - defensive
+        LOGGER.debug("Could not clear O_NONBLOCK: %s", exc)
+
+
 def _validate_image_signature(data: bytes, mime: str) -> None:
     if mime == "image/jpeg" and not data.startswith(b"\xff\xd8\xff"):
         raise ValueError("File content does not match JPEG format")
@@ -86,6 +110,12 @@ def process_image_source(source: str, config: VisionConfig | None = None) -> str
         source = source[1:]
 
     if source.startswith("data:"):
+        # MIME encoders commonly wrap base64 at 76 columns. Such a payload is
+        # still unambiguous, so strip the whitespace instead of reporting it as
+        # an unsupported image format.
+        header, separator, payload = source.partition(",")
+        if separator and _BASE64_WHITESPACE_RE.search(payload):
+            source = f"{header},{_BASE64_WHITESPACE_RE.sub('', payload)}"
         match = _DATA_URI_RE.fullmatch(source)
         if match is None:
             raise ValueError("Invalid data URI; only base64 JPEG and PNG images are supported")
@@ -123,7 +153,7 @@ def process_image_source(source: str, config: VisionConfig | None = None) -> str
     resolved = Path(os.path.realpath(source))
     _validate_path_safe(resolved, config)
 
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | _NONBLOCK_FLAG
     try:
         fd = os.open(str(resolved), flags)
     except FileNotFoundError as exc:
@@ -135,6 +165,7 @@ def process_image_source(source: str, config: VisionConfig | None = None) -> str
         opened_stat = os.fstat(fd)
         if not stat.S_ISREG(opened_stat.st_mode):
             raise ValueError(f"Not a regular file: {resolved}")
+        _clear_nonblock(fd)
 
         # Confirm that validation and opening resolved to the same file.
         current_stat = os.stat(resolved)
@@ -225,15 +256,12 @@ class MimoVisionProvider:
                 self._client_timeout = config.timeout
             return self._http_client
 
-    def _api_url(self) -> str:
-        return self._config().base_url.rstrip("/") + "/chat/completions"
+    def _api_url(self, config: VisionConfig | None = None) -> str:
+        return (config or self._config()).base_url.rstrip("/") + "/chat/completions"
 
     def _model(self, **kwargs: object) -> str:
         value = kwargs.get("model")
         return str(value).strip() if value else self._config().model
-
-    def _api_key(self) -> str | None:
-        return self._config().api_key
 
     def understand(self, image_source: str, prompt: str = DEFAULT_PROMPT, **kwargs: object) -> str:
         """Analyze one validated image and return a stable JSON envelope."""
@@ -284,7 +312,7 @@ class MimoVisionProvider:
 
         try:
             response = self._get_client(config).post(
-                config.base_url.rstrip("/") + "/chat/completions",
+                self._api_url(config),
                 headers={
                     "api-key": config.api_key,
                     "Accept": "application/json",
@@ -293,7 +321,19 @@ class MimoVisionProvider:
                 json=body,
             )
             response.raise_for_status()
-            data = response.json()
+            try:
+                data = response.json()
+            except ValueError as exc:
+                # A 200 with a non-JSON body (gateway error page, truncated
+                # stream) is an upstream contract violation, not a local bug.
+                LOGGER.warning("MiMo returned a non-JSON body: %s", exc)
+                return _error_response(
+                    image_source,
+                    prompt,
+                    model,
+                    "invalid_provider_response",
+                    "MiMo returned a response that is not valid JSON",
+                )
             return self._format(image_source, prompt, model, data)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
@@ -350,10 +390,15 @@ class MimoVisionProvider:
                 "MiMo response contains no analysis text",
             )
 
-        result = {
+        result: dict[str, Any] = {
             "image_url": display_image_source(image_source),
             "prompt": prompt,
             "understanding": content.strip(),
             "model": model,
         }
+        # A length-capped reply is a partial answer. Flag it so callers do not
+        # treat half-read OCR text or a cut-off value as the complete result.
+        if choices[0].get("finish_reason") == "length":
+            result["truncated"] = True
+            result["finish_reason"] = "length"
         return json.dumps(result, ensure_ascii=False)

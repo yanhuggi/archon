@@ -207,3 +207,60 @@ def test_analyze_image_handles_invalid_provider_json() -> None:
     with patch("server.tools.analyze_image.get_provider", return_value=provider):
         data = json.loads(func("https://example.com/img.jpg"))
     assert data["error_code"] == "invalid_provider_response"
+
+
+# ---------------------------------------------------------------------------
+# Response envelope shape
+# ---------------------------------------------------------------------------
+
+_ENVELOPE_KEYS = {"image_url", "prompt", "understanding", "model"}
+_ERROR_KEYS = _ENVELOPE_KEYS | {"error", "error_code"}
+
+
+def test_tool_layer_errors_match_the_documented_envelope() -> None:
+    """Every tool-layer failure carries the same keys as a provider failure."""
+    cases = [
+        (_get_analyze_image_func(), ("https://example.com/img.jpg", "   "), "invalid_prompt"),
+        (_get_analyze_image_func(), ("   ", "q"), "invalid_image_source"),
+        (
+            _get_analyze_image_func_from_registration("nonexistent"),
+            ("https://example.com/img.jpg", "q"),
+            "provider_unavailable",
+        ),
+    ]
+    for func, args, expected_code in cases:
+        data = json.loads(func(*args))
+        assert data["error_code"] == expected_code
+        assert set(data) == _ERROR_KEYS, f"{expected_code} envelope: {sorted(data)}"
+        assert data["understanding"] == ""
+
+
+def test_tool_layer_error_reports_configured_model() -> None:
+    """The error envelope's model field reflects configuration, not a guess."""
+    func = _get_analyze_image_func_from_registration("nonexistent")
+    with patch.dict("os.environ", {"MIMO_MODEL": "mimo-v9"}):
+        data = json.loads(func("https://example.com/img.jpg"))
+    assert data["model"] == "mimo-v9"
+
+
+def test_provider_error_envelope_is_complete() -> None:
+    """An exception inside the provider still yields the full envelope."""
+    func = _get_analyze_image_func()
+    provider = MagicMock()
+    provider.understand.side_effect = RuntimeError("boom")
+    with patch("server.tools.analyze_image.get_provider", return_value=provider):
+        data = json.loads(func("https://example.com/img.jpg"))
+    assert data["error_code"] == "provider_error"
+    assert set(data) == _ERROR_KEYS
+
+
+def test_partial_provider_response_is_backfilled() -> None:
+    """A provider reply missing contract keys is completed, not passed through."""
+    func = _get_analyze_image_func()
+    provider = MagicMock()
+    provider.understand.return_value = json.dumps({"understanding": "看到一只猫"})
+    with patch("server.tools.analyze_image.get_provider", return_value=provider):
+        data = json.loads(func("https://example.com/img.jpg", prompt="有什么动物"))
+    assert set(data) == _ENVELOPE_KEYS
+    assert data["understanding"] == "看到一只猫"
+    assert data["prompt"] == "有什么动物"

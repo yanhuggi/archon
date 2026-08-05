@@ -9,7 +9,11 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from server.providers.mimo import MimoVisionProvider, process_image_source, _MAX_IMAGE_SIZE
+from server.config import VisionConfig
+from server.providers.mimo import MimoVisionProvider, process_image_source
+
+# The production size ceiling comes from configuration, not a module constant.
+_MAX_IMAGE_SIZE = VisionConfig().max_image_size
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +519,52 @@ def test_empty_response(provider: MimoVisionProvider) -> None:
     assert data["error_code"] == "invalid_provider_response"
 
 
+def test_non_json_body_is_a_provider_contract_error(provider: MimoVisionProvider) -> None:
+    """A 200 response with a non-JSON body maps to invalid_provider_response."""
+    with patch.dict("os.environ", {"MIMO_API_KEY": "test-key"}):
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client = mock_client_cls.return_value
+            mock_client.post.return_value.json.side_effect = ValueError("Expecting value")
+
+            data = json.loads(provider.understand("https://example.com/img.jpg"))
+
+    assert data["error_code"] == "invalid_provider_response"
+    assert data["understanding"] == ""
+    assert "not valid JSON" in data["error"]
+
+
+def test_truncated_reply_is_flagged(provider: MimoVisionProvider,
+                                    mimo_api_response: dict) -> None:
+    """A length-capped reply is marked so callers do not trust it as complete."""
+    response = dict(mimo_api_response)
+    response["choices"][0]["finish_reason"] = "length"
+
+    with patch.dict("os.environ", {"MIMO_API_KEY": "test-key"}):
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client = mock_client_cls.return_value
+            mock_client.post.return_value.json.return_value = response
+
+            data = json.loads(provider.understand("https://example.com/img.jpg"))
+
+    assert data["truncated"] is True
+    assert data["finish_reason"] == "length"
+    assert data["understanding"]
+
+
+def test_complete_reply_is_not_flagged(provider: MimoVisionProvider,
+                                       mimo_api_response: dict) -> None:
+    """A normal stop reason adds no truncation keys."""
+    with patch.dict("os.environ", {"MIMO_API_KEY": "test-key"}):
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client = mock_client_cls.return_value
+            mock_client.post.return_value.json.return_value = mimo_api_response
+
+            data = json.loads(provider.understand("https://example.com/img.jpg"))
+
+    assert "truncated" not in data
+    assert "finish_reason" not in data
+
+
 def test_empty_choices(provider: MimoVisionProvider) -> None:
     """understand handles empty choices list."""
     with patch.dict("os.environ", {"MIMO_API_KEY": "test-key"}):
@@ -567,6 +617,42 @@ def test_process_local_file_no_extension(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="no extension"):
         process_image_source(str(img))
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs need POSIX")
+def test_process_fifo_does_not_block(tmp_path: Path) -> None:
+    """A FIFO named like an image is rejected instead of parking the thread."""
+    import threading
+
+    fifo = tmp_path / "trap.png"
+    os.mkfifo(fifo)
+
+    outcome: dict[str, str] = {}
+    finished = threading.Event()
+
+    def call() -> None:
+        try:
+            process_image_source(str(fifo))
+        except BaseException as exc:  # noqa: BLE001 - record whatever surfaces
+            outcome["error"] = f"{type(exc).__name__}: {exc}"
+        finished.set()
+
+    threading.Thread(target=call, daemon=True).start()
+    assert finished.wait(timeout=10), "process_image_source blocked on a FIFO"
+    assert "Not a regular file" in outcome.get("error", "")
+
+
+def test_process_data_uri_accepts_wrapped_base64() -> None:
+    """Line-wrapped base64, as produced by MIME encoders, is accepted."""
+    import base64
+
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    encoded = base64.b64encode(png).decode("ascii")
+    wrapped = "\n".join(encoded[i:i + 20] for i in range(0, len(encoded), 20))
+
+    result = process_image_source(f"data:image/png;base64,{wrapped}")
+
+    assert result == f"data:image/png;base64,{encoded}"
 
 
 def test_process_local_file_not_regular(tmp_path: Path) -> None:

@@ -10,6 +10,7 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from server.config import VisionConfig
 from server.instructions import ANALYZE_IMAGE_DESCRIPTION
 from server.providers import get_provider
 from server.providers.mimo import DEFAULT_PROMPT, display_image_source
@@ -19,12 +20,24 @@ LOGGER = logging.getLogger(__name__)
 MAX_PROMPT_LENGTH = 4000
 
 
+def _configured_model() -> str:
+    """Return the configured model name for tool-layer error envelopes."""
+
+    try:
+        return VisionConfig.from_env().model
+    except Exception:  # pragma: no cover - config parsing is already defensive
+        return ""
+
+
 def _error_response(image_source: object, prompt: object, code: str, message: str) -> str:
+    # Keep the same key set as the provider-layer envelope so callers can parse
+    # any failure identically, regardless of which layer rejected the call.
     return json.dumps(
         {
             "image_url": display_image_source(image_source if isinstance(image_source, str) else ""),
             "prompt": prompt if isinstance(prompt, str) else "",
             "understanding": "",
+            "model": _configured_model(),
             "error": message,
             "error_code": code,
         },
@@ -52,6 +65,7 @@ def _ensure_response(raw: object, image_source: str, prompt: str) -> str:
     data.setdefault("image_url", display_image_source(image_source))
     data.setdefault("prompt", prompt)
     data.setdefault("understanding", "")
+    data.setdefault("model", _configured_model())
     return json.dumps(data, ensure_ascii=False)
 
 
