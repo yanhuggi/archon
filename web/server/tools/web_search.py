@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Annotated, Literal
+from typing import Annotated
 
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from server.instructions import WEB_SEARCH_DESCRIPTION
-from server.providers import get_provider
+from server.providers import SearchProvider, get_provider
 
 
 LOGGER = logging.getLogger(__name__)
@@ -19,7 +19,7 @@ MAX_QUERY_LENGTH = 500
 MIN_RESULTS = 1
 MAX_RESULTS = 20
 DEFAULT_RESULTS = 8
-TimeRange = Literal["day", "week", "month", "year"]
+TIME_RANGES = ("day", "week", "month", "year")
 
 
 def _json_error(query: str, code: str, message: str) -> str:
@@ -51,7 +51,7 @@ def _normalize_query(query: object) -> tuple[str, str | None]:
 
 
 def _normalize_max_results(value: object) -> int | None:
-    """Convert a direct Python call into a safe result limit."""
+    """Convert a tool argument into a safe result limit."""
 
     if isinstance(value, bool):
         return None
@@ -60,6 +60,22 @@ def _normalize_max_results(value: object) -> int | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return min(max(result, MIN_RESULTS), MAX_RESULTS)
+
+
+def _normalize_time_range(value: object) -> tuple[str | None, str | None]:
+    """Normalize ``time_range`` and return ``(value, error_message)``."""
+
+    if value is None:
+        return None, None
+    if not isinstance(value, str):
+        return None, "time_range must be a string"
+    normalized = value.strip().lower()
+    if not normalized:
+        return None, None
+    if normalized not in TIME_RANGES:
+        allowed = ", ".join(TIME_RANGES)
+        return None, f"time_range must be one of: {allowed}"
+    return normalized, None
 
 
 def _ensure_json_response(raw: object, query: str) -> str:
@@ -89,8 +105,23 @@ def _ensure_json_response(raw: object, query: str) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
-def register(mcp: MCPServer) -> None:
-    """Register the ``web_search`` tool on an MCP server."""
+def register(
+    mcp: MCPServer,
+    default_provider: str = "duckduckgo",
+    provider: SearchProvider | None = None,
+) -> None:
+    """Register the ``web_search`` tool on an MCP server.
+
+    ``provider`` binds this tool to one backend instance. Prefer it over
+    ``default_provider``: the name-based registry is process-global, so two
+    servers created in one process would otherwise share whichever provider
+    registered last, along with its timeout, proxy, and rate-limit settings.
+    """
+
+    def _resolve_provider() -> SearchProvider:
+        if provider is not None:
+            return provider
+        return get_provider(default_provider)
 
     @mcp.tool(
         name="web_search",
@@ -106,20 +137,32 @@ def register(mcp: MCPServer) -> None:
         # MCP clients. The envelope is still machine-readable and versioned.
         structured_output=False,
     )
+    # The bounds below are advertised in the JSON schema but deliberately not
+    # enforced by Field(min_length/max_length/ge/le): a schema rejection raises
+    # a generic ToolError instead of the documented JSON envelope. The function
+    # body enforces them so every rejection has the same shape.
     def web_search(
         query: Annotated[
             str,
             Field(
-                min_length=1,
-                max_length=MAX_QUERY_LENGTH,
                 description="Focused web search terms (1-500 characters).",
+                json_schema_extra={"minLength": 1, "maxLength": MAX_QUERY_LENGTH},
             ),
         ],
         max_results: Annotated[
             int,
-            Field(ge=MIN_RESULTS, le=MAX_RESULTS, description="Number of results (1-20)."),
+            Field(
+                description="Number of results (1-20).",
+                json_schema_extra={"minimum": MIN_RESULTS, "maximum": MAX_RESULTS},
+            ),
         ] = DEFAULT_RESULTS,
-        time_range: TimeRange | None = None,
+        time_range: Annotated[
+            str | None,
+            Field(
+                description="Optional recency filter: day, week, month, or year.",
+                json_schema_extra={"enum": [*TIME_RANGES, None]},
+            ),
+        ] = None,
     ) -> str:
         """Search the public web and return a stable JSON result envelope."""
 
@@ -131,17 +174,21 @@ def register(mcp: MCPServer) -> None:
         if normalized_limit is None:
             return _json_error(normalized_query, "invalid_max_results", "max_results must be an integer")
 
+        normalized_range, range_error = _normalize_time_range(time_range)
+        if range_error:
+            return _json_error(normalized_query, "invalid_time_range", range_error)
+
         try:
-            provider = get_provider("duckduckgo")
+            active_provider = _resolve_provider()
         except ValueError as exc:
             return _json_error(normalized_query, "provider_unavailable", str(exc))
 
         kwargs: dict[str, object] = {}
-        if time_range is not None:
-            kwargs["time_range"] = time_range
+        if normalized_range is not None:
+            kwargs["time_range"] = normalized_range
 
         try:
-            raw = provider.search(normalized_query, max_results=normalized_limit, **kwargs)
+            raw = active_provider.search(normalized_query, max_results=normalized_limit, **kwargs)
         except Exception as exc:  # pragma: no cover - defensive for third-party providers
             LOGGER.exception("web_search provider failed")
             return _json_error(

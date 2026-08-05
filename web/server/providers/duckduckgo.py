@@ -15,6 +15,7 @@ from typing import IO, Iterator
 from urllib.parse import urlparse
 
 from ddgs import DDGS
+from ddgs.exceptions import RatelimitException, TimeoutException
 
 from server.config import WebConfig
 
@@ -35,11 +36,33 @@ TIME_RANGE_TO_TIMELIMIT = {
     "year": "y",
 }
 
+# Han blocks that justify Chinese-localized results. The original single range
+# missed compatibility ideographs and every supplementary-plane extension, so
+# queries written with those characters silently fell back to ``us-en``.
+_HAN_RANGES = (
+    ("\u3400", "\u4dbf"),  # Extension A
+    ("\u4e00", "\u9fff"),  # CJK Unified Ideographs
+    ("\uf900", "\ufaff"),  # Compatibility Ideographs
+    ("\U00020000", "\U0003ffff"),  # Extensions B-I (supplementary planes)
+)
+# Kana implies Japanese. Those queries contain Han characters too, so without
+# this check a Japanese query would be routed to the Chinese region.
+_KANA_RANGES = (
+    ("\u3040", "\u30ff"),  # Hiragana and Katakana
+    ("\u31f0", "\u31ff"),  # Katakana Phonetic Extensions
+)
+
+
+def _in_ranges(char: str, ranges: tuple[tuple[str, str], ...]) -> bool:
+    return any(low <= char <= high for low, high in ranges)
+
 
 def _region_for_query(query: str) -> str:
     """Use Chinese-localized results when the query contains Han text."""
 
-    if any("\u3400" <= char <= "\u9fff" for char in query):
+    if any(_in_ranges(char, _KANA_RANGES) for char in query):
+        return "us-en"
+    if any(_in_ranges(char, _HAN_RANGES) for char in query):
         return "cn-zh"
     return "us-en"
 
@@ -181,9 +204,21 @@ def _error_response(query: str, message: str, code: str = "search_failed") -> st
 class DuckDuckGoProvider:
     """Search provider backed by a stable no-key ``ddgs`` text engine.
 
-    No API key is required. Request spacing, timeout, and proxy settings are
-    controlled by :class:`server.config.WebConfig` environment variables.
+    No API key is required. Request spacing, timeout, and proxy settings come
+    from :class:`server.config.WebConfig`. Pass a config to bind this provider
+    to fixed settings; omit it to re-read ``ARCHON_WEB_*`` on every search.
     """
+
+    def __init__(self, config: WebConfig | None = None) -> None:
+        self._config = config
+
+    def _active_config(self) -> WebConfig:
+        # A provider built with an explicit config must keep using it. Reading
+        # the environment here instead would silently discard CLI overrides and
+        # any per-server configuration the caller chose.
+        if self._config is not None:
+            return self._config
+        return WebConfig.from_env()
 
     def search(
         self,
@@ -199,12 +234,16 @@ class DuckDuckGoProvider:
         if not normalized_query:
             return _error_response("", "query must not be empty", "invalid_query")
 
+        if isinstance(max_results, bool):
+            return _error_response(
+                normalized_query, "max_results must be an integer", "invalid_max_results"
+            )
         try:
             normalized_limit = min(max(int(max_results), 1), MAX_RESULTS)
         except (TypeError, ValueError, OverflowError):
             return _error_response(normalized_query, "max_results must be an integer", "invalid_max_results")
 
-        config = WebConfig.from_env()
+        config = self._active_config()
         _rate_limit(config.interval, config.rate_limit_file)
 
         text_kwargs: dict[str, object] = {"max_results": normalized_limit}
@@ -232,6 +271,20 @@ class DuckDuckGoProvider:
                     "result_count": len(results),
                 },
                 ensure_ascii=False,
+            )
+        except RatelimitException as exc:
+            LOGGER.warning("Web search upstream rate-limited the request: %s", exc)
+            return _error_response(
+                normalized_query,
+                f"Web search provider rate-limited the request: {exc}",
+                "rate_limited",
+            )
+        except TimeoutException as exc:
+            LOGGER.warning("Web search upstream timed out after %ss: %s", config.timeout, exc)
+            return _error_response(
+                normalized_query,
+                f"Web search provider timed out after {config.timeout}s: {exc}",
+                "upstream_timeout",
             )
         except Exception as exc:
             LOGGER.error("Web search provider failed: %s", exc)

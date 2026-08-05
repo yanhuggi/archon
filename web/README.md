@@ -15,7 +15,8 @@
 
 - 无需 API Key，安装后即可使用。
 - MCP server 内置使用边界、查询改写、来源核验和引用指引。
-- 工具参数包含长度/范围约束，并提供可选时间过滤。
+- 工具参数包含长度/范围约束，并提供可选时间过滤；参数校验失败同样返回 JSON 包络。
+- 中文查询自动使用中文区域结果，日文查询不会被误判为中文。
 - 成功与失败均返回稳定 JSON 包络，便于模型和程序消费。
 - 内置同一用户下的跨进程请求间隔，多个自动启动的 stdio 服务共享限流状态。
 - 日志写入 `stderr`，不会污染 stdio MCP 的 JSON-RPC 通道。
@@ -97,7 +98,7 @@ claude mcp list
 |---|---|---|---|
 | `query` | string | 必填 | 聚焦的搜索词，1–500 字符 |
 | `max_results` | integer | `8` | 返回数量，范围 1–20 |
-| `time_range` | string/null | `null` | 可选：`day`、`week`、`month`、`year` |
+| `time_range` | string/null | `null` | 可选：`day`、`week`、`month`、`year`，大小写不敏感 |
 
 调用示例：
 
@@ -152,9 +153,14 @@ web_search(query="site:docs.python.org asyncio TaskGroup", max_results=5)
 |---|---|
 | `invalid_query` | 查询为空或超过长度限制 |
 | `invalid_max_results` | 返回数量不是有效整数 |
+| `invalid_time_range` | `time_range` 不在 `day`/`week`/`month`/`year` 之内 |
 | `provider_unavailable` | 搜索 provider 未注册 |
 | `invalid_provider_response` | 上游返回内容不符合 JSON 契约 |
-| `upstream_error` | 搜索上游网络、限流或代理错误 |
+| `rate_limited` | 被搜索上游限流，可稍后重试 |
+| `upstream_timeout` | 上游在 `ARCHON_WEB_TIMEOUT` 内未返回 |
+| `upstream_error` | 其他搜索上游网络或代理错误 |
+
+`query` 长度、`max_results` 范围和 `time_range` 取值都会在 JSON Schema 中声明，但由工具内部校验并返回上面的包络，因此各类失败共享同一组字段，不会出现 MCP 层的通用报错。
 
 ## 模型使用策略
 
@@ -291,9 +297,10 @@ bash test_mcp.sh "MCP Python SDK 2.0" 5 week
 
 ## 常见问题
 
-### 返回 `upstream_error` 或频繁被限流
+### 返回 `rate_limited`、`upstream_timeout` 或 `upstream_error`
 
-- 增大 `ARCHON_WEB_DUCKDUCKGO_INTERVAL`，例如设为 `3` 或 `5`。
+- `rate_limited` 表示被上游限流：增大 `ARCHON_WEB_DUCKDUCKGO_INTERVAL`，例如设为 `3` 或 `5`。
+- `upstream_timeout` 表示上游未在期限内返回：增大 `ARCHON_WEB_TIMEOUT`，或检查代理链路。
 - 检查当前网络是否能访问公开搜索上游。
 - 如需代理，设置 `ARCHON_WEB_PROXY`。
 - 同一用户的多个本地进程会自动共享限流；不同主机、容器或用户仍各自计数。

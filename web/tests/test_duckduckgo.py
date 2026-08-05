@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from ddgs.exceptions import RatelimitException, TimeoutException
+
 import server.providers.duckduckgo as ddg_module
 from server.providers.duckduckgo import DuckDuckGoProvider, _rate_limit, _region_for_query
 
@@ -104,6 +106,16 @@ def test_search_passes_time_range_as_ddgs_timelimit(
     [
         ("福州天气预报 今天", "cn-zh"),
         ("MCP Python SDK", "us-en"),
+        # Han blocks outside the main CJK range must still select cn-zh.
+        ("繁體中文", "cn-zh"),
+        ("㐀", "cn-zh"),  # Extension A
+        ("豈更", "cn-zh"),  # Compatibility ideographs
+        ("\U00020000 字", "cn-zh"),  # Extension B, supplementary plane
+        # Kana means the query is Japanese, even when it contains Han.
+        ("ひらがな", "us-en"),
+        ("東京の天気", "us-en"),
+        ("日本語のテスト", "us-en"),
+        ("한국어 검색", "us-en"),
     ],
 )
 def test_search_selects_region_from_query(query: str, expected: str) -> None:
@@ -130,6 +142,39 @@ def test_search_configures_timeout_and_proxy(
     ):
         provider.search("query")
     mock_ddgs.assert_called_once_with(timeout=25, proxy="http://proxy.example:8080")
+
+
+def test_search_uses_injected_config_instead_of_environment(mock_ddgs: MagicMock) -> None:
+    """A provider built with a config must not re-read the environment.
+
+    Reading ``from_env`` here would discard CLI overrides such as --transport's
+    sibling settings and any per-server configuration the caller chose.
+    """
+    from server.config import WebConfig
+
+    configured = DuckDuckGoProvider(
+        WebConfig(interval=0.0, timeout=42, proxy="http://injected.example:1234")
+    )
+    with patch.dict(os.environ, {"ARCHON_WEB_TIMEOUT": "7", "ARCHON_WEB_PROXY": "http://env:9"}):
+        configured.search("query")
+
+    mock_ddgs.assert_called_once_with(timeout=42, proxy="http://injected.example:1234")
+
+
+def test_search_without_config_still_follows_environment(mock_ddgs: MagicMock) -> None:
+    """Omitting the config keeps the documented env-driven behavior."""
+    with patch.dict(os.environ, {"ARCHON_WEB_TIMEOUT": "33"}):
+        DuckDuckGoProvider().search("query")
+
+    mock_ddgs.assert_called_once_with(timeout=33)
+
+
+def test_search_rejects_boolean_max_results(provider: DuckDuckGoProvider, mock_ddgs: MagicMock) -> None:
+    """``True`` is an int in Python but never a meaningful result count."""
+    data = json.loads(provider.search("query", max_results=True))
+
+    assert data["error_code"] == "invalid_max_results"
+    mock_ddgs.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +253,32 @@ def test_search_ddgs_exception(provider: DuckDuckGoProvider, mock_ddgs: MagicMoc
     assert "Web search provider failed" in data["error"]
     assert "DDG blocked us" in data["error"]
     assert data["error_code"] == "upstream_error"
+    assert data["results"] == []
+
+
+def test_search_reports_rate_limiting_distinctly(
+    provider: DuckDuckGoProvider, mock_ddgs: MagicMock
+) -> None:
+    """Throttling is retryable; a generic upstream failure often is not."""
+    mock_ddgs.return_value.__enter__.return_value.text.side_effect = RatelimitException("slow down")
+
+    data = json.loads(provider.search("test"))
+
+    assert data["error_code"] == "rate_limited"
+    assert data["results"] == []
+    assert data["result_count"] == 0
+
+
+def test_search_reports_timeout_distinctly(
+    provider: DuckDuckGoProvider, mock_ddgs: MagicMock
+) -> None:
+    """A timeout tells the caller to widen ARCHON_WEB_TIMEOUT, not to retry blindly."""
+    mock_ddgs.return_value.__enter__.return_value.text.side_effect = TimeoutException("too slow")
+
+    data = json.loads(provider.search("test"))
+
+    assert data["error_code"] == "upstream_timeout"
+    assert "10s" in data["error"]
     assert data["results"] == []
 
 

@@ -6,6 +6,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import TypeAdapter
 
 from server.providers import register
 from server.providers.duckduckgo import DuckDuckGoProvider
@@ -148,6 +149,85 @@ def test_web_search_rejects_overlong_query() -> None:
 def test_web_search_rejects_non_integer_limit() -> None:
     data = json.loads(_get_web_search_func()("query", max_results="many"))
     assert data["error_code"] == "invalid_max_results"
+
+
+def test_web_search_rejects_boolean_limit() -> None:
+    """``True`` would otherwise pass ``int()`` and request one result."""
+    data = json.loads(_get_web_search_func()("query", max_results=True))
+    assert data["error_code"] == "invalid_max_results"
+
+
+@pytest.mark.parametrize("value", ["decade", "DAYS", "d"])
+def test_web_search_rejects_unknown_time_range_with_envelope(value: str) -> None:
+    """An unsupported range must not reach the provider as a silent no-op."""
+    stub = _StubProvider()
+    with patch("server.tools.web_search.get_provider", return_value=stub):
+        with patch.object(stub, "search", wraps=stub.search) as mock_search:
+            data = json.loads(_get_web_search_func()("query", time_range=value))
+
+    mock_search.assert_not_called()
+    assert data["error_code"] == "invalid_time_range"
+    assert "day, week, month, year" in data["error"]
+
+
+@pytest.mark.parametrize("value", ["WEEK", " week ", "Week"])
+def test_web_search_normalizes_time_range_case_and_padding(value: str) -> None:
+    stub = _StubProvider()
+    with patch("server.tools.web_search.get_provider", return_value=stub):
+        with patch.object(stub, "search", wraps=stub.search) as mock_search:
+            _get_web_search_func()("query", time_range=value)
+
+    mock_search.assert_called_once_with("query", max_results=8, time_range="week")
+
+
+def test_web_search_treats_blank_time_range_as_unset() -> None:
+    """A client sending "" should get an unfiltered search, not a rejection."""
+    stub = _StubProvider()
+    with patch("server.tools.web_search.get_provider", return_value=stub):
+        with patch.object(stub, "search", wraps=stub.search) as mock_search:
+            _get_web_search_func()("query", time_range="  ")
+
+    mock_search.assert_called_once_with("query", max_results=8)
+
+
+def test_bounds_are_advertised_without_schema_level_enforcement() -> None:
+    """Schema bounds guide clients; the body enforces them as JSON envelopes.
+
+    Field(min_length/max_length) would make the SDK raise a generic ToolError
+    for an out-of-range value, so a rejection would not share the documented
+    envelope shape with every other failure.
+    """
+    mcp = _MockMCP()
+    register_tool(mcp)
+    func = mcp.captured_tools["web_search"]["function"]
+
+    schema = TypeAdapter(func).json_schema()
+    query_schema = schema["properties"]["query"]
+    assert query_schema["minLength"] == 1
+    assert query_schema["maxLength"] == 500
+
+    # The bound is advertised, yet an over-long query still returns an envelope.
+    assert json.loads(func("x" * 501))["error_code"] == "invalid_query"
+
+
+def test_register_binds_a_provider_instance_over_the_global_registry() -> None:
+    """Two servers in one process must not share whichever provider was last.
+
+    The name-based registry is process-global, so resolving by name would make
+    the first server use the second server's timeout, proxy, and rate limits.
+    """
+    bound = _StubProvider()
+    mcp = _MockMCP()
+    register_tool(mcp, provider=bound)
+    func = mcp.captured_tools["web_search"]["function"]
+
+    with patch("server.tools.web_search.get_provider") as mock_get:
+        with patch.object(bound, "search", wraps=bound.search) as mock_search:
+            data = json.loads(func("query"))
+
+    mock_get.assert_not_called()
+    mock_search.assert_called_once()
+    assert data["result_count"] == 1
 
 
 def test_web_search_returns_consistent_provider_unavailable_error() -> None:

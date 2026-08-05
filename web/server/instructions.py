@@ -19,5 +19,6 @@ Do not use it for rewriting/translation. Query with 3-8 important words. Add
 date/location and `time_range` when useful; retry once on empty/off-topic
 results. Returns JSON
 `query`, `results[]` (`title`, `url`, `snippet`), `result_count`; failures add
-`error`, `error_code`.
+`error`, `error_code`. On `rate_limited` or `upstream_timeout`, retrying later
+may succeed; report the limitation instead of answering from memory.
 """

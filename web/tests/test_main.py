@@ -66,3 +66,60 @@ def test_cli_rejects_zero_port_instead_of_ignoring_it() -> None:
     args = _build_parser().parse_args(["--port", "0"])
     with pytest.raises(ValueError, match="between 1 and 65535"):
         _config_from_args(args, WebConfig())
+
+
+def test_two_servers_do_not_share_one_provider_config() -> None:
+    """The provider registry is process-global; each server must stay isolated.
+
+    Before this was fixed, creating a second server overwrote "duckduckgo", so
+    the first server's searches used the second server's timeout and proxy.
+    """
+    import server.main as main_module
+
+    server_a = create_server(WebConfig(interval=0.0, timeout=11, proxy="http://proxy-a:1"))
+    server_b = create_server(WebConfig(interval=0.0, timeout=22, proxy="http://proxy-b:2"))
+
+    seen: list[dict[str, object]] = []
+
+    class _RecordingDDGS:
+        def __init__(self, **kwargs: object) -> None:
+            seen.append(kwargs)
+
+        def __enter__(self) -> _RecordingDDGS:
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+        def text(self, query: str, **kwargs: object) -> list[dict[str, str]]:
+            return []
+
+    with patch("server.providers.duckduckgo.DDGS", _RecordingDDGS):
+        asyncio.run(server_a.call_tool("web_search", {"query": "x"}))
+        asyncio.run(server_b.call_tool("web_search", {"query": "x"}))
+
+    assert seen[0] == {"timeout": 11, "proxy": "http://proxy-a:1"}
+    assert seen[1] == {"timeout": 22, "proxy": "http://proxy-b:2"}
+    assert main_module is not None
+
+
+def test_module_level_mcp_is_built_lazily() -> None:
+    """Eager construction made every startup build a second unused server."""
+    import server.main as main_module
+
+    main_module.__dict__.pop("mcp", None)
+    with patch.object(main_module, "create_server", wraps=main_module.create_server) as spy:
+        assert "mcp" not in main_module.__dict__
+        first = main_module.mcp
+        second = main_module.mcp
+
+    assert first is second
+    spy.assert_called_once()
+
+
+def test_module_getattr_still_rejects_unknown_names() -> None:
+    import server.main as main_module
+
+    missing = "does_not_exist"
+    with pytest.raises(AttributeError, match="has no attribute"):
+        getattr(main_module, missing)

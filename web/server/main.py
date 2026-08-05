@@ -48,10 +48,14 @@ load_environment()
 
 
 def create_server(config: WebConfig | None = None) -> MCPServer:
-    """Create and configure an archon-web MCP server instance."""
+    """Create an isolated MCP server with one stable public tool."""
 
     config = config or WebConfig.from_env()
-    register_provider("duckduckgo", DuckDuckGoProvider())
+    provider = DuckDuckGoProvider(config)
+    # The registry stays populated for callers that resolve providers by name,
+    # but this server's tool holds the instance directly, so a later
+    # create_server cannot redirect it to a different timeout or proxy.
+    register_provider("duckduckgo", provider)
 
     server = MCPServer(
         name=SERVER_NAME,
@@ -61,13 +65,23 @@ def create_server(config: WebConfig | None = None) -> MCPServer:
         version=SERVER_VERSION,
         log_level=config.log_level,
     )
-    register_web_search(server)
+    register_web_search(server, provider=provider)
     return server
 
 
-# Kept as a public module attribute for MCP clients and existing integrations
-# that import ``server.main.mcp``.
-mcp = create_server()
+def __getattr__(name: str) -> object:
+    """Build the module-level ``mcp`` server only when something asks for it.
+
+    The ``mcp`` CLI discovers a server by looking up a module attribute named
+    ``mcp``, ``server``, or ``app``. Constructing it eagerly would make every
+    normal ``main()`` startup build a second, unused server and provider.
+    """
+
+    if name == "mcp":
+        server = create_server()
+        globals()["mcp"] = server
+        return server
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _build_parser() -> argparse.ArgumentParser:
