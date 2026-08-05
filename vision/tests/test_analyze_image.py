@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from server.config import VisionConfig
+from server.main import create_server
 from server.providers import register
 from server.providers.mimo import MimoVisionProvider
 from server.tools.analyze_image import register as register_tool
@@ -236,11 +238,59 @@ def test_tool_layer_errors_match_the_documented_envelope() -> None:
 
 
 def test_tool_layer_error_reports_configured_model() -> None:
-    """The error envelope's model field reflects configuration, not a guess."""
+    """Without an explicit config the error envelope falls back to the env."""
     func = _get_analyze_image_func_from_registration("nonexistent")
     with patch.dict("os.environ", {"MIMO_MODEL": "mimo-v9"}):
         data = json.loads(func("https://example.com/img.jpg"))
     assert data["model"] == "mimo-v9"
+
+
+def test_tool_layer_error_prefers_the_servers_fixed_config() -> None:
+    """A fixed-config server reports its own model, not the ambient env."""
+    mcp = MagicMock(spec=["tool"])
+    inner_decorator = MagicMock()
+    mcp.tool = lambda **kwargs: inner_decorator
+    register_tool(mcp, default_provider="nonexistent", config=VisionConfig(model="fixed-model"))
+    func = inner_decorator.call_args[0][0]
+
+    with patch.dict("os.environ", {"MIMO_MODEL": "env-model"}):
+        data = json.loads(func("https://example.com/img.jpg"))
+
+    assert data["model"] == "fixed-model"
+
+
+def test_every_envelope_from_one_server_reports_the_same_model() -> None:
+    """Success and tool-layer failure must not disagree about the model."""
+    config = VisionConfig(api_key="key", model="fixed-model")
+    with patch("server.main.atexit.register"):
+        create_server(config)
+
+    mcp = MagicMock(spec=["tool"])
+    inner_decorator = MagicMock()
+    mcp.tool = lambda **kwargs: inner_decorator
+    register_tool(mcp, default_provider="mimo", config=config)
+    func = inner_decorator.call_args[0][0]
+
+    with patch("httpx.Client") as mock_client_cls:
+        mock_client_cls.return_value.post.return_value.json.return_value = {
+            "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "一张图"}}]
+        }
+        success = json.loads(func("https://example.com/img.jpg", prompt="描述"))
+    provider_error = json.loads(func("/nonexistent/img.jpg", prompt="描述"))
+    tool_error = json.loads(func("   ", prompt="描述"))
+
+    assert success["model"] == "fixed-model"
+    assert provider_error["model"] == "fixed-model"
+    assert tool_error["model"] == "fixed-model"
+
+
+def test_create_server_wires_config_into_the_tool() -> None:
+    """create_server must hand its config to the tool registration."""
+    config = VisionConfig(api_key="key", model="wired-model")
+    with patch("server.main.atexit.register"):
+        with patch("server.main.register_analyze_image") as mock_register:
+            create_server(config)
+    assert mock_register.call_args.kwargs["config"] is config
 
 
 def test_provider_error_envelope_is_complete() -> None:

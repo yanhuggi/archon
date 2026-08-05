@@ -57,7 +57,7 @@ def create_server(config: VisionConfig | None = None) -> MCPServer:
         version=SERVER_VERSION,
         log_level=config.log_level,
     )
-    register_analyze_image(server)
+    register_analyze_image(server, config=config)
     return server
 
 

@@ -20,16 +20,29 @@ LOGGER = logging.getLogger(__name__)
 MAX_PROMPT_LENGTH = 4000
 
 
-def _configured_model() -> str:
-    """Return the configured model name for tool-layer error envelopes."""
+def _model_name(config: VisionConfig | None) -> str:
+    """Return the model name to report in tool-layer envelopes.
 
+    Prefer the config the server was built with, so a fixed-config server
+    reports the same model in every response. Fall back to the environment
+    only when no config was supplied.
+    """
+
+    if config is not None:
+        return config.model
     try:
         return VisionConfig.from_env().model
     except Exception:  # pragma: no cover - config parsing is already defensive
         return ""
 
 
-def _error_response(image_source: object, prompt: object, code: str, message: str) -> str:
+def _error_response(
+    image_source: object,
+    prompt: object,
+    code: str,
+    message: str,
+    config: VisionConfig | None = None,
+) -> str:
     # Keep the same key set as the provider-layer envelope so callers can parse
     # any failure identically, regardless of which layer rejected the call.
     return json.dumps(
@@ -37,7 +50,7 @@ def _error_response(image_source: object, prompt: object, code: str, message: st
             "image_url": display_image_source(image_source if isinstance(image_source, str) else ""),
             "prompt": prompt if isinstance(prompt, str) else "",
             "understanding": "",
-            "model": _configured_model(),
+            "model": _model_name(config),
             "error": message,
             "error_code": code,
         },
@@ -45,12 +58,23 @@ def _error_response(image_source: object, prompt: object, code: str, message: st
     )
 
 
-def _ensure_response(raw: object, image_source: str, prompt: str) -> str:
+def _ensure_response(
+    raw: object,
+    image_source: str,
+    prompt: str,
+    config: VisionConfig | None = None,
+) -> str:
     if isinstance(raw, str):
         try:
             data = json.loads(raw)
         except ValueError:
-            return _error_response(image_source, prompt, "invalid_provider_response", "Provider returned invalid JSON")
+            return _error_response(
+                image_source,
+                prompt,
+                "invalid_provider_response",
+                "Provider returned invalid JSON",
+                config,
+            )
     elif isinstance(raw, dict):
         data = raw
     else:
@@ -59,18 +83,33 @@ def _ensure_response(raw: object, image_source: str, prompt: str) -> str:
             prompt,
             "invalid_provider_response",
             "Provider returned an unsupported response",
+            config,
         )
     if not isinstance(data, dict):
-        return _error_response(image_source, prompt, "invalid_provider_response", "Provider response must be an object")
+        return _error_response(
+            image_source,
+            prompt,
+            "invalid_provider_response",
+            "Provider response must be an object",
+            config,
+        )
     data.setdefault("image_url", display_image_source(image_source))
     data.setdefault("prompt", prompt)
     data.setdefault("understanding", "")
-    data.setdefault("model", _configured_model())
+    data.setdefault("model", _model_name(config))
     return json.dumps(data, ensure_ascii=False)
 
 
-def register(mcp: MCPServer, default_provider: str = "mimo") -> None:
-    """Register the single-provider image analysis tool."""
+def register(
+    mcp: MCPServer,
+    default_provider: str = "mimo",
+    config: VisionConfig | None = None,
+) -> None:
+    """Register the single-provider image analysis tool.
+
+    ``config`` should be the same configuration the provider was built with, so
+    that tool-layer envelopes report the model the server actually uses.
+    """
 
     @mcp.tool(
         name="analyze_image",
@@ -97,9 +136,21 @@ def register(mcp: MCPServer, default_provider: str = "mimo") -> None:
         """Analyze one image and return a stable JSON result envelope."""
 
         if not isinstance(image_source, str) or not image_source.strip():
-            return _error_response(image_source, prompt, "invalid_image_source", "image_source must not be empty")
+            return _error_response(
+                image_source,
+                prompt,
+                "invalid_image_source",
+                "image_source must not be empty",
+                config,
+            )
         if not isinstance(prompt, str) or not prompt.strip():
-            return _error_response(image_source, prompt, "invalid_prompt", "prompt must not be empty")
+            return _error_response(
+                image_source,
+                prompt,
+                "invalid_prompt",
+                "prompt must not be empty",
+                config,
+            )
         normalized_prompt = prompt.strip()
         if len(normalized_prompt) > MAX_PROMPT_LENGTH:
             return _error_response(
@@ -107,12 +158,19 @@ def register(mcp: MCPServer, default_provider: str = "mimo") -> None:
                 normalized_prompt,
                 "invalid_prompt",
                 f"prompt must be at most {MAX_PROMPT_LENGTH} characters",
+                config,
             )
 
         try:
             provider = get_provider(default_provider)
         except ValueError as exc:
-            return _error_response(image_source, normalized_prompt, "provider_unavailable", str(exc))
+            return _error_response(
+                image_source,
+                normalized_prompt,
+                "provider_unavailable",
+                str(exc),
+                config,
+            )
 
         try:
             raw = provider.understand(image_source.strip(), prompt=normalized_prompt)
@@ -123,5 +181,6 @@ def register(mcp: MCPServer, default_provider: str = "mimo") -> None:
                 normalized_prompt,
                 "provider_error",
                 f"Image provider failed: {type(exc).__name__}: {exc}",
+                config,
             )
-        return _ensure_response(raw, image_source, normalized_prompt)
+        return _ensure_response(raw, image_source, normalized_prompt, config)
