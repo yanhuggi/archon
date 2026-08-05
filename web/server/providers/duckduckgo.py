@@ -36,6 +36,23 @@ TIME_RANGE_TO_TIMELIMIT = {
     "year": "y",
 }
 
+# ``ddgs`` 9.14.4 defines RatelimitException but never raises it: engine errors
+# are collected into one variable and re-raised as a bare DDGSException, and the
+# HTTP layer maps everything except primp.TimeoutError to DDGSException too.
+# Classifying throttling therefore has to read the message, and the upstream
+# status code is the only reliable signal in it.
+_RATE_LIMIT_MARKERS = (
+    "429",
+    "too many requests",
+    "ratelimit",
+    "rate limit",
+    "rate-limited",
+)
+# ddgs only converts a timeout to TimeoutException when the aggregated error
+# text happens to contain "timed out", so a "timeout" wording arrives as a
+# plain DDGSException. Match both spellings.
+_TIMEOUT_MARKERS = ("timed out", "timeout", "timedout")
+
 # Han blocks that justify Chinese-localized results. The original single range
 # missed compatibility ideographs and every supplementary-plane extension, so
 # queries written with those characters silently fell back to ``us-en``.
@@ -50,6 +67,7 @@ _HAN_RANGES = (
 _KANA_RANGES = (
     ("\u3040", "\u30ff"),  # Hiragana and Katakana
     ("\u31f0", "\u31ff"),  # Katakana Phonetic Extensions
+    ("\uff66", "\uff9d"),  # Half-width katakana, as produced by legacy IMEs
 )
 
 
@@ -188,6 +206,44 @@ def _clean_url(value: object) -> str:
     return url
 
 
+def _classify_upstream_failure(query: str, exc: BaseException, timeout: int) -> str:
+    """Map an upstream failure to the narrowest documented error code.
+
+    ``ddgs`` flattens engine failures into ``DDGSException`` with the original
+    error only present as text, so the exception type alone cannot distinguish
+    throttling from a dead connection. Inspect the chained messages, which is
+    where the upstream status code survives.
+    """
+
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    # Walk the chain: ddgs raises DDGSException *from* the original error, so
+    # the status code often lives on __cause__ rather than the outer message.
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        parts.append(f"{type(current).__name__}: {current}")
+        current = current.__cause__ or current.__context__
+    text = " ".join(parts).lower()
+
+    if isinstance(exc, RatelimitException) or any(marker in text for marker in _RATE_LIMIT_MARKERS):
+        LOGGER.warning("Web search upstream rate-limited the request: %s", exc)
+        return _error_response(
+            query,
+            f"Web search provider rate-limited the request: {exc}",
+            "rate_limited",
+        )
+    if isinstance(exc, TimeoutException) or any(marker in text for marker in _TIMEOUT_MARKERS):
+        LOGGER.warning("Web search upstream timed out after %ss: %s", timeout, exc)
+        return _error_response(
+            query,
+            f"Web search provider timed out after {timeout}s: {exc}",
+            "upstream_timeout",
+        )
+    LOGGER.error("Web search provider failed: %s", exc)
+    return _error_response(query, f"Web search provider failed: {exc}", "upstream_error")
+
+
 def _error_response(query: str, message: str, code: str = "search_failed") -> str:
     return json.dumps(
         {
@@ -272,27 +328,8 @@ class DuckDuckGoProvider:
                 },
                 ensure_ascii=False,
             )
-        except RatelimitException as exc:
-            LOGGER.warning("Web search upstream rate-limited the request: %s", exc)
-            return _error_response(
-                normalized_query,
-                f"Web search provider rate-limited the request: {exc}",
-                "rate_limited",
-            )
-        except TimeoutException as exc:
-            LOGGER.warning("Web search upstream timed out after %ss: %s", config.timeout, exc)
-            return _error_response(
-                normalized_query,
-                f"Web search provider timed out after {config.timeout}s: {exc}",
-                "upstream_timeout",
-            )
         except Exception as exc:
-            LOGGER.error("Web search provider failed: %s", exc)
-            return _error_response(
-                normalized_query,
-                f"Web search provider failed: {exc}",
-                "upstream_error",
-            )
+            return _classify_upstream_failure(normalized_query, exc, config.timeout)
 
 
 def _format_results(raw_results: object, *, limit: int = MAX_RESULTS) -> list[dict[str, str]]:

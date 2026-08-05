@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Annotated
+from typing import Annotated, Any
 
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
@@ -137,30 +137,39 @@ def register(
         # MCP clients. The envelope is still machine-readable and versioned.
         structured_output=False,
     )
-    # The bounds below are advertised in the JSON schema but deliberately not
-    # enforced by Field(min_length/max_length/ge/le): a schema rejection raises
-    # a generic ToolError instead of the documented JSON envelope. The function
-    # body enforces them so every rejection has the same shape.
+    # Types and bounds are advertised through json_schema_extra but deliberately
+    # annotated as Any: any validation the SDK performs before the body runs
+    # raises a generic ToolError instead of the documented JSON envelope. A
+    # declared ``int`` would also silently coerce ``true`` to 1 and search on.
+    # The body owns every check so all rejections share one shape.
     def web_search(
         query: Annotated[
-            str,
+            Any,
             Field(
                 description="Focused web search terms (1-500 characters).",
-                json_schema_extra={"minLength": 1, "maxLength": MAX_QUERY_LENGTH},
+                json_schema_extra={
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_QUERY_LENGTH,
+                },
             ),
         ],
         max_results: Annotated[
-            int,
+            Any,
             Field(
                 description="Number of results (1-20).",
-                json_schema_extra={"minimum": MIN_RESULTS, "maximum": MAX_RESULTS},
+                json_schema_extra={
+                    "type": "integer",
+                    "minimum": MIN_RESULTS,
+                    "maximum": MAX_RESULTS,
+                },
             ),
         ] = DEFAULT_RESULTS,
         time_range: Annotated[
-            str | None,
+            Any,
             Field(
                 description="Optional recency filter: day, week, month, or year.",
-                json_schema_extra={"enum": [*TIME_RANGES, None]},
+                json_schema_extra={"type": ["string", "null"], "enum": [*TIME_RANGES, None]},
             ),
         ] = None,
     ) -> str:

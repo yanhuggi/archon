@@ -7,10 +7,19 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import primp
+from collections.abc import Callable
+
 from ddgs.exceptions import RatelimitException, TimeoutException
+from ddgs.http_client import HttpClient
 
 import server.providers.duckduckgo as ddg_module
-from server.providers.duckduckgo import DuckDuckGoProvider, _rate_limit, _region_for_query
+from server.providers.duckduckgo import (
+    DuckDuckGoProvider,
+    _classify_upstream_failure,
+    _rate_limit,
+    _region_for_query,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -116,6 +125,10 @@ def test_search_passes_time_range_as_ddgs_timelimit(
         ("東京の天気", "us-en"),
         ("日本語のテスト", "us-en"),
         ("한국어 검색", "us-en"),
+        # Half-width katakana, as produced by legacy IMEs, is still Japanese.
+        ("東京ﾃｽﾄ", "us-en"),
+        ("ﾃｽﾄ", "us-en"),
+        ("ﾊﾝｶｸ ｶﾀｶﾅ", "us-en"),
     ],
 )
 def test_search_selects_region_from_query(query: str, expected: str) -> None:
@@ -280,6 +293,94 @@ def test_search_reports_timeout_distinctly(
     assert data["error_code"] == "upstream_timeout"
     assert "10s" in data["error"]
     assert data["results"] == []
+
+
+# ---------------------------------------------------------------------------
+# Failure classification through the real ddgs call path
+#
+# Patching DDGS.text skips everything ddgs does internally: engine errors are
+# collected into one variable and re-raised as a bare DDGSException, and only a
+# message containing "timed out" becomes TimeoutException. These tests patch the
+# HTTP client instead, so the exception the provider sees is the one ddgs
+# actually produces.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def http_failure() -> Callable[[BaseException], dict]:
+    """Run a real ddgs search whose HTTP layer raises ``exc``."""
+
+    def run(exc: BaseException) -> dict:
+        def failing_request(self: object, *args: object, **kwargs: object) -> object:
+            raise exc
+
+        with patch.object(HttpClient, "request", failing_request):
+            with patch.dict(os.environ, {"ARCHON_WEB_DUCKDUCKGO_INTERVAL": "0"}):
+                return json.loads(DuckDuckGoProvider().search("test", max_results=2))
+
+    return run
+
+
+def test_rate_limiting_survives_ddgs_exception_flattening(http_failure) -> None:
+    """ddgs 9.14.4 never re-raises RatelimitException, so type alone is not enough.
+
+    Engine failures are aggregated and re-raised as a plain DDGSException, which
+    made an ``except RatelimitException`` clause unreachable dead code.
+    """
+    data = http_failure(RatelimitException("429 Too Many Requests"))
+
+    assert data["error_code"] == "rate_limited"
+    assert data["results"] == []
+
+
+def test_rate_limiting_detected_from_status_code_text(http_failure) -> None:
+    """A throttling response carries no distinct type; the status code remains."""
+    data = http_failure(Exception("HTTP 429 Too Many Requests"))
+
+    assert data["error_code"] == "rate_limited"
+
+
+@pytest.mark.parametrize("message", ["timed out", "operation timeout after 10s"])
+def test_timeout_detected_for_both_upstream_spellings(http_failure, message: str) -> None:
+    """ddgs only maps "timed out" to TimeoutException, so "timeout" arrived generic."""
+    data = http_failure(primp.TimeoutError(message))
+
+    assert data["error_code"] == "upstream_timeout"
+    assert "10s" in data["error"]
+
+
+def test_connection_failure_stays_a_generic_upstream_error(http_failure) -> None:
+    """Only throttling and timeouts get a narrower code; nothing else is guessed."""
+    data = http_failure(Exception("tls handshake eof"))
+
+    assert data["error_code"] == "upstream_error"
+
+
+def test_classifier_reads_the_exception_chain() -> None:
+    """The status code may sit on __cause__ rather than the outer message.
+
+    ddgs' own aggregation stringifies the error and loses the chain, but its HTTP
+    layer raises ``DDGSException(...) from ex``, and a future provider may too.
+    Classify on the chain so wrapping cannot hide a retryable failure.
+    """
+    wrapper = RuntimeError("engine failed")
+    wrapper.__cause__ = Exception("429 Too Many Requests")
+
+    data = json.loads(_classify_upstream_failure("test", wrapper, timeout=10))
+
+    assert data["error_code"] == "rate_limited"
+
+
+def test_classifier_ignores_a_self_referencing_chain() -> None:
+    """A cycle in __context__ must not loop forever."""
+    first = RuntimeError("boom")
+    second = RuntimeError("bang")
+    first.__context__ = second
+    second.__context__ = first
+
+    data = json.loads(_classify_upstream_failure("test", first, timeout=10))
+
+    assert data["error_code"] == "upstream_error"
 
 
 # ---------------------------------------------------------------------------

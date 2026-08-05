@@ -16,7 +16,7 @@
 - 无需 API Key，安装后即可使用。
 - MCP server 内置使用边界、查询改写、来源核验和引用指引。
 - 工具参数包含长度/范围约束，并提供可选时间过滤；参数校验失败同样返回 JSON 包络。
-- 中文查询自动使用中文区域结果，日文查询不会被误判为中文。
+- 中文查询自动使用中文区域结果，日文查询（含半角片假名）不会被误判为中文。
 - 成功与失败均返回稳定 JSON 包络，便于模型和程序消费。
 - 内置同一用户下的跨进程请求间隔，多个自动启动的 stdio 服务共享限流状态。
 - 日志写入 `stderr`，不会污染 stdio MCP 的 JSON-RPC 通道。
@@ -160,7 +160,7 @@ web_search(query="site:docs.python.org asyncio TaskGroup", max_results=5)
 | `upstream_timeout` | 上游在 `ARCHON_WEB_TIMEOUT` 内未返回 |
 | `upstream_error` | 其他搜索上游网络或代理错误 |
 
-`query` 长度、`max_results` 范围和 `time_range` 取值都会在 JSON Schema 中声明，但由工具内部校验并返回上面的包络，因此各类失败共享同一组字段，不会出现 MCP 层的通用报错。
+参数的类型、长度和取值范围都会在 JSON Schema 中声明供客户端参考，但一律由工具内部校验并返回上面的包络，因此各类失败共享同一组字段，不会出现 MCP 层的通用报错。传入错误类型（例如 `max_results` 传字符串或布尔值）同样返回包络，不会被静默转换后继续搜索。
 
 ## 模型使用策略
 
