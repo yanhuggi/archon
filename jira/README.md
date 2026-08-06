@@ -182,7 +182,9 @@ search_issues(jql="assignee = currentUser() AND resolution = Unresolved")
       "labels": ["login"]
     }
   ],
-  "result_count": 1
+  "result_count": 1,
+  "has_more": true,
+  "next_start_at": 1
 }
 ```
 
@@ -205,7 +207,8 @@ search_issues(jql="assignee = currentUser() AND resolution = Unresolved")
 | `max_results` | `50` | 每页评论数，范围 1–100 |
 | `start_at` | `0` | 分页偏移 |
 
-评论正文单条最多返回 2000 字符，以控制模型上下文。
+评论正文单条最多返回 2000 字符，以控制模型上下文。返回 `has_more` 和
+`next_start_at`，有更多结果时可直接用下一偏移继续请求。
 
 ### `get_attachment`
 

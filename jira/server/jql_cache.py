@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -43,15 +44,17 @@ class JsonJqlCache:
         identity = f"{config.url or ''}\0{config.username or ''}".encode()
         self._instance_key = hashlib.sha256(identity).hexdigest()[:20]
         self._memory: dict[str, dict] = {}
+        self._lock = threading.RLock()
 
     def get_fields(self, loader: Callable[[], dict], *, refresh: bool = False) -> CacheResult:
-        return self._get(
-            "fields",
-            self._fields_path(),
-            self._config.jql_field_refresh_interval,
-            loader,
-            refresh=refresh,
-        )
+        with self._lock:
+            return self._get(
+                "fields",
+                self._fields_path(),
+                self._config.jql_field_refresh_interval,
+                loader,
+                refresh=refresh,
+            )
 
     def get_values(
         self,
@@ -64,21 +67,23 @@ class JsonJqlCache:
         cache_id = "values:" + hashlib.sha256(
             json.dumps([field, query], ensure_ascii=False, separators=(",", ":")).encode()
         ).hexdigest()
-        return self._get(
-            cache_id,
-            self._values_path(cache_id.removeprefix("values:")),
-            self._config.jql_value_refresh_interval,
-            loader,
-            refresh=refresh,
-        )
+        with self._lock:
+            return self._get(
+                cache_id,
+                self._values_path(cache_id.removeprefix("values:")),
+                self._config.jql_value_refresh_interval,
+                loader,
+                refresh=refresh,
+            )
 
     def invalidate(self) -> None:
         """Mark snapshots stale across MCP processes after a JQL validation error."""
 
-        invalidated_at = self._clock()
-        self._memory["__invalidated__"] = {"invalidated_at": invalidated_at}
-        if self._config.jql_disk_cache_enabled:
-            self._write_json(self._invalidation_path(), {"invalidated_at": invalidated_at})
+        with self._lock:
+            invalidated_at = self._clock()
+            self._memory["__invalidated__"] = {"invalidated_at": invalidated_at}
+            if self._config.jql_disk_cache_enabled:
+                self._write_json(self._invalidation_path(), {"invalidated_at": invalidated_at})
 
     def _get(
         self,

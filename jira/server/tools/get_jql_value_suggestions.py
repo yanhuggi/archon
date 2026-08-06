@@ -7,10 +7,11 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from server.instructions import GET_JQL_VALUE_SUGGESTIONS_DESCRIPTION
+from server.providers import JiraProvider
 from server.tools._common import ensure_json_result, error_response, provider_or_error
 
 
-def register(mcp: MCPServer, default_provider: str = "jira") -> None:
+def register(mcp: MCPServer, default_provider: str = "jira", provider: JiraProvider | None = None) -> None:
     @mcp.tool(
         name="get_jql_value_suggestions",
         title="Get Jira JQL Value Suggestions",
@@ -42,7 +43,7 @@ def register(mcp: MCPServer, default_provider: str = "jira") -> None:
                 suggestions=[],
                 result_count=0,
             )
-        provider, error = provider_or_error(default_provider)
+        resolved_provider, error = provider_or_error(default_provider, provider)
         if error:
             return error_response(
                 "provider_unavailable",
@@ -52,7 +53,7 @@ def register(mcp: MCPServer, default_provider: str = "jira") -> None:
                 result_count=0,
             )
         try:
-            raw = provider.get_jql_value_suggestions(
+            raw = resolved_provider.get_jql_value_suggestions(
                 normalized_field,
                 query=normalized_query,
                 max_results=min(max(int(max_results), 1), 200),

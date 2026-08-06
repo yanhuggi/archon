@@ -1,6 +1,7 @@
 """Tests for the archon-jira MCP server entry point."""
 
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -44,6 +45,29 @@ def test_create_server_always_exposes_stable_tools() -> None:
     assert all("provider" not in tool.input_schema["properties"] for tool in tools)
     assert prompts == []
     assert server._lowlevel_server.name == SERVER_NAME
+
+
+def test_servers_keep_their_provider_binding() -> None:
+    class FakeProvider:
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        def search_issues(self, jql: str, **kwargs) -> str:
+            return json.dumps({"provider": self.label, "results": [], "result_count": 0})
+
+        def close(self) -> None:
+            pass
+
+    first = FakeProvider("first")
+    second = FakeProvider("second")
+    with patch("server.main.JiraProvider", side_effect=[first, second]), patch("server.main.atexit.register"):
+        server_one = create_server(JiraConfig())
+        server_two = create_server(JiraConfig())
+
+    result_one = server_one._tool_manager.get_tool("search_issues").fn("project = TEST")
+    result_two = server_two._tool_manager.get_tool("search_issues").fn("project = TEST")
+    assert json.loads(result_one)["provider"] == "first"
+    assert json.loads(result_two)["provider"] == "second"
 
 
 def test_main_runs_stdio_by_default() -> None:

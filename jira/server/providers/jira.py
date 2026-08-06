@@ -5,6 +5,7 @@ import logging
 import re
 import tempfile
 import threading
+import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -85,6 +86,13 @@ def _string_list(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if item is not None and str(item).strip()]
+
+
+def _object_text(value: object, key: str, default: str = "") -> str:
+    if not isinstance(value, dict):
+        return default
+    candidate = value.get(key)
+    return str(candidate) if candidate is not None else default
 
 
 def _normalize_field_catalog(field_data: list, autocomplete_data: dict | None) -> list[dict]:
@@ -190,6 +198,9 @@ class JiraProvider:
         self._fixed_config = config
         self._client: httpx.Client | None = None
         self._lock = threading.Lock()
+        self._field_map_lock = threading.Lock()
+        self._field_map: dict[str, str] | None = None
+        self._field_map_fetched_at = 0.0
         self._jql_cache = JsonJqlCache(config or JiraConfig.from_env())
 
     def _config(self) -> JiraConfig:
@@ -238,12 +249,13 @@ class JiraProvider:
 
     def _invalidate_client(self) -> None:
         """Close and discard the current client so the next call creates a fresh session."""
-        if self._client is not None:
-            try:
-                self._client.close()
-            except Exception as exc:  # noqa: BLE001 - invalidation must remain best effort
-                LOGGER.debug("Failed to close invalid Jira client: %s", exc)
-            self._client = None
+        with self._lock:
+            if self._client is not None:
+                try:
+                    self._client.close()
+                except Exception as exc:  # noqa: BLE001 - invalidation must remain best effort
+                    LOGGER.debug("Failed to close invalid Jira client: %s", exc)
+                self._client = None
 
     @staticmethod
     def _validate_issue_key(issue_key: str) -> str | None:
@@ -260,19 +272,38 @@ class JiraProvider:
         return None
 
     def _get_field_map(self) -> dict[str, str]:
-        """Fetch custom field ID → name mapping from Jira (always fresh)."""
-        try:
-            client = self._get_client()
-            resp = client.get("rest/api/2/field")
-            resp.raise_for_status()
-            return {
-                f["id"]: f["name"]
-                for f in resp.json()
-                if f.get("custom", False)
-            }
-        except Exception as exc:  # noqa: BLE001 - custom fields are optional enrichment
-            LOGGER.warning("Failed to fetch Jira field map: %s", exc)
-            return {}
+        """Return a short-lived custom field map used to enrich issue details."""
+
+        config = self._config()
+        with self._field_map_lock:
+            now = time.monotonic()
+            if (
+                self._field_map is not None
+                and now - self._field_map_fetched_at < config.jql_field_refresh_interval
+            ):
+                return self._field_map.copy()
+
+            try:
+                client = self._get_client()
+                resp = client.get("rest/api/2/field")
+                resp.raise_for_status()
+                data = resp.json()
+                if not isinstance(data, list):
+                    raise TypeError("Jira field metadata response must be an array")
+                field_map = {
+                    str(field["id"]): str(field["name"])
+                    for field in data
+                    if isinstance(field, dict)
+                    and field.get("custom", False)
+                    and field.get("id")
+                    and field.get("name")
+                }
+                self._field_map = field_map
+                self._field_map_fetched_at = now
+                return field_map.copy()
+            except Exception as exc:  # noqa: BLE001 - custom fields are optional enrichment
+                LOGGER.warning("Failed to fetch Jira field map: %s", exc)
+                return self._field_map.copy() if self._field_map is not None else {}
 
     # ── search_issues ──────────────────────────────────────────────
 
@@ -321,17 +352,44 @@ class JiraProvider:
             code = "configuration_error" if isinstance(exc, RuntimeError) else "provider_error"
             return _json_error(f"{type(exc).__name__}: {exc}", code, jql=jql, results=[], result_count=0)
 
+        issues = data.get("issues", [])
+        total = data.get("total", 0)
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            return _json_error(
+                "Jira search response contains an invalid total",
+                "invalid_provider_response",
+                jql=jql,
+                results=[],
+                result_count=0,
+            )
+        if not isinstance(issues, list) or any(not isinstance(issue, dict) for issue in issues):
+            return _json_error(
+                "Jira search response contains an invalid issues list",
+                "invalid_provider_response",
+                jql=jql,
+                results=[],
+                result_count=0,
+            )
+
         results = []
-        for issue in data.get("issues", []):
+        for issue in issues:
             f = issue.get("fields", {})
+            if not isinstance(f, dict):
+                return _json_error(
+                    "Jira search response contains invalid issue fields",
+                    "invalid_provider_response",
+                    jql=jql,
+                    results=[],
+                    result_count=0,
+                )
             results.append({
                 "key": issue.get("key", ""),
                 "summary": f.get("summary", ""),
-                "status": (f.get("status") or {}).get("name", ""),
-                "assignee": (f.get("assignee") or {}).get("displayName", "Unassigned"),
-                "issue_type": (f.get("issuetype") or {}).get("name", ""),
-                "priority": (f.get("priority") or {}).get("name", ""),
-                "labels": f.get("labels", []),
+                "status": _object_text(f.get("status"), "name"),
+                "assignee": _object_text(f.get("assignee"), "displayName", "Unassigned"),
+                "issue_type": _object_text(f.get("issuetype"), "name"),
+                "priority": _object_text(f.get("priority"), "name"),
+                "labels": _string_list(f.get("labels")),
                 "created": f.get("created", ""),
                 "updated": f.get("updated", ""),
             })
@@ -339,11 +397,15 @@ class JiraProvider:
         return json.dumps(
             {
                 "jql": jql,
-                "total": data.get("total", 0),
+                "total": total,
                 "start_at": start_at,
                 "max_results": max_results,
                 "results": results,
                 "result_count": len(results),
+                "has_more": start_at + len(results) < total,
+                "next_start_at": start_at + len(results)
+                if start_at + len(results) < total
+                else None,
             },
             ensure_ascii=False,
         )
@@ -689,7 +751,7 @@ class JiraProvider:
             resp = client.get(f"rest/api/2/issue/{issue_key}", params={"fields": fields_param})
             resp.raise_for_status()
             issue = resp.json()
-            if not isinstance(issue, dict):
+            if not isinstance(issue, dict) or not isinstance(issue.get("fields", {}), dict):
                 return {"error": "Jira issue response must be an object", "error_code": "invalid_provider_response"}
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
@@ -708,53 +770,67 @@ class JiraProvider:
         f = issue.get("fields", {})
 
         def _user_name(user_obj: dict | None) -> str:
-            if not user_obj:
-                return "Unassigned"
-            return user_obj.get("displayName", user_obj.get("name", ""))
+            return _object_text(user_obj, "displayName") or _object_text(
+                user_obj, "name", "Unassigned"
+            )
 
         def _name(val: dict | None) -> str:
-            return (val or {}).get("name", "")
+            return _object_text(val, "name")
 
         # Extract subtasks
         subtasks = []
-        for st in f.get("subtasks", []):
-            sf = st.get("fields", {})
+        for st in f.get("subtasks", []) if isinstance(f.get("subtasks", []), list) else []:
+            if not isinstance(st, dict):
+                continue
+            sf = st.get("fields", {}) if isinstance(st.get("fields", {}), dict) else {}
             subtasks.append({
                 "key": st.get("key", ""),
                 "summary": sf.get("summary", ""),
-                "status": (sf.get("status") or {}).get("name", ""),
+                "status": _object_text(sf.get("status"), "name"),
             })
 
         # Extract issue links
         issue_links = []
-        for link in f.get("issuelinks", []):
-            lt = link.get("type", {})
+        for link in f.get("issuelinks", []) if isinstance(f.get("issuelinks", []), list) else []:
+            if not isinstance(link, dict):
+                continue
+            lt = link.get("type", {}) if isinstance(link.get("type", {}), dict) else {}
             if "outwardIssue" in link:
                 linked = link["outwardIssue"]
+                if not isinstance(linked, dict):
+                    continue
                 lf = linked.get("fields") or {}
+                if not isinstance(lf, dict):
+                    lf = {}
                 issue_links.append({
                     "direction": lt.get("outward", lt.get("name", "")),
                     "issue": {
                         "key": linked.get("key", ""),
                         "summary": lf.get("summary", ""),
-                        "status": (lf.get("status") or {}).get("name", ""),
+                        "status": _object_text(lf.get("status"), "name"),
                     },
                 })
             elif "inwardIssue" in link:
                 linked = link["inwardIssue"]
+                if not isinstance(linked, dict):
+                    continue
                 lf = linked.get("fields") or {}
+                if not isinstance(lf, dict):
+                    lf = {}
                 issue_links.append({
                     "direction": lt.get("inward", lt.get("name", "")),
                     "issue": {
                         "key": linked.get("key", ""),
                         "summary": lf.get("summary", ""),
-                        "status": (lf.get("status") or {}).get("name", ""),
+                        "status": _object_text(lf.get("status"), "name"),
                     },
                 })
 
         # Extract attachments
         attachments = []
-        for att in f.get("attachment", []):
+        for att in f.get("attachment", []) if isinstance(f.get("attachment", []), list) else []:
+            if not isinstance(att, dict):
+                continue
             attachments.append({
                 "id": att.get("id", ""),
                 "filename": att.get("filename", ""),
@@ -798,9 +874,9 @@ class JiraProvider:
             resp = client.get(f"rest/api/2/issue/{issue_key}", params={"fields": fields_param})
             resp.raise_for_status()
             issue = resp.json()
-            if not isinstance(issue, dict):
+            if not isinstance(issue, dict) or not isinstance(issue.get("fields", {}), dict):
                 return _json_error(
-                    "Jira issue response must be an object",
+                    "Jira issue response must be an object with fields",
                     "invalid_provider_response",
                     issue_key=issue_key,
                 )
@@ -823,12 +899,12 @@ class JiraProvider:
         summary = f.get("summary", "")
 
         def _user_name(user_obj: dict | None) -> str:
-            if not user_obj:
-                return "未分配"
-            return user_obj.get("displayName", user_obj.get("name", ""))
+            return _object_text(user_obj, "displayName") or _object_text(
+                user_obj, "name", "未分配"
+            )
 
         def _name(val: dict | None) -> str:
-            return (val or {}).get("name", "")
+            return _object_text(val, "name")
 
         def _render_custom_field(fid: str) -> str | None:
             val = f.get(fid)
@@ -867,7 +943,7 @@ class JiraProvider:
         if f.get("components"):
             detail_rows.append(("组件", ", ".join(_name(c) for c in f["components"])))
         if f.get("labels"):
-            detail_rows.append(("标签", ", ".join(f["labels"])))
+            detail_rows.append(("标签", ", ".join(_string_list(f["labels"]))))
 
         lines += ["**问题详情**", ""]
         lines += ["| 字段 | 值 |", "|---|---|"]
@@ -922,48 +998,65 @@ class JiraProvider:
             lines += ["", "**研发设计说明：**", "", dev_desc]
 
         # ── issue links ──
-        links = f.get("issuelinks", [])
+        links = f.get("issuelinks", []) if isinstance(f.get("issuelinks", []), list) else []
         if links:
             lines += ["", "**关联任务：**", ""]
             for link in links:
-                lt = link.get("type", {})
+                if not isinstance(link, dict):
+                    continue
+                lt = link.get("type", {}) if isinstance(link.get("type", {}), dict) else {}
                 if "outwardIssue" in link:
                     linked = link["outwardIssue"]
+                    if not isinstance(linked, dict):
+                        continue
                     lf = linked.get("fields") or {}
+                    if not isinstance(lf, dict):
+                        lf = {}
                     rel = lt.get("outward", lt.get("name", ""))
                     lines.append(
                         f"- {rel} {linked.get('key', '')} "
                         f"{lf.get('summary', '')} "
-                        f"({(lf.get('status') or {}).get('name', '')})"
+                        f"({_object_text(lf.get('status'), 'name')})"
                     )
                 elif "inwardIssue" in link:
                     linked = link["inwardIssue"]
+                    if not isinstance(linked, dict):
+                        continue
                     lf = linked.get("fields") or {}
+                    if not isinstance(lf, dict):
+                        lf = {}
                     rel = lt.get("inward", lt.get("name", ""))
                     lines.append(
                         f"- {rel} {linked.get('key', '')} "
                         f"{lf.get('summary', '')} "
-                        f"({(lf.get('status') or {}).get('name', '')})"
+                        f"({_object_text(lf.get('status'), 'name')})"
                     )
 
         # ── subtasks ──
-        subtasks = f.get("subtasks", [])
+        subtasks = f.get("subtasks", []) if isinstance(f.get("subtasks", []), list) else []
         if subtasks:
             lines += ["", "**子任务：**", ""]
             for st in subtasks:
-                sf = st.get("fields", {})
+                if not isinstance(st, dict):
+                    continue
+                sf = st.get("fields", {}) if isinstance(st.get("fields", {}), dict) else {}
                 lines.append(
                     f"- {st.get('key', '')} {sf.get('summary', '')} "
-                    f"({(sf.get('status') or {}).get('name', '')})"
+                    f"({_object_text(sf.get('status'), 'name')})"
                 )
 
         # ── attachments ──
-        attachments = f.get("attachment", [])
+        attachments = f.get("attachment", []) if isinstance(f.get("attachment", []), list) else []
         if attachments:
             lines += ["", "**附件：**", ""]
             for att in attachments:
-                size_mb = att.get("size", 0) / 1024 / 1024
-                author = (att.get("author") or {}).get("displayName", "")
+                if not isinstance(att, dict):
+                    continue
+                try:
+                    size_mb = int(att.get("size") or 0) / 1024 / 1024
+                except (TypeError, ValueError):
+                    size_mb = 0
+                author = _object_text(att.get("author"), "displayName")
                 att_id = att.get("id", "")
                 lines.append(
                     f"- {att.get('filename', '')} ({size_mb:.1f} MB) "
@@ -1050,13 +1143,32 @@ class JiraProvider:
                 comment_count=0,
             )
 
+        raw_comments = data.get("comments", [])
+        total = data.get("total", 0)
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            return _json_error(
+                "Jira comments response contains an invalid total",
+                "invalid_provider_response",
+                issue_key=issue_key,
+                comments=[],
+                comment_count=0,
+            )
+        if not isinstance(raw_comments, list) or any(not isinstance(comment, dict) for comment in raw_comments):
+            return _json_error(
+                "Jira comments response contains an invalid comments list",
+                "invalid_provider_response",
+                issue_key=issue_key,
+                comments=[],
+                comment_count=0,
+            )
+
         comments = []
-        for c in data.get("comments", []):
-            body = c.get("body", "")
+        for c in raw_comments:
+            body = str(c.get("body") or "")
             if len(body) > _MAX_FIELD_LENGTH:
                 body = body[:_MAX_FIELD_LENGTH] + "..."
             comments.append({
-                "author": (c.get("author") or {}).get("displayName", ""),
+                "author": _object_text(c.get("author"), "displayName"),
                 "body": body,
                 "created": c.get("created", ""),
                 "updated": c.get("updated", ""),
@@ -1065,11 +1177,15 @@ class JiraProvider:
         return json.dumps(
             {
                 "issue_key": issue_key,
-                "total": data.get("total", 0),
+                "total": total,
                 "start_at": start_at,
                 "max_results": max_results,
                 "comments": comments,
                 "comment_count": len(comments),
+                "has_more": start_at + len(comments) < total,
+                "next_start_at": start_at + len(comments)
+                if start_at + len(comments) < total
+                else None,
             },
             ensure_ascii=False,
         )

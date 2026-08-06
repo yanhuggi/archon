@@ -7,10 +7,11 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from server.instructions import SEARCH_JQL_FIELDS_DESCRIPTION
+from server.providers import JiraProvider
 from server.tools._common import ensure_json_result, error_response, provider_or_error
 
 
-def register(mcp: MCPServer, default_provider: str = "jira") -> None:
+def register(mcp: MCPServer, default_provider: str = "jira", provider: JiraProvider | None = None) -> None:
     @mcp.tool(
         name="search_jql_fields",
         title="Discover Jira JQL Fields",
@@ -30,7 +31,7 @@ def register(mcp: MCPServer, default_provider: str = "jira") -> None:
         refresh: bool = False,
     ) -> str:
         normalized_query = query.strip() if isinstance(query, str) else ""
-        provider, error = provider_or_error(default_provider)
+        resolved_provider, error = provider_or_error(default_provider, provider)
         if error:
             return error_response(
                 "provider_unavailable",
@@ -40,7 +41,7 @@ def register(mcp: MCPServer, default_provider: str = "jira") -> None:
                 result_count=0,
             )
         try:
-            raw = provider.search_jql_fields(
+            raw = resolved_provider.search_jql_fields(
                 normalized_query,
                 max_results=min(max(int(max_results), 1), 200),
                 start_at=max(int(start_at), 0),

@@ -144,6 +144,20 @@ def test_search_issues_clamps_max_results() -> None:
     provider.close()
 
 
+def test_search_issues_rejects_malformed_issue_list() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"total": 1, "issues": {"key": "PROJ-1"}}
+    response.raise_for_status = MagicMock()
+    mock_client.get.return_value = response
+    provider._client = mock_client
+
+    data = json.loads(provider.search_issues("project = PROJ"))
+    assert data["error_code"] == "invalid_provider_response"
+    provider.close()
+
+
 # ---------------------------------------------------------------------------
 # get_issue
 # ---------------------------------------------------------------------------
@@ -288,6 +302,24 @@ def test_get_issue_custom_field_truncation() -> None:
     provider.close()
 
 
+def test_custom_field_map_is_cached_per_provider() -> None:
+    provider = JiraProvider(JiraConfig(jql_field_refresh_interval=60))
+    mock_client = _make_mock_client()
+    field_resp = MagicMock(status_code=200)
+    field_resp.json.return_value = [
+        {"id": "customfield_1", "name": "Team", "custom": True},
+        {"id": "summary", "name": "Summary", "custom": False},
+    ]
+    field_resp.raise_for_status = MagicMock()
+    mock_client.get.return_value = field_resp
+    provider._client = mock_client
+
+    assert provider._get_field_map() == {"customfield_1": "Team"}
+    assert provider._get_field_map() == {"customfield_1": "Team"}
+    mock_client.get.assert_called_once_with("rest/api/2/field")
+    provider.close()
+
+
 def test_get_issue_missing_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     """get_issue handles issues with missing optional fields gracefully."""
     monkeypatch.setenv("JIRA_URL", "https://jira.example.com")
@@ -395,6 +427,20 @@ def test_get_comments_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result["issue_key"] == "PROJ-1"
     assert result["total"] == 1
     assert result["comments"][0]["author"] == "John"
+    provider.close()
+
+
+def test_get_comments_rejects_malformed_comments_list() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"total": 1, "comments": {"body": "bad"}}
+    response.raise_for_status = MagicMock()
+    mock_client.get.return_value = response
+    provider._client = mock_client
+
+    data = json.loads(provider.get_comments("PROJ-1"))
+    assert data["error_code"] == "invalid_provider_response"
     provider.close()
 
 

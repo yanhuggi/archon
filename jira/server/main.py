@@ -13,7 +13,6 @@ from mcp.server import MCPServer
 
 from server.config import SUPPORTED_TRANSPORTS, JiraConfig
 from server.instructions import SERVER_INSTRUCTIONS
-from server.providers import register as register_provider
 from server.providers.jira import JiraProvider
 from server.tools.export_issue import register as register_export_issue
 from server.tools.get_attachment import register as register_get_attachment
@@ -53,7 +52,6 @@ def create_server(config: JiraConfig | None = None) -> MCPServer:
 
     config = config or JiraConfig.from_env()
     provider = JiraProvider(config)
-    register_provider("jira", provider)
     atexit.register(provider.close)
 
     server = MCPServer(
@@ -64,13 +62,13 @@ def create_server(config: JiraConfig | None = None) -> MCPServer:
         version=SERVER_VERSION,
         log_level=config.log_level,
     )
-    register_search_jql_fields(server)
-    register_get_jql_value_suggestions(server)
-    register_search_issues(server)
-    register_get_issue(server)
-    register_get_comments(server)
-    register_get_attachment(server)
-    register_export_issue(server, config=config)
+    register_search_jql_fields(server, provider=provider)
+    register_get_jql_value_suggestions(server, provider=provider)
+    register_search_issues(server, provider=provider)
+    register_get_issue(server, provider=provider)
+    register_get_comments(server, provider=provider)
+    register_get_attachment(server, provider=provider)
+    register_export_issue(server, config=config, provider=provider)
     return server
 
 

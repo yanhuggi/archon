@@ -1,6 +1,8 @@
 """Tests for the dependency-free Jira JQL metadata cache."""
 
 import json
+import threading
+import time
 
 import pytest
 
@@ -142,3 +144,24 @@ def test_corrupt_snapshot_is_ignored(tmp_path) -> None:
 
     assert result.source == "jira"
     assert result.data["version"] == 2
+
+
+def test_concurrent_loads_share_one_inflight_snapshot(tmp_path) -> None:
+    cache = JsonJqlCache(config(tmp_path))
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def loader() -> dict:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        time.sleep(0.02)
+        return {"version": 1}
+
+    threads = [threading.Thread(target=lambda: cache.get_fields(loader)) for _ in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert calls == 1

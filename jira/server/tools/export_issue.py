@@ -16,6 +16,7 @@ from pydantic import Field
 from server.config import JiraConfig
 from server.files import OutputPathError, commit_output_file, resolve_output_path
 from server.instructions import EXPORT_ISSUE_DESCRIPTION
+from server.providers import JiraProvider
 from server.tools._common import error_response, provider_or_error
 from server.tools.get_issue import ISSUE_KEY_RE
 
@@ -31,6 +32,7 @@ def register(
     mcp: MCPServer,
     default_provider: str = "jira",
     config: JiraConfig | None = None,
+    provider: JiraProvider | None = None,
 ) -> None:
     @mcp.tool(
         name="export_issue",
@@ -59,11 +61,11 @@ def register(
         except OutputPathError as exc:
             return error_response("invalid_output_path", str(exc), issue_key=normalized_key)
 
-        provider, error = provider_or_error(default_provider)
+        resolved_provider, error = provider_or_error(default_provider, provider)
         if error:
             return error_response("provider_unavailable", "Jira provider is unavailable", issue_key=normalized_key)
         try:
-            issue = provider.get_issue_json(normalized_key)
+            issue = resolved_provider.get_issue_json(normalized_key)
         except Exception as exc:  # noqa: BLE001 - provider boundary
             return error_response(
                 "provider_error",
@@ -161,7 +163,7 @@ def register(
                             continue
                         temp_file = Path(temp_dir) / f"attachment-{index}-{attachment_id}.txt"
                         try:
-                            result = json.loads(provider.get_attachment(attachment_id, str(temp_file)))
+                            result = json.loads(resolved_provider.get_attachment(attachment_id, str(temp_file)))
                             if "error" not in result and temp_file.exists():
                                 content = temp_file.read_text(encoding="utf-8", errors="replace")
                                 if len(content) > MAX_EMBEDDED_TEXT_CHARS:

@@ -5,14 +5,24 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from server.providers import get_provider
+from server.providers import JiraProvider, get_provider
 
 
 def error_response(code: str, message: str, **context: Any) -> str:
     return json.dumps({**context, "error": message, "error_code": code}, ensure_ascii=False)
 
 
-def provider_or_error(name: str):
+def provider_or_error(
+    name: str,
+    bound_provider: JiraProvider | None = None,
+) -> tuple[JiraProvider | None, str | None]:
+    """Resolve a provider, preferring the server-local dependency when supplied.
+
+    The registry remains a compatibility path for tests and third-party tools,
+    while production servers avoid sharing mutable provider state globally.
+    """
+    if bound_provider is not None:
+        return bound_provider, None
     try:
         return get_provider(name), None
     except ValueError as exc:
