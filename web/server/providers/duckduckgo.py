@@ -6,13 +6,14 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Iterator
-from urllib.parse import urlparse
+from urllib.parse import quote, quote_plus, urlparse
 
 from ddgs import DDGS
 from ddgs.exceptions import RatelimitException, TimeoutException
@@ -39,19 +40,29 @@ TIME_RANGE_TO_TIMELIMIT = {
 # ``ddgs`` 9.14.4 defines RatelimitException but never raises it: engine errors
 # are collected into one variable and re-raised as a bare DDGSException, and the
 # HTTP layer maps everything except primp.TimeoutError to DDGSException too.
-# Classifying throttling therefore has to read the message, and the upstream
-# status code is the only reliable signal in it.
-_RATE_LIMIT_MARKERS = (
-    "429",
-    "too many requests",
-    "ratelimit",
-    "rate limit",
-    "rate-limited",
+# Classifying a failure therefore has to fall back to the message text.
+#
+# That text embeds the request URL, which embeds the user's query, so a bare
+# substring search lets a query term impersonate an upstream signal: searching
+# for "HTTP 429 troubleshooting" made an ordinary TLS failure look throttled.
+# _redact_error_text strips the URL and query first, and the patterns below
+# additionally require real status context rather than a loose number.
+_RATE_LIMIT_PATTERNS = (
+    re.compile(r"too\s+many\s+requests"),
+    re.compile(r"rate[\s_-]*limit"),
+    # "HTTP 429", "status: 429", "code=429" — but not a bare "429".
+    re.compile(r"\b(?:http|https|status|statuscode|code|error|response)\W{0,4}429\b"),
+    re.compile(r"\b429\W{1,4}(?:too|client|error|retry)"),
 )
 # ddgs only converts a timeout to TimeoutException when the aggregated error
 # text happens to contain "timed out", so a "timeout" wording arrives as a
 # plain DDGSException. Match both spellings.
-_TIMEOUT_MARKERS = ("timed out", "timeout", "timedout")
+_TIMEOUT_PATTERNS = (
+    re.compile(r"timed[\s_-]*out"),
+    re.compile(r"\btimeout\b"),
+)
+# Matches the URL an upstream error quotes, including the query string.
+_URL_PATTERN = re.compile(r"\b(?:https?|ftp)://\S*", re.IGNORECASE)
 
 # Han blocks that justify Chinese-localized results. The original single range
 # missed compatibility ideographs and every supplementary-plane extension, so
@@ -68,6 +79,11 @@ _KANA_RANGES = (
     ("\u3040", "\u30ff"),  # Hiragana and Katakana
     ("\u31f0", "\u31ff"),  # Katakana Phonetic Extensions
     ("\uff66", "\uff9d"),  # Half-width katakana, as produced by legacy IMEs
+    # Supplementary-plane kana. These sit inside the Han Extension B-I range
+    # below, so without an explicit entry archaic or small kana would select the
+    # Chinese region.
+    ("\U0001b000", "\U0001b12f"),  # Kana Supplement and Kana Extended-A
+    ("\U0001b130", "\U0001b16f"),  # Small Kana Extension and Kana Extended-B
 )
 
 
@@ -206,34 +222,63 @@ def _clean_url(value: object) -> str:
     return url
 
 
+def _redact_error_text(text: str, query: str) -> str:
+    """Remove caller-controlled substrings before classifying an error message.
+
+    Upstream errors quote the request URL, which contains the percent-encoded
+    query, so the user's own words end up inside the text used for matching.
+    Strip URLs and the query itself so a search for "HTTP 429 troubleshooting"
+    cannot make an unrelated connection failure look like throttling.
+    """
+
+    redacted = _URL_PATTERN.sub(" ", text)
+    # The query may also appear outside a URL, and engines may quote it in
+    # either raw or percent-encoded form.
+    candidates = {query, quote_plus(query), quote(query)}
+    for candidate in candidates:
+        stripped = candidate.strip()
+        if len(stripped) >= 3:
+            redacted = redacted.replace(stripped, " ")
+    return redacted
+
+
 def _classify_upstream_failure(query: str, exc: BaseException, timeout: int) -> str:
     """Map an upstream failure to the narrowest documented error code.
 
     ``ddgs`` flattens engine failures into ``DDGSException`` with the original
     error only present as text, so the exception type alone cannot distinguish
-    throttling from a dead connection. Inspect the chained messages, which is
-    where the upstream status code survives.
+    throttling from a dead connection. Match the message only after redacting
+    the parts the caller controls.
     """
 
     parts: list[str] = []
+    chain: list[BaseException] = []
     seen: set[int] = set()
     current: BaseException | None = exc
-    # Walk the chain: ddgs raises DDGSException *from* the original error, so
-    # the status code often lives on __cause__ rather than the outer message.
+    # Walk the chain: the HTTP layer raises DDGSException *from* the original
+    # error, so both the typed exception and any status context can live on
+    # __cause__ rather than on the outermost error. Guard against a cycle.
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        chain.append(current)
         parts.append(f"{type(current).__name__}: {current}")
         current = current.__cause__ or current.__context__
-    text = " ".join(parts).lower()
+    text = _redact_error_text(" ".join(parts), query).lower()
 
-    if isinstance(exc, RatelimitException) or any(marker in text for marker in _RATE_LIMIT_MARKERS):
+    # A typed error anywhere in the chain is authoritative: it carries no
+    # caller-controlled text, so it cannot be spoofed by the query.
+    if any(isinstance(item, RatelimitException) for item in chain) or any(
+        p.search(text) for p in _RATE_LIMIT_PATTERNS
+    ):
         LOGGER.warning("Web search upstream rate-limited the request: %s", exc)
         return _error_response(
             query,
             f"Web search provider rate-limited the request: {exc}",
             "rate_limited",
         )
-    if isinstance(exc, TimeoutException) or any(marker in text for marker in _TIMEOUT_MARKERS):
+    if any(isinstance(item, TimeoutException) for item in chain) or any(
+        p.search(text) for p in _TIMEOUT_PATTERNS
+    ):
         LOGGER.warning("Web search upstream timed out after %ss: %s", timeout, exc)
         return _error_response(
             query,

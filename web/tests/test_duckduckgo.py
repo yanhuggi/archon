@@ -9,6 +9,7 @@ import pytest
 
 import primp
 from collections.abc import Callable
+from urllib.parse import quote_plus
 
 from ddgs.exceptions import RatelimitException, TimeoutException
 from ddgs.http_client import HttpClient
@@ -129,6 +130,13 @@ def test_search_passes_time_range_as_ddgs_timelimit(
         ("東京ﾃｽﾄ", "us-en"),
         ("ﾃｽﾄ", "us-en"),
         ("ﾊﾝｶｸ ｶﾀｶﾅ", "us-en"),
+        # Supplementary-plane kana sits inside the Han Extension B-I range, so
+        # archaic and small kana would otherwise select the Chinese region.
+        ("東京𛀁", "us-en"),  # U+1B001, archaic hiragana
+        ("\U0001b000", "us-en"),  # Kana Supplement
+        ("東京\U0001b122", "us-en"),  # Kana Extended-A
+        ("東京\U0001b132", "us-en"),  # Small Kana Extension
+        ("東京\U0001b164", "us-en"),  # Kana Extended-B
     ],
 )
 def test_search_selects_region_from_query(query: str, expected: str) -> None:
@@ -354,6 +362,87 @@ def test_connection_failure_stays_a_generic_upstream_error(http_failure) -> None
     data = http_failure(Exception("tls handshake eof"))
 
     assert data["error_code"] == "upstream_error"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "HTTP 429 troubleshooting",
+        "python timeout handling",
+        "rate limit best practices",
+        "too many requests error",
+        "nginx rate-limit config",
+        "429",
+        "连接 timeout 处理",
+    ],
+)
+def test_query_terms_cannot_impersonate_an_upstream_signal(query: str) -> None:
+    """Upstream errors quote the request URL, which contains the user's query.
+
+    Matching the raw message let a search for "HTTP 429 troubleshooting" turn an
+    ordinary TLS failure into rate_limited, telling the caller to back off for a
+    problem that retrying would not fix.
+    """
+
+    def failing_request(self: object, *args: object, **kwargs: object) -> object:
+        raise Exception(
+            "ConnectError: error sending request for url "
+            f"(https://search.brave.com/search?q={quote_plus(query)}&source=web) "
+            "> client error (Connect) > tls handshake eof"
+        )
+
+    with patch.object(HttpClient, "request", failing_request):
+        with patch.dict(os.environ, {"ARCHON_WEB_DUCKDUCKGO_INTERVAL": "0"}):
+            data = json.loads(DuckDuckGoProvider().search(query, max_results=2))
+
+    assert data["error_code"] == "upstream_error"
+
+
+def test_a_real_signal_still_wins_over_a_matching_query(http_failure) -> None:
+    """Redaction must not suppress a genuine status code."""
+    data = http_failure(Exception("HTTP 429 Too Many Requests"))
+
+    assert data["error_code"] == "rate_limited"
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["HTTP 429 Too Many Requests", "status: 429", "429 Too Many Requests", "rate limit exceeded"],
+)
+def test_rate_limiting_needs_real_status_context(http_failure, message: str) -> None:
+    """A bare number is not enough context, but a status-qualified 429 is."""
+    assert http_failure(Exception(message))["error_code"] == "rate_limited"
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (RatelimitException("slow down"), "rate_limited"),
+        (TimeoutException("nothing useful"), "upstream_timeout"),
+    ],
+)
+def test_typed_errors_classify_without_any_text_marker(
+    exc: BaseException, expected: str
+) -> None:
+    """A typed error carries no caller-controlled text, so it cannot be spoofed.
+
+    ddgs 9.14.4 stringifies engine errors and drops the chain, so this path is
+    only reachable for a provider that raises the typed errors directly, but it
+    must not depend on message wording.
+    """
+    data = json.loads(_classify_upstream_failure("normal query", exc, timeout=10))
+
+    assert data["error_code"] == expected
+
+
+def test_typed_error_is_found_through_the_exception_chain() -> None:
+    """Wrapping must not hide a retryable failure behind a generic error."""
+    wrapper = RuntimeError("engine failed")
+    wrapper.__cause__ = RatelimitException("slow down")
+
+    data = json.loads(_classify_upstream_failure("q", wrapper, timeout=10))
+
+    assert data["error_code"] == "rate_limited"
 
 
 def test_classifier_reads_the_exception_chain() -> None:
