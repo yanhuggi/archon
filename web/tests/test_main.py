@@ -69,11 +69,7 @@ def test_cli_rejects_zero_port_instead_of_ignoring_it() -> None:
 
 
 def test_two_servers_do_not_share_one_provider_config() -> None:
-    """The provider registry is process-global; each server must stay isolated.
-
-    Before this was fixed, creating a second server overwrote "duckduckgo", so
-    the first server's searches used the second server's timeout and proxy.
-    """
+    """Each server's DuckDuckGo client retains its own configuration."""
     import server.main as main_module
 
     server_a = create_server(WebConfig(interval=0.0, timeout=11, proxy="http://proxy-a:1"))

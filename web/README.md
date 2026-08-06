@@ -1,6 +1,6 @@
 # archon-web
 
-`archon-web` 是一个轻量级 MCP（Model Context Protocol）联网搜索服务。它通过 `ddgs` 的公开搜索后端提供网页搜索，无需 API Key，适合为 Claude Code、Codex 和其他 MCP 客户端补充实时信息检索能力。
+`archon-web` 是一个轻量级 MCP（Model Context Protocol）联网搜索服务。它仅通过 DuckDuckGo 提供网页搜索，不提供其他搜索厂商的选择；无需 API Key，适合为 Claude Code、Codex 和其他 MCP 客户端补充实时信息检索能力。
 
 ## 能力概览
 
@@ -21,7 +21,7 @@
 - 内置同一用户下的跨进程请求间隔，多个自动启动的 stdio 服务共享限流状态。
 - 日志写入 `stderr`，不会污染 stdio MCP 的 JSON-RPC 通道。
 
-> 公开搜索上游不提供可用性 SLA。搜索摘要适合发现和初步核验信息，不等同于完整网页内容。
+> DuckDuckGo 不提供可用性 SLA。搜索摘要适合发现和初步核验信息，不等同于完整网页内容。
 
 ## 快速开始
 
@@ -144,7 +144,7 @@ web_search(query="site:docs.python.org asyncio TaskGroup", max_results=5)
   "query": "example",
   "results": [],
   "result_count": 0,
-  "error": "Web search provider failed: ...",
+  "error": "DuckDuckGo search failed: ...",
   "error_code": "upstream_error"
 }
 ```
@@ -156,11 +156,10 @@ web_search(query="site:docs.python.org asyncio TaskGroup", max_results=5)
 | `invalid_query` | 未传 `query`，或查询为空、超过长度限制 |
 | `invalid_max_results` | 返回数量不是有效整数 |
 | `invalid_time_range` | `time_range` 不在 `day`/`week`/`month`/`year` 之内 |
-| `provider_unavailable` | 搜索 provider 未注册 |
-| `invalid_provider_response` | 上游返回内容不符合 JSON 契约 |
-| `rate_limited` | 被搜索上游限流，可稍后重试 |
-| `upstream_timeout` | 上游在 `ARCHON_WEB_TIMEOUT` 内未返回 |
-| `upstream_error` | 其他搜索上游网络或代理错误 |
+| `invalid_provider_response` | DuckDuckGo 返回内容不符合 JSON 契约 |
+| `rate_limited` | 被 DuckDuckGo 限流，可稍后重试 |
+| `upstream_timeout` | DuckDuckGo 在 `ARCHON_WEB_TIMEOUT` 内未返回 |
+| `upstream_error` | DuckDuckGo 网络或代理错误 |
 
 参数的类型、长度和取值范围都会在 JSON Schema 中声明供客户端参考（`query` 仍标记为必填），但一律由工具内部校验并返回上面的包络，因此各类失败共享同一组字段，不会出现 MCP 层的通用报错——完全不传 `query` 也返回包络，而不是传输层错误。传入错误类型同样返回包络，不会被静默转换后继续搜索：`max_results` 只接受真正的整数，字符串（含 `"3"`）、布尔值和浮点数（含 `1.5`）都会被拒绝，而不是被折算成一个调用方没有要求的数量。
 
@@ -288,14 +287,14 @@ uv sync --group dev
 uv run pytest tests -q
 ```
 
-执行真实 stdio MCP + 公开搜索上游冒烟测试：
+执行真实 stdio MCP + DuckDuckGo 冒烟测试：
 
 ```bash
 cd web
 bash test_mcp.sh "MCP Python SDK 2.0" 5 week
 ```
 
-该脚本使用 MCP `2026-07-28` 的 `server/discover` 完成能力协商并调用 `web_search`。它需要能够访问所选公开搜索上游。
+该脚本使用 MCP `2026-07-28` 的 `server/discover` 完成能力协商并调用 `web_search`。它需要能够访问 DuckDuckGo。
 
 ## 常见问题
 
@@ -303,7 +302,7 @@ bash test_mcp.sh "MCP Python SDK 2.0" 5 week
 
 - `rate_limited` 表示被上游限流：增大 `ARCHON_WEB_DUCKDUCKGO_INTERVAL`，例如设为 `3` 或 `5`。
 - `upstream_timeout` 表示上游未在期限内返回：增大 `ARCHON_WEB_TIMEOUT`，或检查代理链路。
-- 检查当前网络是否能访问公开搜索上游。
+- 检查当前网络是否能访问 DuckDuckGo。
 - 如需代理，设置 `ARCHON_WEB_PROXY`。
 - 同一用户的多个本地进程会自动共享限流；不同主机、容器或用户仍各自计数。
 - 检查 `ARCHON_WEB_RATE_LIMIT_FILE` 的父目录是否可写；不可写时服务会降级为进程内限流。
@@ -338,7 +337,7 @@ web/
 │   ├── main.py                   # MCP server、传输和 CLI 入口
 │   ├── instructions.py           # server instructions 与工具使用说明
 │   ├── providers/
-│   │   ├── __init__.py           # provider 注册表与协议
+│   │   ├── __init__.py           # DuckDuckGo 实现包
 │   │   └── duckduckgo.py         # 搜索、限流、超时和结果清洗
 │   └── tools/
 │       └── web_search.py         # MCP 工具定义与稳定响应契约
@@ -347,6 +346,5 @@ web/
     ├── test_duckduckgo.py
     ├── test_main.py
     ├── test_instructions.py
-    ├── test_providers_init.py
     └── test_web_search.py
 ```

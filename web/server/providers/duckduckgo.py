@@ -1,4 +1,4 @@
-"""No-key public web search provider built on the ``ddgs`` package."""
+"""No-key DuckDuckGo search client built on the ``ddgs`` package."""
 
 from __future__ import annotations
 
@@ -28,14 +28,7 @@ LOGGER = logging.getLogger(__name__)
 MAX_TITLE_LENGTH = 300
 MAX_FIELD_LENGTH = 2000
 MAX_RESULTS = 20
-# ``ddgs`` auto selection is randomized, making latency and relevance unstable,
-# so one backend is pinned. Restricted to "duckduckgo" on purpose: Brave,
-# Google, and Mojeek enforce anti-bot challenges that a headless MCP server
-# cannot solve and that a no-key search tool should not attempt to bypass.
-# DuckDuckGo's own HTML endpoint is not exempt from this trade-off — it can
-# return its own anomaly-detection page instead of results, surfacing as
-# upstream_error with no HTTP-level signal — but it was chosen anyway as the
-# identity this provider already advertises.
+# Explicitly select DuckDuckGo instead of letting ``ddgs`` choose a backend.
 SEARCH_BACKEND = "duckduckgo"
 TIME_RANGE_TO_TIMELIMIT = {
     "day": "d",
@@ -278,7 +271,7 @@ def _classify_upstream_failure(query: str, exc: BaseException, timeout: int) -> 
         LOGGER.warning("Web search upstream rate-limited the request: %s", exc)
         return _error_response(
             query,
-            f"Web search provider rate-limited the request: {exc}",
+            f"DuckDuckGo rate-limited the request: {exc}",
             "rate_limited",
         )
     if any(isinstance(item, TimeoutException) for item in chain) or any(
@@ -287,11 +280,11 @@ def _classify_upstream_failure(query: str, exc: BaseException, timeout: int) -> 
         LOGGER.warning("Web search upstream timed out after %ss: %s", timeout, exc)
         return _error_response(
             query,
-            f"Web search provider timed out after {timeout}s: {exc}",
+            f"DuckDuckGo timed out after {timeout}s: {exc}",
             "upstream_timeout",
         )
-    LOGGER.error("Web search provider failed: %s", exc)
-    return _error_response(query, f"Web search provider failed: {exc}", "upstream_error")
+    LOGGER.error("DuckDuckGo search failed: %s", exc)
+    return _error_response(query, f"DuckDuckGo search failed: {exc}", "upstream_error")
 
 
 def _error_response(query: str, message: str, code: str = "search_failed") -> str:
@@ -308,7 +301,7 @@ def _error_response(query: str, message: str, code: str = "search_failed") -> st
 
 
 class DuckDuckGoProvider:
-    """Search provider backed by a stable no-key ``ddgs`` text engine.
+    """DuckDuckGo search client backed by the no-key ``ddgs`` text engine.
 
     No API key is required. Request spacing, timeout, and proxy settings come
     from :class:`server.config.WebConfig`. Pass a config to bind this provider
@@ -334,7 +327,7 @@ class DuckDuckGoProvider:
         time_range: str | None = None,
         **kwargs: object,
     ) -> str:
-        """Search the public web and return a compact JSON result envelope."""
+        """Search DuckDuckGo and return a compact JSON result envelope."""
 
         normalized_query = " ".join(query.split()) if isinstance(query, str) else ""
         if not normalized_query:
@@ -383,7 +376,7 @@ class DuckDuckGoProvider:
 
 
 def _format_results(raw_results: object, *, limit: int = MAX_RESULTS) -> list[dict[str, str]]:
-    """Normalize, de-duplicate, and bound raw search results."""
+    """Normalize, de-duplicate, and bound DuckDuckGo search results."""
 
     if not isinstance(raw_results, Iterable) or isinstance(raw_results, (str, bytes, Mapping)):
         return []

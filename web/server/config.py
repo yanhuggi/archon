@@ -1,7 +1,7 @@
 """Runtime configuration for the archon-web MCP server.
 
 Configuration is intentionally read from the environment at the point where it
-is used.  This keeps the provider easy to exercise in tests and allows a
+is used.  This keeps the DuckDuckGo client easy to exercise in tests and allows a
 long-running process to be configured through a normal ``.env`` file without
 introducing a second configuration format.
 """

@@ -9,7 +9,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from server.providers import register
 from server.providers.duckduckgo import DuckDuckGoProvider
 from server.tools.web_search import register as register_tool
 
@@ -29,12 +28,6 @@ class _StubProvider:
         )
 
 
-@pytest.fixture(autouse=True)
-def _register_stub() -> None:
-    register("duckduckgo", _StubProvider())
-    yield
-
-
 class _MockMCP:
     """Capture the tool decorator and its metadata."""
 
@@ -50,15 +43,15 @@ class _MockMCP:
         return decorator
 
 
-def _get_web_search_func() -> callable:
+def _get_web_search_func(provider: object | None = None) -> callable:
     mcp = _MockMCP()
-    register_tool(mcp)
+    register_tool(mcp, provider=provider or _StubProvider())
     return mcp.captured_tools["web_search"]["function"]
 
 
 def test_register_creates_read_only_open_world_tool() -> None:
     mcp = _MockMCP()
-    register_tool(mcp)
+    register_tool(mcp, provider=_StubProvider())
 
     metadata = mcp.captured_tools["web_search"]
     assert metadata["title"] == "Web Search"
@@ -71,7 +64,7 @@ def test_register_creates_read_only_open_world_tool() -> None:
 
 def test_tool_description_defines_use_and_non_use_boundaries() -> None:
     mcp = _MockMCP()
-    register_tool(mcp)
+    register_tool(mcp, provider=_StubProvider())
     description = str(mcp.captured_tools["web_search"]["description"])
 
     assert "3-8 important words" in description
@@ -81,23 +74,20 @@ def test_tool_description_defines_use_and_non_use_boundaries() -> None:
 
 
 def test_web_search_calls_duckduckgo_provider() -> None:
-    func = _get_web_search_func()
+    provider = _StubProvider()
+    func = _get_web_search_func(provider)
+    data = json.loads(func("hello"))
 
-    with patch("server.tools.web_search.get_provider", return_value=_StubProvider()) as mock_get:
-        data = json.loads(func("hello"))
-
-    mock_get.assert_called_once_with("duckduckgo")
     assert data["query"] == "hello"
     assert data["result_count"] == 1
 
 
 def test_web_search_normalizes_query_and_forwards_limit() -> None:
     stub = _StubProvider()
-    func = _get_web_search_func()
+    func = _get_web_search_func(stub)
 
-    with patch("server.tools.web_search.get_provider", return_value=stub):
-        with patch.object(stub, "search", wraps=stub.search) as mock_search:
-            func("  MCP   server\nrelease ", max_results=3)
+    with patch.object(stub, "search", wraps=stub.search) as mock_search:
+        func("  MCP   server\nrelease ", max_results=3)
 
     mock_search.assert_called_once_with("MCP server release", max_results=3)
 
@@ -108,34 +98,32 @@ def test_web_search_normalizes_query_and_forwards_limit() -> None:
 )
 def test_web_search_clamps_direct_python_result_limit(requested: int, expected: int) -> None:
     stub = _StubProvider()
-    func = _get_web_search_func()
+    func = _get_web_search_func(stub)
 
-    with patch("server.tools.web_search.get_provider", return_value=stub):
-        with patch.object(stub, "search", wraps=stub.search) as mock_search:
-            func("query", max_results=requested)
+    with patch.object(stub, "search", wraps=stub.search) as mock_search:
+        func("query", max_results=requested)
 
     mock_search.assert_called_once_with("query", max_results=expected)
 
 
 def test_web_search_passes_time_range_only_when_requested() -> None:
     stub = _StubProvider()
-    func = _get_web_search_func()
+    func = _get_web_search_func(stub)
 
-    with patch("server.tools.web_search.get_provider", return_value=stub):
-        with patch.object(stub, "search", wraps=stub.search) as mock_search:
-            func("MCP release", time_range="week")
+    with patch.object(stub, "search", wraps=stub.search) as mock_search:
+        func("MCP release", time_range="week")
 
     mock_search.assert_called_once_with("MCP release", max_results=8, time_range="week")
 
 
 @pytest.mark.parametrize("query", ["", "   ", "\n\t"])
 def test_web_search_rejects_empty_query(query: str) -> None:
-    func = _get_web_search_func()
-
-    with patch("server.tools.web_search.get_provider") as mock_get:
+    stub = _StubProvider()
+    func = _get_web_search_func(stub)
+    with patch.object(stub, "search") as mock_search:
         data = json.loads(func(query))
 
-    mock_get.assert_not_called()
+    mock_search.assert_not_called()
     assert data["error_code"] == "invalid_query"
     assert data["results"] == []
     assert data["result_count"] == 0
@@ -162,9 +150,8 @@ def test_web_search_rejects_boolean_limit() -> None:
 def test_web_search_rejects_unknown_time_range_with_envelope(value: str) -> None:
     """An unsupported range must not reach the provider as a silent no-op."""
     stub = _StubProvider()
-    with patch("server.tools.web_search.get_provider", return_value=stub):
-        with patch.object(stub, "search", wraps=stub.search) as mock_search:
-            data = json.loads(_get_web_search_func()("query", time_range=value))
+    with patch.object(stub, "search", wraps=stub.search) as mock_search:
+        data = json.loads(_get_web_search_func(stub)("query", time_range=value))
 
     mock_search.assert_not_called()
     assert data["error_code"] == "invalid_time_range"
@@ -174,9 +161,8 @@ def test_web_search_rejects_unknown_time_range_with_envelope(value: str) -> None
 @pytest.mark.parametrize("value", ["WEEK", " week ", "Week"])
 def test_web_search_normalizes_time_range_case_and_padding(value: str) -> None:
     stub = _StubProvider()
-    with patch("server.tools.web_search.get_provider", return_value=stub):
-        with patch.object(stub, "search", wraps=stub.search) as mock_search:
-            _get_web_search_func()("query", time_range=value)
+    with patch.object(stub, "search", wraps=stub.search) as mock_search:
+        _get_web_search_func(stub)("query", time_range=value)
 
     mock_search.assert_called_once_with("query", max_results=8, time_range="week")
 
@@ -184,9 +170,8 @@ def test_web_search_normalizes_time_range_case_and_padding(value: str) -> None:
 def test_web_search_treats_blank_time_range_as_unset() -> None:
     """A client sending "" should get an unfiltered search, not a rejection."""
     stub = _StubProvider()
-    with patch("server.tools.web_search.get_provider", return_value=stub):
-        with patch.object(stub, "search", wraps=stub.search) as mock_search:
-            _get_web_search_func()("query", time_range="  ")
+    with patch.object(stub, "search", wraps=stub.search) as mock_search:
+        _get_web_search_func(stub)("query", time_range="  ")
 
     mock_search.assert_called_once_with("query", max_results=8)
 
@@ -402,58 +387,37 @@ def test_a_client_supplied_empty_query_is_not_read_as_missing() -> None:
     assert _normalize_query("")[1] == "query must not be empty"
 
 
-def test_register_binds_a_provider_instance_over_the_global_registry() -> None:
-    """Two servers in one process must not share whichever provider was last.
-
-    The name-based registry is process-global, so resolving by name would make
-    the first server use the second server's timeout, proxy, and rate limits.
-    """
+def test_register_binds_its_duckduckgo_client() -> None:
+    """The tool uses the client instance supplied by its server."""
     bound = _StubProvider()
     mcp = _MockMCP()
     register_tool(mcp, provider=bound)
     func = mcp.captured_tools["web_search"]["function"]
 
-    with patch("server.tools.web_search.get_provider") as mock_get:
-        with patch.object(bound, "search", wraps=bound.search) as mock_search:
-            data = json.loads(func("query"))
-
-    mock_get.assert_not_called()
-    mock_search.assert_called_once()
-    assert data["result_count"] == 1
-
-
-def test_web_search_returns_consistent_provider_unavailable_error() -> None:
-    func = _get_web_search_func()
-    with patch("server.tools.web_search.get_provider", side_effect=ValueError("Unknown provider")):
+    with patch.object(bound, "search", wraps=bound.search) as mock_search:
         data = json.loads(func("query"))
 
-    assert data["query"] == "query"
-    assert data["results"] == []
-    assert data["result_count"] == 0
-    assert data["error_code"] == "provider_unavailable"
+    mock_search.assert_called_once()
+    assert data["result_count"] == 1
 
 
 def test_web_search_handles_invalid_provider_json() -> None:
     provider = MagicMock()
     provider.search.return_value = "not-json"
-    func = _get_web_search_func()
-
-    with patch("server.tools.web_search.get_provider", return_value=provider):
-        data = json.loads(func("query"))
+    func = _get_web_search_func(provider)
+    data = json.loads(func("query"))
 
     assert data["error_code"] == "invalid_provider_response"
 
 
 def test_real_duckduckgo_integration_via_tool() -> None:
-    register("duckduckgo", DuckDuckGoProvider())
-
     with patch("server.providers.duckduckgo.DDGS") as mock_ddgs:
         instance = mock_ddgs.return_value.__enter__.return_value
         instance.text.return_value = [
             {"title": "D1", "href": "https://d1.example", "body": "body1"},
         ]
         with patch("server.providers.duckduckgo._rate_limit"):
-            data = json.loads(_get_web_search_func()("ddg test"))
+            data = json.loads(_get_web_search_func(DuckDuckGoProvider())("ddg test"))
 
     assert data["query"] == "ddg test"
     assert data["result_count"] == 1

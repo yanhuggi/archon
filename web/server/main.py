@@ -12,7 +12,6 @@ from mcp.server import MCPServer
 
 from server.config import SUPPORTED_TRANSPORTS, WebConfig
 from server.instructions import SERVER_INSTRUCTIONS
-from server.providers import register as register_provider
 from server.providers.duckduckgo import DuckDuckGoProvider
 from server.tools.web_search import register as register_web_search
 
@@ -52,10 +51,6 @@ def create_server(config: WebConfig | None = None) -> MCPServer:
 
     config = config or WebConfig.from_env()
     provider = DuckDuckGoProvider(config)
-    # The registry stays populated for callers that resolve providers by name,
-    # but this server's tool holds the instance directly, so a later
-    # create_server cannot redirect it to a different timeout or proxy.
-    register_provider("duckduckgo", provider)
 
     server = MCPServer(
         name=SERVER_NAME,

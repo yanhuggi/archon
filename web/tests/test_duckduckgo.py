@@ -274,7 +274,7 @@ def test_search_ddgs_exception(provider: DuckDuckGoProvider, mock_ddgs: MagicMoc
     data = json.loads(result)
 
     assert "error" in data
-    assert "Web search provider failed" in data["error"]
+    assert "DuckDuckGo search failed" in data["error"]
     assert "DDG blocked us" in data["error"]
     assert data["error_code"] == "upstream_error"
     assert data["results"] == []
@@ -471,7 +471,7 @@ def test_typed_errors_classify_without_any_text_marker(
     """A typed error carries no caller-controlled text, so it cannot be spoofed.
 
     ddgs 9.14.4 stringifies engine errors and drops the chain, so this path is
-    only reachable for a provider that raises the typed errors directly, but it
+    only reachable when the client raises the typed errors directly, but it
     must not depend on message wording.
     """
     data = json.loads(_classify_upstream_failure("normal query", exc, timeout=10))
@@ -493,7 +493,7 @@ def test_classifier_reads_the_exception_chain() -> None:
     """The status code may sit on __cause__ rather than the outer message.
 
     ddgs' own aggregation stringifies the error and loses the chain, but its HTTP
-    layer raises ``DDGSException(...) from ex``, and a future provider may too.
+    layer raises ``DDGSException(...) from ex``.
     Classify on the chain so wrapping cannot hide a retryable failure.
     """
     wrapper = RuntimeError("engine failed")

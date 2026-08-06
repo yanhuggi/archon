@@ -11,7 +11,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from server.instructions import WEB_SEARCH_DESCRIPTION
-from server.providers import SearchProvider, get_provider
+from server.providers.duckduckgo import DuckDuckGoProvider
 
 
 LOGGER = logging.getLogger(__name__)
@@ -101,23 +101,23 @@ def _normalize_time_range(value: object) -> tuple[str | None, str | None]:
 
 
 def _ensure_json_response(raw: object, query: str) -> str:
-    """Keep provider output JSON-compatible and preserve the public contract."""
+    """Keep DuckDuckGo output JSON-compatible and preserve the public contract."""
 
     if isinstance(raw, str):
         try:
             data = json.loads(raw)
         except (TypeError, ValueError):
-            return _json_error(query, "invalid_provider_response", "Search provider returned invalid JSON")
+            return _json_error(query, "invalid_provider_response", "DuckDuckGo returned invalid JSON")
     elif isinstance(raw, dict):
         data = raw
     else:
-        return _json_error(query, "invalid_provider_response", "Search provider returned an unsupported response")
+        return _json_error(query, "invalid_provider_response", "DuckDuckGo returned an unsupported response")
 
     if not isinstance(data, dict):
-        return _json_error(query, "invalid_provider_response", "Search provider response must be a JSON object")
+        return _json_error(query, "invalid_provider_response", "DuckDuckGo response must be a JSON object")
 
-    # Providers should return this envelope themselves, but filling missing
-    # fields here makes the MCP contract robust when a provider is replaced.
+    # DuckDuckGo should return this envelope itself, but filling missing fields
+    # here preserves the MCP contract if the library returns an unusual shape.
     data.setdefault("query", query)
     results = data.get("results")
     if not isinstance(results, list):
@@ -194,21 +194,13 @@ def _query_is_advertised_as_required(mcp: MCPServer) -> bool:
 
 def register(
     mcp: MCPServer,
-    default_provider: str = "duckduckgo",
-    provider: SearchProvider | None = None,
+    provider: DuckDuckGoProvider,
 ) -> None:
     """Register the ``web_search`` tool on an MCP server.
 
-    ``provider`` binds this tool to one backend instance. Prefer it over
-    ``default_provider``: the name-based registry is process-global, so two
-    servers created in one process would otherwise share whichever provider
-    registered last, along with its timeout, proxy, and rate-limit settings.
+    ``provider`` is the DuckDuckGo client bound to this server instance, so
+    concurrent servers retain their own timeout, proxy, and rate-limit settings.
     """
-
-    def _resolve_provider() -> SearchProvider:
-        if provider is not None:
-            return provider
-        return get_provider(default_provider)
 
     @mcp.tool(
         name="web_search",
@@ -279,23 +271,18 @@ def register(
         if range_error:
             return _json_error(normalized_query, "invalid_time_range", range_error)
 
-        try:
-            active_provider = _resolve_provider()
-        except ValueError as exc:
-            return _json_error(normalized_query, "provider_unavailable", str(exc))
-
         kwargs: dict[str, object] = {}
         if normalized_range is not None:
             kwargs["time_range"] = normalized_range
 
         try:
-            raw = active_provider.search(normalized_query, max_results=normalized_limit, **kwargs)
-        except Exception as exc:  # pragma: no cover - defensive for third-party providers
-            LOGGER.exception("web_search provider failed")
+            raw = provider.search(normalized_query, max_results=normalized_limit, **kwargs)
+        except Exception as exc:  # pragma: no cover - defensive boundary around the upstream client
+            LOGGER.exception("web_search DuckDuckGo client failed")
             return _json_error(
                 normalized_query,
-                "provider_error",
-                f"Search provider failed: {type(exc).__name__}: {exc}",
+                "upstream_error",
+                f"DuckDuckGo search failed: {type(exc).__name__}: {exc}",
             )
         return _ensure_json_response(raw, normalized_query)
 
