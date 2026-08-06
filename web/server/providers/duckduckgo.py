@@ -13,7 +13,7 @@ from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Iterator
-from urllib.parse import quote, quote_plus, urlparse
+from urllib.parse import urlparse
 
 from ddgs import DDGS
 from ddgs.exceptions import RatelimitException, TimeoutException
@@ -45,8 +45,8 @@ TIME_RANGE_TO_TIMELIMIT = {
 # That text embeds the request URL, which embeds the user's query, so a bare
 # substring search lets a query term impersonate an upstream signal: searching
 # for "HTTP 429 troubleshooting" made an ordinary TLS failure look throttled.
-# _redact_error_text strips the URL and query first, and the patterns below
-# additionally require real status context rather than a loose number.
+# _redact_error_text strips that URL first, and the patterns below additionally
+# require real status context rather than a loose number.
 _RATE_LIMIT_PATTERNS = (
     re.compile(r"too\s+many\s+requests"),
     re.compile(r"rate[\s_-]*limit"),
@@ -82,8 +82,10 @@ _KANA_RANGES = (
     # Supplementary-plane kana. These sit inside the Han Extension B-I range
     # below, so without an explicit entry archaic or small kana would select the
     # Chinese region.
-    ("\U0001b000", "\U0001b12f"),  # Kana Supplement and Kana Extended-A
-    ("\U0001b130", "\U0001b16f"),  # Small Kana Extension and Kana Extended-B
+    ("\U0001aff0", "\U0001afff"),  # Kana Extended-B
+    ("\U0001b000", "\U0001b0ff"),  # Kana Supplement
+    ("\U0001b100", "\U0001b12f"),  # Kana Extended-A
+    ("\U0001b130", "\U0001b16f"),  # Small Kana Extension
 )
 
 
@@ -222,24 +224,20 @@ def _clean_url(value: object) -> str:
     return url
 
 
-def _redact_error_text(text: str, query: str) -> str:
-    """Remove caller-controlled substrings before classifying an error message.
+def _redact_error_text(text: str) -> str:
+    """Remove the quoted request URL before classifying an error message.
 
     Upstream errors quote the request URL, which contains the percent-encoded
     query, so the user's own words end up inside the text used for matching.
-    Strip URLs and the query itself so a search for "HTTP 429 troubleshooting"
-    cannot make an unrelated connection failure look like throttling.
+
+    Only the URL is removed. Deleting every occurrence of the query would also
+    erase a genuine signal whenever the two coincide: with query="timeout" and a
+    real timeout, the evidence disappeared and the failure fell back to
+    upstream_error. The query is caller-controlled only where the upstream
+    echoes it, and that is inside the URL.
     """
 
-    redacted = _URL_PATTERN.sub(" ", text)
-    # The query may also appear outside a URL, and engines may quote it in
-    # either raw or percent-encoded form.
-    candidates = {query, quote_plus(query), quote(query)}
-    for candidate in candidates:
-        stripped = candidate.strip()
-        if len(stripped) >= 3:
-            redacted = redacted.replace(stripped, " ")
-    return redacted
+    return _URL_PATTERN.sub(" ", text)
 
 
 def _classify_upstream_failure(query: str, exc: BaseException, timeout: int) -> str:
@@ -263,7 +261,7 @@ def _classify_upstream_failure(query: str, exc: BaseException, timeout: int) -> 
         chain.append(current)
         parts.append(f"{type(current).__name__}: {current}")
         current = current.__cause__ or current.__context__
-    text = _redact_error_text(" ".join(parts), query).lower()
+    text = _redact_error_text(" ".join(parts)).lower()
 
     # A typed error anywhere in the chain is authoritative: it carries no
     # caller-controlled text, so it cannot be spoofed by the query.

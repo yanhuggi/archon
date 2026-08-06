@@ -136,7 +136,9 @@ def test_search_passes_time_range_as_ddgs_timelimit(
         ("\U0001b000", "us-en"),  # Kana Supplement
         ("東京\U0001b122", "us-en"),  # Kana Extended-A
         ("東京\U0001b132", "us-en"),  # Small Kana Extension
-        ("東京\U0001b164", "us-en"),  # Kana Extended-B
+        # Kana Extended-B is at U+1AFF0-U+1AFFF, not next to the other blocks.
+        ("東京𚿰", "us-en"),  # U+1AFF0, Minnan tone mark
+        ("東京\U0001aff1", "us-en"),
     ],
 )
 def test_search_selects_region_from_query(query: str, expected: str) -> None:
@@ -403,6 +405,37 @@ def test_a_real_signal_still_wins_over_a_matching_query(http_failure) -> None:
     data = http_failure(Exception("HTTP 429 Too Many Requests"))
 
     assert data["error_code"] == "rate_limited"
+
+
+@pytest.mark.parametrize(
+    ("query", "message", "expected"),
+    [
+        ("HTTP 429 Too Many Requests", "HTTP 429 Too Many Requests", "rate_limited"),
+        ("timeout", "operation timeout after 10s", "upstream_timeout"),
+        ("rate limit", "upstream rate limit exceeded", "rate_limited"),
+        ("timed out", "timed out", "upstream_timeout"),
+        ("429", "status: 429", "rate_limited"),
+    ],
+)
+def test_a_query_matching_the_real_error_does_not_hide_it(
+    query: str, message: str, expected: str
+) -> None:
+    """Redacting every occurrence of the query erased genuine evidence.
+
+    Deleting the query text outright fixed forged signals but created the
+    opposite defect: with query="timeout" and a real timeout, the only evidence
+    was removed and the failure degraded to upstream_error. Redaction is limited
+    to the URL, which is the only place the upstream echoes the query.
+    """
+
+    def failing_request(self: object, *args: object, **kwargs: object) -> object:
+        raise Exception(message)
+
+    with patch.object(HttpClient, "request", failing_request):
+        with patch.dict(os.environ, {"ARCHON_WEB_DUCKDUCKGO_INTERVAL": "0"}):
+            data = json.loads(DuckDuckGoProvider().search(query, max_results=2))
+
+    assert data["error_code"] == expected
 
 
 @pytest.mark.parametrize(

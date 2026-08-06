@@ -51,15 +51,16 @@ def _normalize_query(query: object) -> tuple[str, str | None]:
 
 
 def _normalize_max_results(value: object) -> int | None:
-    """Convert a tool argument into a safe result limit."""
+    """Clamp a genuine integer limit, rejecting every other type.
 
-    if isinstance(value, bool):
+    ``int(value)`` would accept "3", " 3 ", and 1.5, silently searching with a
+    limit the caller never asked for. ``bool`` is an ``int`` subclass, so it has
+    to be excluded explicitly.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
         return None
-    try:
-        result = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return min(max(result, MIN_RESULTS), MAX_RESULTS)
+    return min(max(value, MIN_RESULTS), MAX_RESULTS)
 
 
 def _normalize_time_range(value: object) -> tuple[str | None, str | None]:

@@ -222,6 +222,10 @@ def test_bounds_are_advertised_without_schema_level_enforcement() -> None:
         ({"query": "ok", "max_results": "many"}, "invalid_max_results"),
         # A declared ``int`` would coerce this to 1 and search anyway.
         ({"query": "ok", "max_results": True}, "invalid_max_results"),
+        # int() would accept all three, searching with a limit nobody asked for.
+        ({"query": "ok", "max_results": "3"}, "invalid_max_results"),
+        ({"query": "ok", "max_results": " 3 "}, "invalid_max_results"),
+        ({"query": "ok", "max_results": 1.5}, "invalid_max_results"),
         ({"query": "ok", "time_range": "decade"}, "invalid_time_range"),
         ({"query": "ok", "time_range": 123}, "invalid_time_range"),
     ],
