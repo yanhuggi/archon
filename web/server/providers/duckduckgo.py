@@ -28,8 +28,15 @@ LOGGER = logging.getLogger(__name__)
 MAX_TITLE_LENGTH = 300
 MAX_FIELD_LENGTH = 2000
 MAX_RESULTS = 20
-# ``ddgs`` auto selection is randomized, making latency and relevance unstable.
-SEARCH_BACKEND = "brave"
+# ``ddgs`` auto selection is randomized, making latency and relevance unstable,
+# so one backend is pinned. Restricted to "duckduckgo" on purpose: Brave,
+# Google, and Mojeek enforce anti-bot challenges that a headless MCP server
+# cannot solve and that a no-key search tool should not attempt to bypass.
+# DuckDuckGo's own HTML endpoint is not exempt from this trade-off — it can
+# return its own anomaly-detection page instead of results, surfacing as
+# upstream_error with no HTTP-level signal — but it was chosen anyway as the
+# identity this provider already advertises.
+SEARCH_BACKEND = "duckduckgo"
 TIME_RANGE_TO_TIMELIMIT = {
     "day": "d",
     "week": "w",

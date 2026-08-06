@@ -13,6 +13,7 @@ from urllib.parse import quote_plus
 
 from ddgs.exceptions import RatelimitException, TimeoutException
 from ddgs.http_client import HttpClient
+from ddgs.http_client2 import HttpClient2
 
 import server.providers.duckduckgo as ddg_module
 from server.providers.duckduckgo import (
@@ -77,7 +78,7 @@ def test_search_success(provider: DuckDuckGoProvider, mock_ddgs: MagicMock) -> N
 
     # Verify max_results is passed through
     mock_ddgs.return_value.__enter__.return_value.text.assert_called_once_with(
-        "test query", max_results=10, backend="brave", region="us-en"
+        "test query", max_results=10, backend="duckduckgo", region="us-en"
     )
 
 
@@ -85,7 +86,7 @@ def test_search_custom_max_results(provider: DuckDuckGoProvider, mock_ddgs: Magi
     """max_results parameter is forwarded to DDGS.text()."""
     provider.search("q", max_results=5)
     mock_ddgs.return_value.__enter__.return_value.text.assert_called_once_with(
-        "q", max_results=5, backend="brave", region="us-en"
+        "q", max_results=5, backend="duckduckgo", region="us-en"
     )
 
 
@@ -107,7 +108,7 @@ def test_search_passes_time_range_as_ddgs_timelimit(
     """Friendly MCP time ranges are translated to DuckDuckGo values."""
     provider.search("recent release", time_range="week")
     mock_ddgs.return_value.__enter__.return_value.text.assert_called_once_with(
-        "recent release", max_results=10, timelimit="w", backend="brave", region="us-en"
+        "recent release", max_results=10, timelimit="w", backend="duckduckgo", region="us-en"
     )
 
 
@@ -150,7 +151,7 @@ def test_search_uses_chinese_region(provider: DuckDuckGoProvider, mock_ddgs: Mag
     mock_ddgs.return_value.__enter__.return_value.text.assert_called_once_with(
         "福州天气预报 今天",
         max_results=10,
-        backend="brave",
+        backend="duckduckgo",
         region="cn-zh",
     )
 
@@ -310,9 +311,16 @@ def test_search_reports_timeout_distinctly(
 #
 # Patching DDGS.text skips everything ddgs does internally: engine errors are
 # collected into one variable and re-raised as a bare DDGSException, and only a
-# message containing "timed out" becomes TimeoutException. These tests patch the
-# HTTP client instead, so the exception the provider sees is the one ddgs
+# message containing "timed out" becomes TimeoutException. These tests patch
+# the HTTP client instead, so the exception the provider sees is the one ddgs
 # actually produces.
+#
+# SEARCH_BACKEND="duckduckgo" routes through HttpClient2, not HttpClient: ddgs
+# ships a second, separate HTTP client "temporary ... for 'backend=duckduckgo'"
+# (its own docstring). Both wrap non-timeout errors as a bare DDGSException and
+# only recognize "timed out" as a timeout, so classification does not need to
+# know which one is active, but a test that patches only HttpClient silently
+# stops covering anything once the backend changes.
 # ---------------------------------------------------------------------------
 
 
@@ -325,8 +333,9 @@ def http_failure() -> Callable[[BaseException], dict]:
             raise exc
 
         with patch.object(HttpClient, "request", failing_request):
-            with patch.dict(os.environ, {"ARCHON_WEB_DUCKDUCKGO_INTERVAL": "0"}):
-                return json.loads(DuckDuckGoProvider().search("test", max_results=2))
+            with patch.object(HttpClient2, "request", failing_request):
+                with patch.dict(os.environ, {"ARCHON_WEB_DUCKDUCKGO_INTERVAL": "0"}):
+                    return json.loads(DuckDuckGoProvider().search("test", max_results=2))
 
     return run
 
@@ -389,13 +398,14 @@ def test_query_terms_cannot_impersonate_an_upstream_signal(query: str) -> None:
     def failing_request(self: object, *args: object, **kwargs: object) -> object:
         raise Exception(
             "ConnectError: error sending request for url "
-            f"(https://search.brave.com/search?q={quote_plus(query)}&source=web) "
+            f"(https://html.duckduckgo.com/html/?q={quote_plus(query)}&source=web) "
             "> client error (Connect) > tls handshake eof"
         )
 
     with patch.object(HttpClient, "request", failing_request):
-        with patch.dict(os.environ, {"ARCHON_WEB_DUCKDUCKGO_INTERVAL": "0"}):
-            data = json.loads(DuckDuckGoProvider().search(query, max_results=2))
+        with patch.object(HttpClient2, "request", failing_request):
+            with patch.dict(os.environ, {"ARCHON_WEB_DUCKDUCKGO_INTERVAL": "0"}):
+                data = json.loads(DuckDuckGoProvider().search(query, max_results=2))
 
     assert data["error_code"] == "upstream_error"
 
@@ -432,8 +442,9 @@ def test_a_query_matching_the_real_error_does_not_hide_it(
         raise Exception(message)
 
     with patch.object(HttpClient, "request", failing_request):
-        with patch.dict(os.environ, {"ARCHON_WEB_DUCKDUCKGO_INTERVAL": "0"}):
-            data = json.loads(DuckDuckGoProvider().search(query, max_results=2))
+        with patch.object(HttpClient2, "request", failing_request):
+            with patch.dict(os.environ, {"ARCHON_WEB_DUCKDUCKGO_INTERVAL": "0"}):
+                data = json.loads(DuckDuckGoProvider().search(query, max_results=2))
 
     assert data["error_code"] == expected
 

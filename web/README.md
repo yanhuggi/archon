@@ -313,6 +313,10 @@ bash test_mcp.sh "MCP Python SDK 2.0" 5 week
 - 缩短自然语言问题，改为实体 + 主题 + 日期/地点。
 - 对最新内容设置 `time_range`。
 - 用同义词或官方域名限定（例如 `site:docs.python.org`）重试一次。
+- DuckDuckGo 的 HTML 端点偶尔会返回自己的人机核验/异常流量提示页而非结果，
+  表现为 `upstream_error`，错误信息中不含 HTTP 状态异常（因为端点仍返回 200/202）。
+  这与网络代理、IP 信誉相关，通常间歇性出现；持续出现时更换出口 IP 或设置
+  `ARCHON_WEB_PROXY` 可能缓解。
 
 ### MCP 客户端找不到 `archon-web`
 
