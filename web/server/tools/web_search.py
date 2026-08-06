@@ -22,6 +22,25 @@ DEFAULT_RESULTS = 8
 TIME_RANGES = ("day", "week", "month", "year")
 
 
+class _Missing(str):
+    """Sentinel marking an argument the caller never sent.
+
+    ``None`` cannot serve this purpose: a client may legitimately send
+    ``query: null``, and that has to be reported as an invalid value rather than
+    as a missing one.
+
+    It subclasses ``str`` so Pydantic can serialize it while building the JSON
+    schema. A plain object triggers a PydanticJsonSchemaWarning on stderr, which
+    would corrupt nothing but does pollute a stdio server's logs.
+    ``_restore_required_query`` removes it from the published schema.
+    """
+
+    __slots__ = ()
+
+
+_MISSING = _Missing()
+
+
 def _json_error(query: str, code: str, message: str) -> str:
     """Return the stable error envelope used by the MCP tool."""
 
@@ -40,6 +59,8 @@ def _json_error(query: str, code: str, message: str) -> str:
 def _normalize_query(query: object) -> tuple[str, str | None]:
     """Normalize user input and return ``(query, error_message)``."""
 
+    if query is _MISSING:
+        return "", "query is required"
     if not isinstance(query, str):
         return "", "query must be a string"
     normalized = " ".join(query.split())
@@ -106,6 +127,31 @@ def _ensure_json_response(raw: object, query: str) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
+def _restore_required_query(mcp: MCPServer) -> None:
+    """Advertise ``query`` as required despite its sentinel default.
+
+    The sentinel exists so an omitted ``query`` reaches the function body and
+    returns the documented envelope instead of a generic ToolError. It is an
+    implementation detail, so strip it from the published schema and restore the
+    ``required`` marker a client needs to see.
+    """
+
+    try:
+        schema = mcp._tool_manager.get_tool("web_search").parameters
+    except Exception:  # pragma: no cover - tolerate a different SDK internal
+        LOGGER.debug("Could not adjust the web_search schema", exc_info=True)
+        return
+
+    properties = schema.get("properties")
+    if isinstance(properties, dict) and isinstance(properties.get("query"), dict):
+        properties["query"].pop("default", None)
+    required = schema.get("required")
+    if not isinstance(required, list):
+        schema["required"] = ["query"]
+    elif "query" not in required:
+        required.insert(0, "query")
+
+
 def register(
     mcp: MCPServer,
     default_provider: str = "duckduckgo",
@@ -143,6 +189,11 @@ def register(
     # raises a generic ToolError instead of the documented JSON envelope. A
     # declared ``int`` would also silently coerce ``true`` to 1 and search on.
     # The body owns every check so all rejections share one shape.
+    #
+    # ``query`` carries a sentinel default for the same reason: a parameter with
+    # no default is rejected by the SDK before the body runs, so omitting it
+    # produced a non-JSON ToolError. ``_restore_required_query`` puts the
+    # ``required`` marker back into the published schema afterwards.
     def web_search(
         query: Annotated[
             Any,
@@ -154,7 +205,7 @@ def register(
                     "maxLength": MAX_QUERY_LENGTH,
                 },
             ),
-        ],
+        ] = _MISSING,
         max_results: Annotated[
             Any,
             Field(
@@ -207,3 +258,5 @@ def register(
                 f"Search provider failed: {type(exc).__name__}: {exc}",
             )
         return _ensure_json_response(raw, normalized_query)
+
+    _restore_required_query(mcp)

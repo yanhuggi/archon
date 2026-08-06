@@ -7,7 +7,6 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
-from pydantic import TypeAdapter
 
 from server.providers import register
 from server.providers.duckduckgo import DuckDuckGoProvider
@@ -198,22 +197,29 @@ def test_bounds_are_advertised_without_schema_level_enforcement() -> None:
     for an out-of-range value, so a rejection would not share the documented
     envelope shape with every other failure.
     """
-    mcp = _MockMCP()
-    register_tool(mcp)
-    func = mcp.captured_tools["web_search"]["function"]
+    from server.config import WebConfig
+    from server.main import create_server
 
-    schema = TypeAdapter(func).json_schema()
+    # Read the schema the SDK actually publishes rather than one derived from the
+    # function signature, which is not what a client sees.
+    schema = asyncio.run(create_server(WebConfig()).list_tools())[0].input_schema
     query_schema = schema["properties"]["query"]
     assert query_schema["minLength"] == 1
     assert query_schema["maxLength"] == 500
 
     # The bound is advertised, yet an over-long query still returns an envelope.
+    func = _get_web_search_func()
     assert json.loads(func("x" * 501))["error_code"] == "invalid_query"
 
 
 @pytest.mark.parametrize(
     ("arguments", "expected_code"),
     [
+        # Omitting a required argument is rejected by the SDK before the body
+        # runs unless the parameter has a default, which produced a non-JSON
+        # ToolError for the one call every client is most likely to get wrong.
+        ({}, "invalid_query"),
+        ({"max_results": 3}, "invalid_query"),
         ({"query": ""}, "invalid_query"),
         ({"query": "   "}, "invalid_query"),
         ({"query": "x" * 501}, "invalid_query"),
@@ -303,7 +309,36 @@ def test_schema_still_advertises_types_and_bounds_to_clients() -> None:
     assert properties["max_results"]["minimum"] == 1
     assert properties["max_results"]["maximum"] == 20
     assert properties["time_range"]["enum"] == ["day", "week", "month", "year", None]
+    # The sentinel default that lets an omitted query reach the body is an
+    # implementation detail; clients must still be told the argument is required.
     assert schema["required"] == ["query"]
+    assert "default" not in properties["query"]
+
+
+def test_building_the_schema_emits_no_pydantic_warning() -> None:
+    """A stderr warning at startup would pollute a stdio server's logs."""
+    import warnings
+
+    from server.config import WebConfig
+    from server.main import create_server
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        asyncio.run(create_server(WebConfig()).list_tools())
+
+
+def test_a_client_supplied_empty_query_is_not_read_as_missing() -> None:
+    """The sentinel is compared by identity, so its value cannot be forged.
+
+    It subclasses ``str`` to stay JSON-schema serializable, which means a client
+    could send the same value. That must be reported as an empty query rather
+    than as an omitted one.
+    """
+    from server.tools.web_search import _MISSING, _normalize_query
+
+    assert _normalize_query(_MISSING)[1] == "query is required"
+    assert _normalize_query(str(_MISSING))[1] == "query must not be empty"
+    assert _normalize_query("")[1] == "query must not be empty"
 
 
 def test_register_binds_a_provider_instance_over_the_global_registry() -> None:

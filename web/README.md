@@ -151,7 +151,7 @@ web_search(query="site:docs.python.org asyncio TaskGroup", max_results=5)
 
 | 代码 | 含义 |
 |---|---|
-| `invalid_query` | 查询为空或超过长度限制 |
+| `invalid_query` | 未传 `query`，或查询为空、超过长度限制 |
 | `invalid_max_results` | 返回数量不是有效整数 |
 | `invalid_time_range` | `time_range` 不在 `day`/`week`/`month`/`year` 之内 |
 | `provider_unavailable` | 搜索 provider 未注册 |
@@ -160,7 +160,7 @@ web_search(query="site:docs.python.org asyncio TaskGroup", max_results=5)
 | `upstream_timeout` | 上游在 `ARCHON_WEB_TIMEOUT` 内未返回 |
 | `upstream_error` | 其他搜索上游网络或代理错误 |
 
-参数的类型、长度和取值范围都会在 JSON Schema 中声明供客户端参考，但一律由工具内部校验并返回上面的包络，因此各类失败共享同一组字段，不会出现 MCP 层的通用报错。传入错误类型同样返回包络，不会被静默转换后继续搜索：`max_results` 只接受真正的整数，字符串（含 `"3"`）、布尔值和浮点数（含 `1.5`）都会被拒绝，而不是被折算成一个调用方没有要求的数量。
+参数的类型、长度和取值范围都会在 JSON Schema 中声明供客户端参考（`query` 仍标记为必填），但一律由工具内部校验并返回上面的包络，因此各类失败共享同一组字段，不会出现 MCP 层的通用报错——完全不传 `query` 也返回包络，而不是传输层错误。传入错误类型同样返回包络，不会被静默转换后继续搜索：`max_results` 只接受真正的整数，字符串（含 `"3"`）、布尔值和浮点数（含 `1.5`）都会被拒绝，而不是被折算成一个调用方没有要求的数量。
 
 ## 模型使用策略
 
