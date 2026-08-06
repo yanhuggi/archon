@@ -127,6 +127,22 @@ def _ensure_json_response(raw: object, query: str) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
+def _published_schema(mcp: MCPServer) -> dict[str, object] | None:
+    """Return the tool's live input schema, or ``None`` if it cannot be reached.
+
+    The MCP SDK exposes no public accessor for a registered tool's schema, and
+    ``list_tools()`` hands back a copy, so this reads an internal attribute. It
+    is isolated here so the one unsupported access has a single call site and a
+    single failure path.
+    """
+
+    try:
+        schema = mcp._tool_manager.get_tool("web_search").parameters
+    except Exception:  # noqa: BLE001 - any SDK change must degrade, not crash
+        return None
+    return schema if isinstance(schema, dict) else None
+
+
 def _restore_required_query(mcp: MCPServer) -> None:
     """Advertise ``query`` as required despite its sentinel default.
 
@@ -134,22 +150,46 @@ def _restore_required_query(mcp: MCPServer) -> None:
     returns the documented envelope instead of a generic ToolError. It is an
     implementation detail, so strip it from the published schema and restore the
     ``required`` marker a client needs to see.
+
+    This depends on an SDK internal that the dependency range does not promise.
+    The tool keeps working if that access fails, but clients would be told
+    ``query`` is optional and shown the sentinel default, so the outcome is
+    verified and a failure is reported loudly rather than swallowed.
     """
 
-    try:
-        schema = mcp._tool_manager.get_tool("web_search").parameters
-    except Exception:  # pragma: no cover - tolerate a different SDK internal
-        LOGGER.debug("Could not adjust the web_search schema", exc_info=True)
-        return
+    schema = _published_schema(mcp)
+    if schema is not None:
+        properties = schema.get("properties")
+        if isinstance(properties, dict) and isinstance(properties.get("query"), dict):
+            properties["query"].pop("default", None)
+        required = schema.get("required")
+        if not isinstance(required, list):
+            schema["required"] = ["query"]
+        elif "query" not in required:
+            required.insert(0, "query")
 
-    properties = schema.get("properties")
-    if isinstance(properties, dict) and isinstance(properties.get("query"), dict):
-        properties["query"].pop("default", None)
+    if not _query_is_advertised_as_required(mcp):
+        LOGGER.warning(
+            "Could not mark web_search's query argument as required in the published "
+            "schema; this MCP SDK version exposes tool metadata differently. Calls "
+            "still return the documented JSON envelope, but clients may treat query "
+            "as optional. Please report this together with the installed mcp version."
+        )
+
+
+def _query_is_advertised_as_required(mcp: MCPServer) -> bool:
+    """Check the outcome instead of assuming the adjustment above worked."""
+
+    schema = _published_schema(mcp)
+    if schema is None:
+        return False
     required = schema.get("required")
-    if not isinstance(required, list):
-        schema["required"] = ["query"]
-    elif "query" not in required:
-        required.insert(0, "query")
+    if not isinstance(required, list) or "query" not in required:
+        return False
+    properties = schema.get("properties")
+    if not isinstance(properties, dict) or not isinstance(properties.get("query"), dict):
+        return False
+    return "default" not in properties["query"]
 
 
 def register(

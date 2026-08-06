@@ -53,7 +53,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "ddgs", specifier = ">=9,<10" },
-    { name = "mcp", specifier = ">=2.0.0,<3" },
+    { name = "mcp", specifier = ">=2.0.0,<2.1" },
     { name = "python-dotenv", specifier = ">=1.0.0,<2" },
 ]
 

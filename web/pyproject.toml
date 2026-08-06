@@ -5,7 +5,11 @@ description = "MCP server for focused, no-key public web search"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=2.0.0,<3",
+    # Pinned to the minor series this server is verified against. The tool
+    # adjusts its published JSON schema through an SDK internal (see
+    # server/tools/web_search.py), which no public API replaces yet, so a
+    # future minor release must be re-verified rather than picked up silently.
+    "mcp>=2.0.0,<2.1",
     "python-dotenv>=1.0.0,<2",
     "ddgs>=9,<10",
 ]

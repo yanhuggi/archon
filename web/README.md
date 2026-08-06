@@ -30,6 +30,8 @@
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/)
 
+依赖中的 `mcp` 固定在 `>=2.0.0,<2.1`。`web_search` 需要调整自身发布的 JSON Schema（把 `query` 标记为必填），而当前 SDK 没有公开接口可用，只能访问内部结构；因此升级 MCP 次版本需要重新验证，而不是自动跟随。若该访问失效，工具调用仍返回正常 JSON 包络，但会在启动时输出一条 `WARNING`。
+
 ### 从 Git 安装
 
 ```bash

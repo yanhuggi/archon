@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -325,6 +326,66 @@ def test_building_the_schema_emits_no_pydantic_warning() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         asyncio.run(create_server(WebConfig()).list_tools())
+
+
+def test_unreachable_sdk_internals_warn_instead_of_failing_silently(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The schema adjustment uses an SDK internal the dependency cannot promise.
+
+    If a future release exposes tool metadata differently, calls still return the
+    documented envelope, but clients would be told query is optional and shown
+    the sentinel default. That must be reported, not swallowed.
+    """
+    from mcp.server.mcpserver.tools.tool_manager import ToolManager
+
+    from server.config import WebConfig
+    from server.main import create_server
+
+    def unavailable(self: object, name: str) -> object:
+        raise AttributeError("SDK internals changed")
+
+    with patch.object(ToolManager, "get_tool", unavailable):
+        with caplog.at_level("WARNING", logger="server.tools.web_search"):
+            server = create_server(WebConfig())
+
+    assert any("query argument as required" in record.message for record in caplog.records)
+    # The tool itself must keep working, including the envelope for a missing query.
+    result = asyncio.run(server.call_tool("web_search", {}))
+    payload = result[0] if isinstance(result, tuple) else result
+    assert json.loads(payload.content[0].text)["error_code"] == "invalid_query"
+
+
+def test_no_warning_is_emitted_on_the_supported_sdk(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The pinned MCP version must satisfy the schema check."""
+    from server.config import WebConfig
+    from server.main import create_server
+
+    with caplog.at_level("WARNING", logger="server.tools.web_search"):
+        create_server(WebConfig())
+
+    assert [record.message for record in caplog.records] == []
+
+
+def test_mcp_dependency_is_pinned_to_a_verified_minor_series() -> None:
+    """An unbounded minor range would silently adopt an unverified SDK.
+
+    The schema adjustment above depends on an SDK internal, so a new minor
+    release has to be re-verified rather than picked up by a fresh install.
+    """
+    # tomllib is 3.11+, and this project supports 3.10, so match the line
+    # directly rather than adding a parser dependency for one assertion.
+    from pathlib import Path
+
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    requirements = re.findall(
+        r'"(mcp[^"]*)"', pyproject.read_text(encoding="utf-8")
+    )
+
+    assert requirements, "no mcp requirement found in pyproject.toml"
+    assert all("<2.1" in requirement for requirement in requirements), requirements
 
 
 def test_a_client_supplied_empty_query_is_not_read_as_missing() -> None:
