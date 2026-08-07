@@ -1,8 +1,10 @@
 """Tests for controlled Jira output paths."""
 
 import errno
+import os
 import threading
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -121,6 +123,46 @@ def test_hard_link_fallback_survives_a_crashed_previous_publish(tmp_path) -> Non
     retry.write_text("new", encoding="utf-8")
     with patch("server.files.os.link", side_effect=OSError(95, "Operation not supported")):
         commit_output_file(retry, destination, config)
+
+    assert destination.read_text(encoding="utf-8") == "new"
+
+
+def test_publish_reclaims_staging_files_orphaned_by_a_killed_process(tmp_path) -> None:
+    """Stale staging files are swept; in-flight and unrelated files are left alone."""
+    destination = tmp_path / "destination"
+    orphan = tmp_path / f".{destination.name}-old{files._STAGING_SUFFIX}"
+    orphan.write_text("orphaned", encoding="utf-8")
+    stale = time.time() - files._STAGING_MAX_AGE_SECONDS - 60
+    os.utime(orphan, (stale, stale))
+
+    # A staging file young enough to belong to a concurrent publish must survive.
+    in_flight = tmp_path / f".{destination.name}-new{files._STAGING_SUFFIX}"
+    in_flight.write_text("in flight", encoding="utf-8")
+    unrelated = tmp_path / "keep.docx"
+    unrelated.write_text("important", encoding="utf-8")
+
+    temporary = tmp_path / "temporary"
+    temporary.write_text("new", encoding="utf-8")
+    with patch("server.files.os.link", side_effect=OSError(95, "Operation not supported")):
+        commit_output_file(temporary, destination, JiraConfig(output_dir=tmp_path))
+
+    assert not orphan.exists()
+    assert in_flight.exists()
+    assert unrelated.read_text(encoding="utf-8") == "important"
+    assert destination.read_text(encoding="utf-8") == "new"
+
+
+def test_staging_cleanup_failure_does_not_fail_the_export(tmp_path) -> None:
+    """Reclaiming disk space is best effort and must never break a publish."""
+    destination = tmp_path / "destination"
+    temporary = tmp_path / "temporary"
+    temporary.write_text("new", encoding="utf-8")
+
+    with (
+        patch("server.files.os.link", side_effect=OSError(95, "Operation not supported")),
+        patch.object(Path, "glob", side_effect=OSError("permission denied")),
+    ):
+        commit_output_file(temporary, destination, JiraConfig(output_dir=tmp_path))
 
     assert destination.read_text(encoding="utf-8") == "new"
 

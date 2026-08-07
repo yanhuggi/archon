@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 from server.config import JiraConfig
@@ -16,6 +17,10 @@ LOGGER = logging.getLogger(__name__)
 
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
+_STAGING_SUFFIX = ".publish"
+# A staging file older than this cannot belong to a live publish: the writer only
+# holds it for one copy, so anything this stale was orphaned by a killed process.
+_STAGING_MAX_AGE_SECONDS = 6 * 60 * 60
 
 
 class OutputPathError(ValueError):
@@ -94,6 +99,30 @@ def resolve_output_path(
     return resolved
 
 
+def _discard_abandoned_staging_files(directory: Path) -> None:
+    """Remove staging files orphaned by a killed process.
+
+    A publish that is force-killed leaves its uniquely named staging file behind.
+    It never blocks a later publish, but it does occupy disk, so each publish
+    sweeps siblings that are too old to belong to an in-flight write. Failures
+    here are ignored: reclaiming space must never fail an export.
+    """
+
+    cutoff = time.time() - _STAGING_MAX_AGE_SECONDS
+    try:
+        candidates = list(directory.glob(f".*{_STAGING_SUFFIX}"))
+    except OSError as exc:
+        LOGGER.debug("Could not scan %s for abandoned staging files: %s", directory, exc)
+        return
+    for path in candidates:
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+                LOGGER.info("Removed abandoned Jira export staging file: %s", path)
+        except OSError as exc:
+            LOGGER.debug("Could not remove abandoned staging file %s: %s", path, exc)
+
+
 def commit_output_file(temporary_path: Path, destination: Path, config: JiraConfig) -> None:
     """Publish a completed temporary file without weakening overwrite policy."""
 
@@ -129,10 +158,11 @@ def _publish_without_hard_link(temporary_path: Path, destination: Path) -> None:
     and it is narrower than the fully non-atomic copy it replaces.
     """
 
+    _discard_abandoned_staging_files(destination.parent)
     staging: Path | None = None
     try:
         descriptor, name = tempfile.mkstemp(
-            prefix=f".{destination.name}-", suffix=".publish", dir=destination.parent
+            prefix=f".{destination.name}-", suffix=_STAGING_SUFFIX, dir=destination.parent
         )
         staging = Path(name)
     except OSError as exc:
