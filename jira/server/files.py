@@ -18,6 +18,11 @@ LOGGER = logging.getLogger(__name__)
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
 _STAGING_SUFFIX = ".publish"
+# Staging files carry an application-specific prefix so the cleanup sweep can
+# only ever match files this module created. A bare ".*.publish" glob would also
+# match unrelated hidden files that happen to share the suffix.
+_STAGING_PREFIX = ".archon-jira-publish-"
+_STAGING_GLOB = f"{_STAGING_PREFIX}*{_STAGING_SUFFIX}"
 # A staging file older than this cannot belong to a live publish: the writer only
 # holds it for one copy, so anything this stale was orphaned by a killed process.
 _STAGING_MAX_AGE_SECONDS = 6 * 60 * 60
@@ -104,13 +109,16 @@ def _discard_abandoned_staging_files(directory: Path) -> None:
 
     A publish that is force-killed leaves its uniquely named staging file behind.
     It never blocks a later publish, but it does occupy disk, so each publish
-    sweeps siblings that are too old to belong to an in-flight write. Failures
-    here are ignored: reclaiming space must never fail an export.
+    sweeps siblings that are too old to belong to an in-flight write.
+
+    The glob is restricted to this module's own prefix: the output directory
+    belongs to the user, and a broader pattern could delete their files. Failures
+    are ignored, since reclaiming space must never fail an export.
     """
 
     cutoff = time.time() - _STAGING_MAX_AGE_SECONDS
     try:
-        candidates = list(directory.glob(f".*{_STAGING_SUFFIX}"))
+        candidates = list(directory.glob(_STAGING_GLOB))
     except OSError as exc:
         LOGGER.debug("Could not scan %s for abandoned staging files: %s", directory, exc)
         return
@@ -125,6 +133,8 @@ def _discard_abandoned_staging_files(directory: Path) -> None:
 
 def commit_output_file(temporary_path: Path, destination: Path, config: JiraConfig) -> None:
     """Publish a completed temporary file without weakening overwrite policy."""
+
+    _discard_abandoned_staging_files(destination.parent)
 
     if config.allow_overwrite:
         os.replace(temporary_path, destination)
@@ -158,11 +168,10 @@ def _publish_without_hard_link(temporary_path: Path, destination: Path) -> None:
     and it is narrower than the fully non-atomic copy it replaces.
     """
 
-    _discard_abandoned_staging_files(destination.parent)
     staging: Path | None = None
     try:
         descriptor, name = tempfile.mkstemp(
-            prefix=f".{destination.name}-", suffix=_STAGING_SUFFIX, dir=destination.parent
+            prefix=_STAGING_PREFIX, suffix=_STAGING_SUFFIX, dir=destination.parent
         )
         staging = Path(name)
     except OSError as exc:

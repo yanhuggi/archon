@@ -127,19 +127,21 @@ def test_hard_link_fallback_survives_a_crashed_previous_publish(tmp_path) -> Non
     assert destination.read_text(encoding="utf-8") == "new"
 
 
+def _age(path: Path, seconds: float) -> None:
+    stale = time.time() - seconds
+    os.utime(path, (stale, stale))
+
+
 def test_publish_reclaims_staging_files_orphaned_by_a_killed_process(tmp_path) -> None:
-    """Stale staging files are swept; in-flight and unrelated files are left alone."""
+    """Stale staging files are swept; in-flight ones are left alone."""
     destination = tmp_path / "destination"
-    orphan = tmp_path / f".{destination.name}-old{files._STAGING_SUFFIX}"
+    orphan = tmp_path / f"{files._STAGING_PREFIX}old{files._STAGING_SUFFIX}"
     orphan.write_text("orphaned", encoding="utf-8")
-    stale = time.time() - files._STAGING_MAX_AGE_SECONDS - 60
-    os.utime(orphan, (stale, stale))
+    _age(orphan, files._STAGING_MAX_AGE_SECONDS + 60)
 
     # A staging file young enough to belong to a concurrent publish must survive.
-    in_flight = tmp_path / f".{destination.name}-new{files._STAGING_SUFFIX}"
+    in_flight = tmp_path / f"{files._STAGING_PREFIX}new{files._STAGING_SUFFIX}"
     in_flight.write_text("in flight", encoding="utf-8")
-    unrelated = tmp_path / "keep.docx"
-    unrelated.write_text("important", encoding="utf-8")
 
     temporary = tmp_path / "temporary"
     temporary.write_text("new", encoding="utf-8")
@@ -148,8 +150,61 @@ def test_publish_reclaims_staging_files_orphaned_by_a_killed_process(tmp_path) -
 
     assert not orphan.exists()
     assert in_flight.exists()
-    assert unrelated.read_text(encoding="utf-8") == "important"
     assert destination.read_text(encoding="utf-8") == "new"
+
+
+def test_cleanup_only_touches_files_this_module_created(tmp_path) -> None:
+    """The output directory is the user's; the sweep must not delete their files.
+
+    A bare ".*.publish" glob would match unrelated hidden files that merely share
+    the suffix, so the sweep is namespaced to this module's own prefix.
+    """
+
+    destination = tmp_path / "destination"
+    bystanders = [
+        tmp_path / ".user-draft.publish",  # same suffix, not ours
+        tmp_path / ".publish",
+        tmp_path / "notes.publish",
+        tmp_path / "keep.docx",
+    ]
+    for path in bystanders:
+        path.write_text("important", encoding="utf-8")
+        _age(path, files._STAGING_MAX_AGE_SECONDS * 10)
+
+    temporary = tmp_path / "temporary"
+    temporary.write_text("new", encoding="utf-8")
+    with patch("server.files.os.link", side_effect=OSError(95, "Operation not supported")):
+        commit_output_file(temporary, destination, JiraConfig(output_dir=tmp_path))
+
+    for path in bystanders:
+        assert path.read_text(encoding="utf-8") == "important", path
+    assert destination.read_text(encoding="utf-8") == "new"
+
+
+def test_cleanup_runs_even_when_hard_links_work(tmp_path) -> None:
+    """The sweep belongs to every publish, not only the no-hard-link fallback."""
+    orphan = tmp_path / f"{files._STAGING_PREFIX}old{files._STAGING_SUFFIX}"
+    orphan.write_text("orphaned", encoding="utf-8")
+    _age(orphan, files._STAGING_MAX_AGE_SECONDS + 60)
+
+    temporary = tmp_path / "temporary"
+    temporary.write_text("new", encoding="utf-8")
+    # No os.link patch: this is the ordinary hard-link path.
+    commit_output_file(temporary, tmp_path / "destination", JiraConfig(output_dir=tmp_path))
+
+    assert not orphan.exists()
+
+    # And on the overwrite path, which returns before either publish strategy.
+    second = tmp_path / f"{files._STAGING_PREFIX}other{files._STAGING_SUFFIX}"
+    second.write_text("orphaned", encoding="utf-8")
+    _age(second, files._STAGING_MAX_AGE_SECONDS + 60)
+    replacement = tmp_path / "replacement"
+    replacement.write_text("newer", encoding="utf-8")
+    commit_output_file(
+        replacement, tmp_path / "destination", JiraConfig(output_dir=tmp_path, allow_overwrite=True)
+    )
+
+    assert not second.exists()
 
 
 def test_staging_cleanup_failure_does_not_fail_the_export(tmp_path) -> None:
