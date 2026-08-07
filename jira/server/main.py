@@ -6,6 +6,7 @@ import argparse
 import atexit
 import logging
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -84,7 +85,20 @@ def create_server(config: JiraConfig | None = None) -> MCPServer:
     return server
 
 
-mcp = create_server()
+def __getattr__(name: str) -> object:
+    """Build the module-level ``mcp`` server only when something asks for it.
+
+    The ``mcp`` CLI discovers a server by looking up a module attribute named
+    ``mcp``, ``server``, or ``app``. Constructing it eagerly would make every
+    normal ``main()`` startup build a second, unused server and provider, and
+    register a stray ``atexit`` close callback.
+    """
+
+    if name == "mcp":
+        server = create_server()
+        globals()["mcp"] = server
+        return server
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -96,31 +110,20 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _config_from_args(args: argparse.Namespace, base: JiraConfig) -> JiraConfig:
+    """Apply command-line overrides without mutating the environment.
+
+    ``replace`` keeps every other setting attached to ``base``, so a new config
+    field cannot silently fall back to its default when the CLI is used.
+    """
+
     port = args.port if args.port is not None else base.port
     if not 1 <= port <= 65535:
         raise ValueError("--port must be between 1 and 65535")
-    return JiraConfig(
-        url=base.url,
-        username=base.username,
-        password=base.password,
-        timeout=base.timeout,
-        max_attachment_size=base.max_attachment_size,
-        output_dir=base.output_dir,
-        allow_overwrite=base.allow_overwrite,
-        jql_disk_cache_enabled=base.jql_disk_cache_enabled,
-        jql_cache_dir=base.jql_cache_dir,
-        jql_field_refresh_interval=base.jql_field_refresh_interval,
-        jql_value_refresh_interval=base.jql_value_refresh_interval,
-        jql_cache_max_stale=base.jql_cache_max_stale,
-        jql_value_cache_max_entries=base.jql_value_cache_max_entries,
+    return replace(
+        base,
         transport=args.transport if args.transport is not None else base.transport,
         host=args.host if args.host is not None else base.host,
         port=port,
-        log_level=base.log_level,
-        streamable_http_path=base.streamable_http_path,
-        sse_path=base.sse_path,
-        message_path=base.message_path,
-        stateless_http=base.stateless_http,
     )
 
 

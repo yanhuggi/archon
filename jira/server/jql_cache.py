@@ -45,9 +45,27 @@ class JsonJqlCache:
         self._instance_key = hashlib.sha256(identity).hexdigest()[:20]
         self._memory: dict[str, dict] = {}
         self._lock = threading.RLock()
+        self._entry_locks: dict[str, threading.RLock] = {}
+        self._marker_fingerprint: tuple[int, int, int] | None = None
+        self._marker_value: dict | None = None
+
+    def _entry_lock(self, cache_id: str) -> threading.RLock:
+        """Return the per-entry lock that serializes one snapshot's loader.
+
+        Loaders perform Jira HTTP calls, so holding a single global lock across
+        them would make an in-flight field refresh block every unrelated value
+        lookup. Coalescing stays per cache entry, which is where it matters.
+        """
+
+        with self._lock:
+            lock = self._entry_locks.get(cache_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._entry_locks[cache_id] = lock
+            return lock
 
     def get_fields(self, loader: Callable[[], dict], *, refresh: bool = False) -> CacheResult:
-        with self._lock:
+        with self._entry_lock("fields"):
             return self._get(
                 "fields",
                 self._fields_path(),
@@ -67,7 +85,7 @@ class JsonJqlCache:
         cache_id = "values:" + hashlib.sha256(
             json.dumps([field, query], ensure_ascii=False, separators=(",", ":")).encode()
         ).hexdigest()
-        with self._lock:
+        with self._entry_lock(cache_id):
             return self._get(
                 cache_id,
                 self._values_path(cache_id.removeprefix("values:")),
@@ -82,6 +100,8 @@ class JsonJqlCache:
         with self._lock:
             invalidated_at = self._clock()
             self._memory["__invalidated__"] = {"invalidated_at": invalidated_at}
+            self._marker_fingerprint = None
+            self._marker_value = None
             if self._config.jql_disk_cache_enabled:
                 self._write_json(self._invalidation_path(), {"invalidated_at": invalidated_at})
 
@@ -95,20 +115,22 @@ class JsonJqlCache:
         refresh: bool,
     ) -> CacheResult:
         now = self._clock()
-        snapshot = self._memory.get(cache_id)
+        with self._lock:
+            snapshot = self._memory.get(cache_id)
         source = "memory"
         if snapshot is None and self._config.jql_disk_cache_enabled:
             snapshot = self._read_snapshot(path)
             source = "disk"
             if snapshot is not None:
-                self._memory[cache_id] = snapshot
+                with self._lock:
+                    self._memory[cache_id] = snapshot
 
-        invalidated_at = self._invalidated_at()
         if snapshot is not None:
             fetched_at = float(snapshot["fetched_at"])
             age = max(0.0, now - fetched_at)
-            is_invalidated = fetched_at < invalidated_at
-            if not refresh and not is_invalidated and age < refresh_interval:
+            # Only consult the cross-process invalidation marker for a snapshot
+            # that would otherwise be served, so warm hits stay in memory.
+            if not refresh and age < refresh_interval and fetched_at >= self._invalidated_at():
                 return CacheResult(snapshot["data"], fetched_at, source)
 
         try:
@@ -127,37 +149,58 @@ class JsonJqlCache:
             "fetched_at": now,
             "data": data,
         }
-        self._memory[cache_id] = fresh
-        if cache_id.startswith("values:"):
-            self._trim_memory_values()
+        with self._lock:
+            self._memory[cache_id] = fresh
+            if cache_id.startswith("values:"):
+                self._trim_memory_values()
         if self._config.jql_disk_cache_enabled:
             self._write_json(path, fresh)
             if cache_id.startswith("values:"):
-                self._prune_value_files(path.parent)
+                self._prune_value_files(path.parent, keep=path)
         return CacheResult(data, now, "jira")
 
     def _trim_memory_values(self) -> None:
+        """Drop the oldest value snapshots. Callers must hold ``self._lock``."""
+
         value_keys = [key for key in self._memory if key.startswith("values:")]
         overflow = len(value_keys) - self._config.jql_value_cache_max_entries
         for key in value_keys[: max(0, overflow)]:
             self._memory.pop(key, None)
+            # Keep the lock table bounded alongside the snapshots it guards. A
+            # concurrent holder keeps its own reference, so dropping the entry
+            # only means the next caller allocates a fresh lock.
+            self._entry_locks.pop(key, None)
 
-    def _prune_value_files(self, directory: Path) -> None:
+    def _prune_value_files(self, directory: Path, *, keep: Path) -> None:
+        """Keep the newest value snapshots, always retaining the one just written.
+
+        ``keep`` is pinned explicitly because filesystems with coarse mtime
+        granularity can report the fresh file as no newer than its neighbours,
+        which would otherwise let the pass delete what it just cached.
+        """
+
         try:
-            paths = sorted(
-                directory.glob("*.json"),
-                key=lambda path: path.stat().st_mtime,
-                reverse=True,
-            )
-            for path in paths[self._config.jql_value_cache_max_entries :]:
+            candidates = []
+            for path in directory.glob("*.json"):
+                if path == keep:
+                    continue
+                try:
+                    candidates.append((path.stat().st_mtime_ns, path))
+                except OSError:
+                    # A concurrent process may prune the same directory.
+                    continue
+            candidates.sort(reverse=True)
+            # `keep` occupies one of the retained slots.
+            for _, path in candidates[max(self._config.jql_value_cache_max_entries - 1, 0) :]:
                 path.unlink(missing_ok=True)
         except OSError as exc:
             LOGGER.warning("Could not prune Jira JQL value cache %s: %s", directory, exc)
 
     def _invalidated_at(self) -> float:
-        marker = self._memory.get("__invalidated__")
+        with self._lock:
+            marker = self._memory.get("__invalidated__")
         if self._config.jql_disk_cache_enabled:
-            disk_marker = self._read_json(self._invalidation_path())
+            disk_marker = self._read_invalidation_marker()
             try:
                 disk_time = float((disk_marker or {}).get("invalidated_at", 0))
                 memory_time = float((marker or {}).get("invalidated_at", 0))
@@ -165,11 +208,36 @@ class JsonJqlCache:
                 disk_time = memory_time = 0.0
             if disk_time > memory_time:
                 marker = disk_marker
-                self._memory["__invalidated__"] = disk_marker
+                with self._lock:
+                    self._memory["__invalidated__"] = disk_marker
         try:
             return float((marker or {}).get("invalidated_at", 0))
         except (TypeError, ValueError):
             return 0.0
+
+    def _read_invalidation_marker(self) -> dict | None:
+        """Read the cross-process marker, re-parsing only when the file changed.
+
+        This runs on every cache hit, so it stats the marker and reuses the
+        previous parse while the file's identity is unchanged. Another process
+        writes the marker via ``os.replace``, which always yields a new
+        (inode, mtime, size) triple, so a real invalidation is never missed.
+        """
+
+        path = self._invalidation_path()
+        try:
+            status = path.stat()
+            fingerprint = (status.st_ino, status.st_mtime_ns, status.st_size)
+        except OSError:
+            fingerprint = None
+        with self._lock:
+            if fingerprint is not None and fingerprint == self._marker_fingerprint:
+                return self._marker_value
+        value = self._read_json(path) if fingerprint is not None else None
+        with self._lock:
+            self._marker_fingerprint = fingerprint
+            self._marker_value = value
+        return value
 
     def _read_snapshot(self, path: Path) -> dict | None:
         snapshot = self._read_json(path)

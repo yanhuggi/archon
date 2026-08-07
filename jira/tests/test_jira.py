@@ -3,6 +3,8 @@
 import base64
 import json
 import os
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -12,6 +14,8 @@ from server.config import JiraConfig
 from server.providers.jira import (
     _DEFAULT_MAX_ATTACHMENT_SIZE,
     _MAX_FIELD_LENGTH,
+    _MAX_OTHER_FIELD_LENGTH,
+    _MAX_OTHER_FIELD_ROWS,
     _MAX_SEARCH_RESULTS,
     JiraProvider,
 )
@@ -298,8 +302,90 @@ def test_get_issue_custom_field_truncation() -> None:
     result = provider.get_issue("PROJ-1")
 
     assert "Long field" in result
-    assert result.count("x") == _MAX_FIELD_LENGTH
+    # Table rows carry a tighter bound than free-form sections.
+    assert result.count("x") == _MAX_OTHER_FIELD_LENGTH
     assert "..." in result
+    provider.close()
+
+
+def test_get_issue_json_skips_the_unused_custom_field_lookup() -> None:
+    """The export projection renders no custom fields, so it must not fetch them."""
+    provider = JiraProvider(
+        JiraConfig(url="https://jira.example.com", username="user", password="pass")
+    )
+    mock_client = _make_mock_client()
+    issue_resp = MagicMock(status_code=200)
+    issue_resp.raise_for_status = MagicMock()
+    issue_resp.json.return_value = {
+        "key": "PROJ-1",
+        "fields": {"summary": "Test", "status": {"name": "Open"}},
+    }
+    mock_client.get.return_value = issue_resp
+    provider._client = mock_client
+
+    result = provider.get_issue_json("PROJ-1")
+
+    assert result["key"] == "PROJ-1"
+    assert [call.args[0] for call in mock_client.get.call_args_list] == ["rest/api/2/issue/PROJ-1"]
+    assert "customfield" not in mock_client.get.call_args.kwargs["params"]["fields"]
+    provider.close()
+
+
+def test_get_issue_bounds_a_wide_custom_field_instance() -> None:
+    """get_issue caps the auxiliary table so one issue cannot flood context."""
+    provider = JiraProvider()
+    field_map = {f"customfield_{20000 + index}": f"Field {index}" for index in range(300)}
+    provider._field_map = dict(field_map)
+    provider._field_map_fetched_at = float("inf")
+    mock_client = _make_mock_client()
+    issue_resp = MagicMock(status_code=200)
+    issue_resp.json.return_value = {
+        "key": "PROJ-1",
+        "fields": {
+            "summary": "Test",
+            "status": {"name": "Open"},
+            "issuetype": {"name": "Task"},
+            **{field_id: "x" * 3000 for field_id in field_map},
+        },
+    }
+    issue_resp.raise_for_status = MagicMock()
+    mock_client.get.return_value = issue_resp
+    provider._client = mock_client
+
+    result = provider.get_issue("PROJ-1")
+
+    assert result.count("\n| Field ") == _MAX_OTHER_FIELD_ROWS
+    assert f"（另有 {300 - _MAX_OTHER_FIELD_ROWS} 个自定义字段未显示）" in result
+    assert len(result) < 60_000
+    provider.close()
+
+
+def test_get_issue_escapes_table_breaking_field_values() -> None:
+    """Untrusted Jira values cannot forge extra Markdown table cells or rows."""
+    provider = JiraProvider()
+    provider._field_map = {}
+    provider._field_map_fetched_at = float("inf")
+    mock_client = _make_mock_client()
+    issue_resp = MagicMock(status_code=200)
+    issue_resp.json.return_value = {
+        "key": "PROJ-1",
+        "fields": {
+            "summary": "Test",
+            "status": {"name": "Open | Forged | Column"},
+            "issuetype": {"name": "Task"},
+            "labels": ["a|b"],
+            "created": "2025-01-15\n| 更新时间 | forged |",
+        },
+    }
+    issue_resp.raise_for_status = MagicMock()
+    mock_client.get.return_value = issue_resp
+    provider._client = mock_client
+
+    result = provider.get_issue("PROJ-1")
+
+    assert "| 状态 | Open \\| Forged \\| Column |" in result
+    assert "| 标签 | a\\|b |" in result
+    assert "| 更新时间 | forged |" not in result
     provider.close()
 
 
@@ -893,14 +979,15 @@ def test_search_issues_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
     mock_client = _make_mock_client()
     mock_client.get.return_value = MagicMock()
     mock_client.get.return_value.raise_for_status.side_effect = httpx.HTTPStatusError(
-        "401 Unauthorized",
+        "500 Server Error",
         request=MagicMock(),
-        response=MagicMock(status_code=401, text="Unauthorized"),
+        response=MagicMock(status_code=500, text="Server Error"),
     )
     provider._client = mock_client
 
     result = json.loads(provider.search_issues("jql"))
     assert "error" in result
+    assert result["error_code"] == "upstream_error"
     provider.close()
 
 
@@ -967,7 +1054,7 @@ def test_get_attachment_valid_id() -> None:
 
 
 def test_search_issues_401_invalidates_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    """search_issues invalidates client on 401 so next call creates fresh session."""
+    """search_issues discards the rejected session so a later call re-authenticates."""
     monkeypatch.setenv("JIRA_URL", "https://jira.example.com")
     monkeypatch.setenv("JIRA_USERNAME", "user")
     monkeypatch.setenv("JIRA_PASSWORD", "pass")
@@ -980,9 +1067,131 @@ def test_search_issues_401_invalidates_client(monkeypatch: pytest.MonkeyPatch) -
     )
     provider._client = mock_client
 
-    result = json.loads(provider.search_issues("jql"))
+    # The retry rebuilds a client, so keep login offline and let it fail the same way.
+    with patch.object(JiraProvider, "_login", staticmethod(lambda *a: None)), patch(
+        "server.providers.jira.httpx.Client", return_value=mock_client
+    ):
+        result = json.loads(provider.search_issues("jql"))
     assert "error" in result
     assert provider._client is None
+    provider.close()
+
+
+def test_expired_session_is_retried_transparently(tmp_path) -> None:
+    """An idle-expired Jira session re-authenticates instead of failing the call."""
+    config = JiraConfig(
+        url="https://jira.example.com", username="user", password="pass", output_dir=tmp_path
+    )
+    provider = JiraProvider(config)
+    request = httpx.Request("GET", "https://jira.example.com/rest/api/2/search")
+    unauthorized = httpx.Response(401, request=request, json={"errorMessages": ["expired"]})
+    success = MagicMock()
+    success.raise_for_status = MagicMock()
+    success.json.return_value = {"total": 0, "issues": []}
+
+    clients: list[MagicMock] = []
+    logins: list[int] = []
+
+    def build_client(**_kwargs) -> MagicMock:
+        client = _make_mock_client()
+        # Only the first session is stale; the re-authenticated one succeeds.
+        client.get.side_effect = lambda *a, **k: unauthorized if client is clients[0] else success
+        clients.append(client)
+        return client
+
+    with (
+        patch("server.providers.jira.httpx.Client", build_client),
+        patch.object(JiraProvider, "_login", staticmethod(lambda *a: logins.append(1))),
+    ):
+        data = json.loads(provider.search_issues("project = TEST"))
+
+    assert "error" not in data
+    assert data["result_count"] == 0
+    assert len(clients) == 2
+    assert len(logins) == 2
+    provider.close()
+
+
+def test_persistent_401_stops_after_one_retry(tmp_path) -> None:
+    """Genuinely rejected credentials surface an error instead of looping."""
+    config = JiraConfig(
+        url="https://jira.example.com", username="user", password="bad", output_dir=tmp_path
+    )
+    provider = JiraProvider(config)
+    request = httpx.Request("GET", "https://jira.example.com/rest/api/2/search")
+    unauthorized = httpx.Response(401, request=request, json={"errorMessages": ["nope"]})
+    logins: list[int] = []
+
+    def build_client(**_kwargs) -> MagicMock:
+        client = _make_mock_client()
+        client.get.return_value = unauthorized
+        return client
+
+    with (
+        patch("server.providers.jira.httpx.Client", build_client),
+        patch.object(JiraProvider, "_login", staticmethod(lambda *a: logins.append(1))),
+    ):
+        data = json.loads(provider.search_issues("project = TEST"))
+
+    assert data["error_code"] == "authentication_error"
+    assert len(logins) == 2
+    assert provider._client is None
+    provider.close()
+
+
+def test_mutations_are_retried_on_an_expired_session(tmp_path) -> None:
+    """A 401 means Jira never applied the write, so one retry stays safe."""
+    config = JiraConfig(
+        url="https://jira.example.com", username="user", password="pass", output_dir=tmp_path
+    )
+    provider = JiraProvider(config)
+    request = httpx.Request("POST", "https://jira.example.com/rest/api/2/issue/PROJ-1/comment")
+    unauthorized = httpx.Response(401, request=request, json={"errorMessages": ["expired"]})
+    created = MagicMock()
+    created.raise_for_status = MagicMock()
+    created.json.return_value = {"id": "10001", "body": "Deployed", "created": "now"}
+
+    clients: list[MagicMock] = []
+    posts: list[dict] = []
+
+    def build_client(**_kwargs) -> MagicMock:
+        client = _make_mock_client()
+
+        def post(url, **kwargs):
+            posts.append({"url": url, **kwargs})
+            return unauthorized if client is clients[0] else created
+
+        client.post.side_effect = post
+        clients.append(client)
+        return client
+
+    with (
+        patch("server.providers.jira.httpx.Client", build_client),
+        patch.object(JiraProvider, "_login", staticmethod(lambda *a: None)),
+    ):
+        data = json.loads(provider.add_comment("PROJ-1", "Deployed"))
+
+    assert data["added"] is True
+    assert data["comment"]["id"] == "10001"
+    # The rejected attempt plus exactly one retry: no duplicate comment.
+    assert len(posts) == 2
+    provider.close()
+
+
+def test_stale_401_does_not_discard_a_newer_session(tmp_path) -> None:
+    """Invalidation targets the rejected client, not whatever is current."""
+    config = JiraConfig(
+        url="https://jira.example.com", username="user", password="pass", output_dir=tmp_path
+    )
+    provider = JiraProvider(config)
+    rejected = _make_mock_client()
+    current = _make_mock_client()
+    provider._client = current
+
+    provider._invalidate_client(rejected)
+
+    assert provider._client is current
+    current.close.assert_not_called()
     provider.close()
 
 
@@ -1078,6 +1287,38 @@ def test_attachment_enforces_actual_stream_size_and_cleans_partial_file(tmp_path
     assert data["error_code"] == "attachment_too_large"
     assert not destination.exists()
     assert list(tmp_path.glob(".archon-jira-*.part")) == []
+
+
+def test_client_is_not_published_before_login_completes(tmp_path) -> None:
+    """A second thread must never receive a client that has no session cookie."""
+    config = JiraConfig(
+        url="https://jira.example.com", username="user", password="pass", output_dir=tmp_path
+    )
+    provider = JiraProvider(config)
+    login_started = threading.Event()
+    login_finished = threading.Event()
+    observed: list[bool] = []
+
+    def slow_login(client, username, password) -> None:
+        login_started.set()
+        time.sleep(0.3)
+        login_finished.set()
+
+    with (
+        patch("server.providers.jira.httpx.Client", lambda **_kwargs: _make_mock_client()),
+        patch.object(JiraProvider, "_login", staticmethod(slow_login)),
+    ):
+        thread = threading.Thread(target=provider._get_client)
+        thread.start()
+        assert login_started.wait(1.0)
+        # While the first login is still in flight, any client handed out here
+        # would be unauthenticated.
+        provider._get_client()
+        observed.append(login_finished.is_set())
+        thread.join()
+
+    assert observed == [True]
+    provider.close()
 
 
 def test_login_failure_discards_unusable_client(tmp_path) -> None:

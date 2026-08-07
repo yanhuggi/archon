@@ -17,10 +17,10 @@ from server.files import OutputPathError, commit_output_file, resolve_output_pat
 from server.jql_cache import CacheResult, JsonJqlCache
 
 _MAX_FIELD_LENGTH = 2000
-_DEFAULT_MAX_RESULTS = 50
+_MAX_OTHER_FIELD_ROWS = 60
+_MAX_OTHER_FIELD_LENGTH = 500
 _MAX_SEARCH_RESULTS = 200
 _MAX_CACHED_VALUE_SUGGESTIONS = 1000
-_DEFAULT_TIMEOUT = 30
 _DEFAULT_MAX_ATTACHMENT_SIZE = DEFAULT_MAX_ATTACHMENT_SIZE
 _ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
 _COMMENT_ID_RE = re.compile(r"^\d+$")
@@ -96,6 +96,17 @@ def _object_text(value: object, key: str, default: str = "") -> str:
         return default
     candidate = value.get(key)
     return str(candidate) if candidate is not None else default
+
+
+def _table_cell(value: object) -> str:
+    """Render untrusted Jira text as one Markdown table cell.
+
+    A raw ``|`` or newline in a Jira value would otherwise split the cell and
+    let issue content forge extra columns or rows in the rendered table.
+    """
+
+    text = "" if value is None else str(value)
+    return text.replace("\\", "\\\\").replace("|", "\\|").replace("\r", " ").replace("\n", " ")
 
 
 def _normalize_comment(comment: dict, fallback_body: str = "") -> dict:
@@ -265,34 +276,39 @@ class JiraProvider:
         return self._fixed_config or JiraConfig.from_env()
 
     def _get_client(self) -> httpx.Client:
-        if self._client is not None and self._client.is_closed:
+        client = self._client
+        if client is not None and not client.is_closed:
+            return client
+        with self._lock:
+            client = self._client
+            if client is not None and not client.is_closed:
+                return client
             self._client = None
-        if self._client is None:
-            with self._lock:
-                if self._client is not None and self._client.is_closed:
-                    self._client = None
-                if self._client is None:
-                    config = self._config()
-                    if not config.is_configured:
-                        raise RuntimeError(
-                            "JIRA_URL, JIRA_USERNAME, and JIRA_PASSWORD must all be configured"
-                        )
-                    self._client = httpx.Client(
-                        timeout=config.timeout,
-                        headers={"Accept": "application/json"},
-                        base_url=config.url.rstrip("/") + "/",
-                    )
-                    try:
-                        self._login(config.username, config.password)
-                    except Exception:
-                        self._client.close()
-                        self._client = None
-                        raise
-        return self._client
+            config = self._config()
+            if not config.is_configured:
+                raise RuntimeError(
+                    "JIRA_URL, JIRA_USERNAME, and JIRA_PASSWORD must all be configured"
+                )
+            # Authenticate before publishing the client. Publishing first would
+            # let another thread take the fast path above and issue a request on
+            # a connection that has no session cookie yet.
+            client = httpx.Client(
+                timeout=config.timeout,
+                headers={"Accept": "application/json"},
+                base_url=config.url.rstrip("/") + "/",
+            )
+            try:
+                self._login(client, config.username, config.password)
+            except Exception:
+                client.close()
+                raise
+            self._client = client
+            return client
 
-    def _login(self, username: str, password: str) -> None:
+    @staticmethod
+    def _login(client: httpx.Client, username: str, password: str) -> None:
         """Authenticate via Jira session API and store the session cookie."""
-        resp = self._client.post(
+        resp = client.post(
             "rest/auth/1/session",
             json={"username": username, "password": password},
         )
@@ -305,15 +321,50 @@ class JiraProvider:
                 self._client.close()
             self._client = None
 
-    def _invalidate_client(self) -> None:
-        """Close and discard the current client so the next call creates a fresh session."""
+    def _invalidate_client(self, expected: httpx.Client | None = None) -> None:
+        """Close and discard the current client so the next call creates a fresh session.
+
+        When ``expected`` is given, only that client is discarded. This keeps a
+        stale 401 from throwing away a session another thread just established.
+        """
+
         with self._lock:
-            if self._client is not None:
-                try:
-                    self._client.close()
-                except Exception as exc:  # noqa: BLE001 - invalidation must remain best effort
-                    LOGGER.debug("Failed to close invalid Jira client: %s", exc)
-                self._client = None
+            if self._client is None or (expected is not None and self._client is not expected):
+                return
+            stale = self._client
+            self._client = None
+        try:
+            stale.close()
+        except Exception as exc:  # noqa: BLE001 - invalidation must remain best effort
+            LOGGER.debug("Failed to close invalid Jira client: %s", exc)
+
+    def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """Send one authenticated Jira request, re-authenticating once on 401.
+
+        Jira sessions expire on the server's schedule, so the first call after an
+        idle period can fail even though the credentials are still valid. A 401
+        means Jira rejected the request without applying it, which makes a single
+        retry safe for mutations as well as reads.
+        """
+
+        last_attempt = 1
+        for attempt in (0, last_attempt):
+            client = self._get_client()
+            response = getattr(client, method.lower())(url, **kwargs)
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 401:
+                    raise
+                # Drop exactly this session so the retry, and any later call,
+                # authenticates again instead of reusing a rejected cookie.
+                self._invalidate_client(client)
+                if attempt == last_attempt:
+                    raise
+                LOGGER.info("Jira session rejected %s %s; re-authenticating once", method, url)
+                continue
+            return response
+        raise AssertionError("unreachable")  # pragma: no cover - loop always returns or raises
 
     @staticmethod
     def _validate_issue_key(issue_key: str) -> str | None:
@@ -349,10 +400,7 @@ class JiraProvider:
                 return self._field_map.copy()
 
             try:
-                client = self._get_client()
-                resp = client.get("rest/api/2/field")
-                resp.raise_for_status()
-                data = resp.json()
+                data = self._request("GET", "rest/api/2/field").json()
                 if not isinstance(data, list):
                     raise TypeError("Jira field metadata response must be an array")
                 field_map = {
@@ -380,8 +428,8 @@ class JiraProvider:
 
         fields = "key,summary,status,assignee,issuetype,priority,labels,created,updated"
         try:
-            client = self._get_client()
-            resp = client.get(
+            data = self._request(
+                "GET",
                 "rest/api/2/search",
                 params={
                     "jql": jql,
@@ -389,9 +437,7 @@ class JiraProvider:
                     "startAt": start_at,
                     "maxResults": max_results,
                 },
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            ).json()
             if not isinstance(data, dict):
                 return _json_error(
                     "Jira search response must be an object",
@@ -402,8 +448,6 @@ class JiraProvider:
                 )
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if status == 401:
-                self._invalidate_client()
             if status == 400:
                 self._jql_cache.invalidate()
             LOGGER.warning("Jira search returned HTTP %d", status)
@@ -478,19 +522,14 @@ class JiraProvider:
     # ── JQL metadata ───────────────────────────────────────────────
 
     def _fetch_jql_fields(self) -> dict:
-        client = self._get_client()
-        field_response = client.get("rest/api/2/field")
-        field_response.raise_for_status()
-        field_data = field_response.json()
+        field_data = self._request("GET", "rest/api/2/field").json()
         if not isinstance(field_data, list):
             raise TypeError("Jira field metadata response must be an array")
 
         autocomplete_data: dict | None = None
         warning: str | None = None
         try:
-            response = client.get("rest/api/2/jql/autocompletedata")
-            response.raise_for_status()
-            candidate = response.json()
+            candidate = self._request("GET", "rest/api/2/jql/autocompletedata").json()
             if not isinstance(candidate, dict):
                 raise TypeError("Jira JQL autocomplete response must be an object")
             autocomplete_data = candidate
@@ -531,8 +570,6 @@ class JiraProvider:
             cached = self._field_catalog(refresh=refresh)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if status == 401:
-                self._invalidate_client()
             return _json_error(
                 _http_error_message(exc),
                 _status_error_code(status),
@@ -641,13 +678,12 @@ class JiraProvider:
         query: str,
         schema_type: str,
     ) -> dict:
-        client = self._get_client()
-        response = client.get(
-            "rest/api/2/jql/autocompletedata/suggestions",
-            params={"fieldName": field_clause, "fieldValue": query},
-        )
         try:
-            response.raise_for_status()
+            response = self._request(
+                "GET",
+                "rest/api/2/jql/autocompletedata/suggestions",
+                params={"fieldName": field_clause, "fieldValue": query},
+            )
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in {404, 405}:
                 raise _MetadataUnsupported(
@@ -737,8 +773,6 @@ class JiraProvider:
             )
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if status == 401:
-                self._invalidate_client()
             return _json_error(
                 _http_error_message(exc),
                 _status_error_code(status),
@@ -805,23 +839,18 @@ class JiraProvider:
         if err:
             return {"error": err, "error_code": "invalid_issue_key"}
 
-        field_map = self._get_field_map()
-        custom_fields = ",".join(field_map.keys())
-        fields_param = _DEFAULT_FIELDS
-        if custom_fields:
-            fields_param += "," + custom_fields
-
+        # This projection renders only standard fields, so it deliberately skips
+        # the custom-field map that get_issue needs. Requesting every custom
+        # field here would add a metadata round trip and inflate the Jira
+        # response with values that are then discarded.
         try:
-            client = self._get_client()
-            resp = client.get(f"rest/api/2/issue/{issue_key}", params={"fields": fields_param})
-            resp.raise_for_status()
-            issue = resp.json()
+            issue = self._request(
+                "GET", f"rest/api/2/issue/{issue_key}", params={"fields": _DEFAULT_FIELDS}
+            ).json()
             if not isinstance(issue, dict) or not isinstance(issue.get("fields", {}), dict):
                 return {"error": "Jira issue response must be an object", "error_code": "invalid_provider_response"}
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if status == 401:
-                self._invalidate_client()
             LOGGER.warning("Jira issue lookup returned HTTP %d", status)
             return {"error": _http_error_message(exc), "error_code": _status_error_code(status)}
         except httpx.RequestError as exc:
@@ -935,10 +964,9 @@ class JiraProvider:
             fields_param += "," + custom_fields
 
         try:
-            client = self._get_client()
-            resp = client.get(f"rest/api/2/issue/{issue_key}", params={"fields": fields_param})
-            resp.raise_for_status()
-            issue = resp.json()
+            issue = self._request(
+                "GET", f"rest/api/2/issue/{issue_key}", params={"fields": fields_param}
+            ).json()
             if not isinstance(issue, dict) or not isinstance(issue.get("fields", {}), dict):
                 return _json_error(
                     "Jira issue response must be an object with fields",
@@ -947,8 +975,6 @@ class JiraProvider:
                 )
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if status == 401:
-                self._invalidate_client()
             LOGGER.warning("Jira issue lookup returned HTTP %d", status)
             return _json_error(_http_error_message(exc), _status_error_code(status), issue_key=issue_key)
         except httpx.RequestError as exc:
@@ -1013,7 +1039,7 @@ class JiraProvider:
         lines += ["**问题详情**", ""]
         lines += ["| 字段 | 值 |", "|---|---|"]
         for label, value in detail_rows:
-            lines.append(f"| {label} | {value} |")
+            lines.append(f"| {_table_cell(label)} | {_table_cell(value)} |")
 
         # ── 用户 ──
         user_rows = [("经办人", _user_name(f.get("assignee")))]
@@ -1029,15 +1055,15 @@ class JiraProvider:
         lines += ["", "**用户**", ""]
         lines += ["| 字段 | 值 |", "|---|---|"]
         for label, value in user_rows:
-            lines.append(f"| {label} | {value} |")
+            lines.append(f"| {_table_cell(label)} | {_table_cell(value)} |")
 
         # ── 日期 ──
         lines += ["", "**日期**", ""]
         lines += ["| 字段 | 值 |", "|---|---|"]
         if f.get("created"):
-            lines.append(f"| 创建时间 | {f['created']} |")
+            lines.append(f"| 创建时间 | {_table_cell(f['created'])} |")
         if f.get("updated"):
-            lines.append(f"| 更新时间 | {f['updated']} |")
+            lines.append(f"| 更新时间 | {_table_cell(f['updated'])} |")
 
         # ── parent ──
         parent = f.get("parent")
@@ -1142,23 +1168,28 @@ class JiraProvider:
             if val:
                 other_rows.append((fname, val))
         if other_rows:
+            # An instance with hundreds of populated custom fields would
+            # otherwise render a single response of several hundred kilobytes.
+            omitted = len(other_rows) - _MAX_OTHER_FIELD_ROWS
             lines += ["", "**其他信息**", ""]
             lines += ["| 字段 | 值 |", "|---|---|"]
-            for label, value in other_rows:
-                lines.append(f"| {label} | {value} |")
+            for label, value in other_rows[:_MAX_OTHER_FIELD_ROWS]:
+                if len(value) > _MAX_OTHER_FIELD_LENGTH:
+                    value = value[:_MAX_OTHER_FIELD_LENGTH] + "..."
+                lines.append(f"| {_table_cell(label)} | {_table_cell(value)} |")
+            if omitted > 0:
+                lines += ["", f"（另有 {omitted} 个自定义字段未显示）"]
 
         return "\n".join(lines)
 
     # ── workflow transitions ──────────────────────────────────────
 
     def _fetch_transitions(self, issue_key: str) -> list[dict]:
-        client = self._get_client()
-        response = client.get(
+        data = self._request(
+            "GET",
             f"rest/api/2/issue/{issue_key}/transitions",
             params={"expand": "transitions.fields"},
-        )
-        response.raise_for_status()
-        data = response.json()
+        ).json()
         raw_transitions = data.get("transitions") if isinstance(data, dict) else None
         if not isinstance(raw_transitions, list) or any(
             not isinstance(transition, dict) for transition in raw_transitions
@@ -1181,8 +1212,6 @@ class JiraProvider:
             transitions = self._fetch_transitions(issue_key)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if status == 401:
-                self._invalidate_client()
             LOGGER.warning("Jira transitions lookup returned HTTP %d", status)
             return _json_error(
                 _http_error_message(exc),
@@ -1340,16 +1369,13 @@ class JiraProvider:
             payload: dict[str, object] = {"transition": {"id": transition_id}}
             if fields is not None:
                 payload["fields"] = transition_fields
-            client = self._get_client()
-            response = client.post(
+            self._request(
+                "POST",
                 f"rest/api/2/issue/{issue_key}/transitions",
                 json=payload,
             )
-            response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if status == 401:
-                self._invalidate_client()
             LOGGER.warning("Jira issue transition returned HTTP %d", status)
             return _json_error(
                 _http_error_message(exc),
@@ -1403,13 +1429,11 @@ class JiraProvider:
         start_at = max(start_at, 0)
 
         try:
-            client = self._get_client()
-            resp = client.get(
+            data = self._request(
+                "GET",
                 f"rest/api/2/issue/{issue_key}/comment",
                 params={"maxResults": max_results, "startAt": start_at},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            ).json()
             if not isinstance(data, dict):
                 return _json_error(
                     "Jira comments response must be an object",
@@ -1420,8 +1444,6 @@ class JiraProvider:
                 )
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if status == 401:
-                self._invalidate_client()
             LOGGER.warning("Jira comments returned HTTP %d", status)
             return _json_error(
                 _http_error_message(exc),
@@ -1509,13 +1531,11 @@ class JiraProvider:
             return _json_error(body_error, "invalid_comment_body", issue_key=issue_key, added=False)
 
         try:
-            client = self._get_client()
-            response = client.post(
+            comment = self._request(
+                "POST",
                 f"rest/api/2/issue/{issue_key}/comment",
                 json={"body": body},
-            )
-            response.raise_for_status()
-            comment = response.json()
+            ).json()
             if not isinstance(comment, dict):
                 return _json_error(
                     "Jira add-comment response must be an object",
@@ -1525,8 +1545,6 @@ class JiraProvider:
                 )
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if status == 401:
-                self._invalidate_client()
             LOGGER.warning("Jira comment creation returned HTTP %d", status)
             return _json_error(_http_error_message(exc), _status_error_code(status), issue_key=issue_key, added=False)
         except httpx.RequestError as exc:
@@ -1555,13 +1573,11 @@ class JiraProvider:
             return _json_error(body_error, "invalid_comment_body", issue_key=issue_key, comment_id=comment_id, updated=False)
 
         try:
-            client = self._get_client()
-            response = client.put(
+            comment = self._request(
+                "PUT",
                 f"rest/api/2/issue/{issue_key}/comment/{comment_id}",
                 json={"body": body},
-            )
-            response.raise_for_status()
-            comment = response.json()
+            ).json()
             if not isinstance(comment, dict):
                 return _json_error(
                     "Jira update-comment response must be an object",
@@ -1572,8 +1588,6 @@ class JiraProvider:
                 )
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if status == 401:
-                self._invalidate_client()
             LOGGER.warning("Jira comment update returned HTTP %d", status)
             return _json_error(_http_error_message(exc), _status_error_code(status), issue_key=issue_key, comment_id=comment_id, updated=False)
         except httpx.RequestError as exc:
@@ -1604,13 +1618,9 @@ class JiraProvider:
             return _json_error(comment_error, "invalid_comment_id", issue_key=issue_key, comment_id=comment_id, deleted=False)
 
         try:
-            client = self._get_client()
-            response = client.delete(f"rest/api/2/issue/{issue_key}/comment/{comment_id}")
-            response.raise_for_status()
+            self._request("DELETE", f"rest/api/2/issue/{issue_key}/comment/{comment_id}")
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if status == 401:
-                self._invalidate_client()
             LOGGER.warning("Jira comment deletion returned HTTP %d", status)
             return _json_error(_http_error_message(exc), _status_error_code(status), issue_key=issue_key, comment_id=comment_id, deleted=False)
         except httpx.RequestError as exc:
@@ -1684,10 +1694,7 @@ class JiraProvider:
             )
 
         try:
-            client = self._get_client()
-            editmeta_response = client.get(f"rest/api/2/issue/{issue_key}/editmeta")
-            editmeta_response.raise_for_status()
-            editmeta = editmeta_response.json()
+            editmeta = self._request("GET", f"rest/api/2/issue/{issue_key}/editmeta").json()
             metadata_fields = editmeta.get("fields") if isinstance(editmeta, dict) else None
             if not isinstance(metadata_fields, dict):
                 return _json_error(
@@ -1724,15 +1731,13 @@ class JiraProvider:
                     editable_fields=sorted(set(editable_aliases.values()))[:200],
                 )
 
-            response = client.put(
+            self._request(
+                "PUT",
                 f"rest/api/2/issue/{issue_key}",
                 json={"fields": normalized_fields},
             )
-            response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if status == 401:
-                self._invalidate_client()
             LOGGER.warning("Jira issue edit metadata/update returned HTTP %d", status)
             return _json_error(
                 _http_error_message(exc),
@@ -1770,10 +1775,7 @@ class JiraProvider:
         """Fetch bounded attachment bytes without writing to disk."""
         config = self._config()
         try:
-            client = self._get_client()
-            meta_resp = client.get(f"rest/api/2/attachment/{attachment_id}")
-            meta_resp.raise_for_status()
-            meta = meta_resp.json()
+            meta = self._request("GET", f"rest/api/2/attachment/{attachment_id}").json()
             if not isinstance(meta, dict):
                 return _json_error(
                     "Jira returned invalid attachment metadata",
@@ -1782,8 +1784,6 @@ class JiraProvider:
                 )
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if status == 401:
-                self._invalidate_client()
             LOGGER.warning("Jira attachment metadata returned HTTP %d", status)
             return _json_error(_http_error_message(exc), _status_error_code(status), id=attachment_id)
         except httpx.RequestError as exc:
@@ -1838,8 +1838,17 @@ class JiraProvider:
         try:
             chunks: list[bytes] = []
             downloaded_size = 0
+            client = self._get_client()
             with client.stream("GET", download_url) as download_resp:
-                download_resp.raise_for_status()
+                try:
+                    download_resp.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    # A streamed error response has no buffered body yet, and
+                    # _http_error_message needs one to extract Jira's message.
+                    exc.response.read()
+                    if exc.response.status_code == 401:
+                        self._invalidate_client(client)
+                    raise
                 for chunk in download_resp.iter_bytes(chunk_size=8192):
                     downloaded_size += len(chunk)
                     if downloaded_size > config.max_attachment_size:
@@ -1851,8 +1860,6 @@ class JiraProvider:
             return _json_error(str(exc), "attachment_too_large", id=attachment_id, filename=filename)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            if status == 401:
-                self._invalidate_client()
             LOGGER.warning("Jira attachment download returned HTTP %d", status)
             return _json_error(_http_error_message(exc), _status_error_code(status), id=attachment_id)
         except httpx.RequestError as exc:

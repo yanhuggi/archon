@@ -22,6 +22,10 @@ _TEXT_MIME_TYPES = {
     "application/x-yaml",
 }
 
+# JIRA_MAX_ATTACHMENT_SIZE bounds the download; this bounds what one tool call
+# returns inline, since the download limit alone permits megabytes of text.
+MAX_INLINE_TEXT_CHARS = 200_000
+
 
 def _is_text_mime(mime_type: str) -> bool:
     return mime_type.startswith("text/") or mime_type in _TEXT_MIME_TYPES
@@ -83,7 +87,11 @@ def register(mcp: MCPServer, default_provider: str = "jira", provider: JiraProvi
                 ImageContent(data=base64.b64encode(content).decode("ascii"), mimeType=mime_type),
             ]
         if _is_text_mime(mime_type):
-            payload["content"] = content.decode("utf-8", errors="replace")
+            text = content.decode("utf-8", errors="replace")
+            payload["truncated"] = len(text) > MAX_INLINE_TEXT_CHARS
+            if payload["truncated"]:
+                text = text[:MAX_INLINE_TEXT_CHARS]
+            payload["content"] = text
             return json.dumps(payload, ensure_ascii=False)
 
         payload["readable"] = False

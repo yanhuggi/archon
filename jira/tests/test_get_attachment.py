@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 from mcp.types import ImageContent
 from server.providers import register
+from server.tools.get_attachment import MAX_INLINE_TEXT_CHARS
 from server.tools.get_attachment import register as register_tool
 
 
@@ -69,3 +70,31 @@ def test_attachment_does_not_expose_provider_argument() -> None:
     signature = inspect.signature(get_func())
     assert "provider" not in signature.parameters
     assert "save_to" not in signature.parameters
+
+
+def test_attachment_bounds_inline_text() -> None:
+    """A large text attachment cannot flood one tool result."""
+
+    class LargeTextProvider:
+        def get_attachment(self, attachment_id: str, **kwargs) -> str:
+            body = b"x" * (MAX_INLINE_TEXT_CHARS + 500)
+            return json.dumps({
+                "id": attachment_id,
+                "filename": "big.log",
+                "size": len(body),
+                "mime_type": "text/plain",
+                "content_base64": base64.b64encode(body).decode("ascii"),
+            })
+
+    register("large", LargeTextProvider())
+    data = json.loads(get_func("large")("10001"))
+
+    assert data["truncated"] is True
+    assert len(data["content"]) == MAX_INLINE_TEXT_CHARS
+
+
+def test_attachment_marks_small_text_as_complete() -> None:
+    register("stub", StubProvider())
+    data = json.loads(get_func()("10001"))
+    assert data["truncated"] is False
+    assert data["content"] == "test"

@@ -211,6 +211,10 @@ search_issues(jql="assignee = currentUser() AND resolution = Unresolved")
 
 评论不自动混入详情；只有需要讨论历史时才调用 `get_comments`。
 
+单个字段值截断到 2,000 字符；「其他信息」表最多列出 60 个自定义字段、每格
+500 字符，超出时在表尾说明省略数量。字段值中的 `|` 和换行会转义，Jira 内容
+无法伪造表格结构。
+
 ### `get_transitions`
 
 返回当前账号对指定任务此刻可执行的工作流流转，包括数字 transition ID、
@@ -322,6 +326,9 @@ UTF-8 正文，图片以内联 MCP 图片内容返回；其他二进制附件只
 3. 在内存中读取并检查实际字节数。
 4. 按 MIME 类型返回文本、图片或元数据，不落盘。
 
+文本附件最多内联返回 200,000 字符，超出时截断并置 `truncated=true`。
+`JIRA_MAX_ATTACHMENT_SIZE` 限制下载字节数，这一项限制单次返回的上下文体积。
+
 ### `export_issue`
 
 | 参数 | 默认值 | 说明 |
@@ -355,7 +362,7 @@ JSON 工具调用失败时返回 `error` 与 `error_code`。`get_issue` 成功�
 | `invalid_output_path` | 输出路径越界、为目录或不允许覆盖 |
 | `invalid_attachment_url` | 下载地址与 Jira 不同源 |
 | `attachment_too_large` | 声明大小或实际下载大小超过限制 |
-| `authentication_error` | Jira 返回 401/403 |
+| `authentication_error` | Jira 返回 401/403；401 已自动重新登录重试过一次 |
 | `not_found` | Jira 返回 404 |
 | `rate_limited` | Jira 返回 429 |
 | `upstream_error` | 网络或其他 Jira HTTP 错误 |
@@ -515,9 +522,16 @@ uv run pytest tests -q
 
 正常情况下字段最多约 15 分钟、候选值最多约 30 分钟后自动刷新。需要立即确认时，在对应元数据工具中使用 `refresh=true`。若返回的 `cache.stale=true`，表示 Jira 刷新失败，当前结果来自最大陈旧期限内的旧快照。
 
+### 长时间空闲后第一次调用失败
+
+Jira session 由服务端决定过期时间。服务在收到 401 时会重新登录并自动重试一次，
+所以空闲后的首次调用通常无需干预。若仍返回 `authentication_error`，说明凭据本身
+被拒绝，需要检查账号状态。401 表示 Jira 未执行该请求，因此写操作重试不会产生重复
+评论或重复状态流转。
+
 ### Windows 兼容性
 
-核心服务、原子替换、临时文件和路径处理使用跨平台 Python API，配置路径建议使用正斜杠。仓库尚未配置 Windows CI，发布前应在 Windows 上执行完整测试。
+核心服务、原子替换、临时文件和路径处理使用跨平台 Python API，配置路径建议使用正斜杠。输出目录若位于不支持硬链接的挂载点（网络盘、部分 FUSE 或 Windows 挂载路径），会自动改用独占创建写入，仍然不覆盖已有文件。仓库尚未配置 Windows CI，发布前应在 Windows 上执行完整测试。
 
 ## 项目结构
 

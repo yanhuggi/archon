@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 from server.config import JiraConfig
@@ -58,4 +59,26 @@ def commit_output_file(temporary_path: Path, destination: Path, config: JiraConf
         os.link(temporary_path, destination)
     except FileExistsError as exc:
         raise OutputPathError(f"Output file already exists: {destination}") from exc
-    temporary_path.unlink()
+    except OSError:
+        # Some mounts (network shares, certain FUSE and Windows-backed paths)
+        # reject hard links outright. An exclusive create keeps the
+        # create-if-absent guarantee without them.
+        _copy_exclusive(temporary_path, destination)
+    temporary_path.unlink(missing_ok=True)
+
+
+def _copy_exclusive(temporary_path: Path, destination: Path) -> None:
+    """Copy into a newly created destination, refusing to replace an existing file."""
+
+    try:
+        descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as exc:
+        raise OutputPathError(f"Output file already exists: {destination}") from exc
+    except OSError as exc:
+        raise OutputPathError(f"Could not write output file {destination}: {exc}") from exc
+    try:
+        with open(descriptor, "wb") as handle, temporary_path.open("rb") as source:
+            shutil.copyfileobj(source, handle)
+    except OSError as exc:
+        destination.unlink(missing_ok=True)
+        raise OutputPathError(f"Could not write output file {destination}: {exc}") from exc

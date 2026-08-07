@@ -1,5 +1,7 @@
 """Tests for controlled Jira output paths."""
 
+from unittest.mock import patch
+
 import pytest
 
 from server.config import JiraConfig
@@ -40,6 +42,34 @@ def test_commit_output_file_does_not_replace_racing_destination(tmp_path) -> Non
 
     with pytest.raises(OutputPathError, match="already exists"):
         commit_output_file(temporary, destination, JiraConfig(output_dir=tmp_path))
+
+    assert destination.read_text(encoding="utf-8") == "existing"
+    assert temporary.read_text(encoding="utf-8") == "new"
+
+
+def test_commit_output_file_falls_back_without_hard_links(tmp_path) -> None:
+    """Mounts that reject hard links still publish the file."""
+    temporary = tmp_path / "temporary"
+    destination = tmp_path / "destination"
+    temporary.write_text("new", encoding="utf-8")
+
+    with patch("server.files.os.link", side_effect=OSError(95, "Operation not supported")):
+        commit_output_file(temporary, destination, JiraConfig(output_dir=tmp_path))
+
+    assert destination.read_text(encoding="utf-8") == "new"
+    assert not temporary.exists()
+
+
+def test_hard_link_fallback_still_refuses_to_overwrite(tmp_path) -> None:
+    """The fallback must not weaken the no-overwrite guarantee."""
+    temporary = tmp_path / "temporary"
+    destination = tmp_path / "destination"
+    temporary.write_text("new", encoding="utf-8")
+    destination.write_text("existing", encoding="utf-8")
+
+    with patch("server.files.os.link", side_effect=OSError(95, "Operation not supported")):
+        with pytest.raises(OutputPathError, match="already exists"):
+            commit_output_file(temporary, destination, JiraConfig(output_dir=tmp_path))
 
     assert destination.read_text(encoding="utf-8") == "existing"
     assert temporary.read_text(encoding="utf-8") == "new"
