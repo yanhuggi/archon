@@ -1,5 +1,6 @@
 """Tests for server.providers.jira — JiraProvider implementation."""
 
+import base64
 import json
 import os
 from unittest.mock import MagicMock, patch
@@ -394,6 +395,130 @@ def test_get_issue_field_map_failure(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# workflow transitions
+# ---------------------------------------------------------------------------
+
+
+def _transitions_response() -> MagicMock:
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        "transitions": [
+            {
+                "id": "31",
+                "name": "Resolve Issue",
+                "to": {"id": "5", "name": "Resolved"},
+                "fields": {
+                    "resolution": {
+                        "name": "Resolution",
+                        "required": True,
+                        "schema": {"type": "resolution"},
+                        "operations": ["set"],
+                        "allowedValues": [{"id": "1", "name": "Fixed"}],
+                    }
+                },
+            }
+        ]
+    }
+    response.raise_for_status = MagicMock()
+    return response
+
+
+def test_get_transitions_success() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    mock_client.get.return_value = _transitions_response()
+    provider._client = mock_client
+
+    data = json.loads(provider.get_transitions("PROJ-1"))
+
+    assert data["transition_count"] == 1
+    assert data["transitions"][0]["id"] == "31"
+    assert data["transitions"][0]["to"] == {"id": "5", "name": "Resolved"}
+    assert data["transitions"][0]["fields"][0]["required"] is True
+    assert data["transitions"][0]["fields"][0]["allowed_values"] == [
+        {"id": "1", "name": "Fixed"}
+    ]
+    mock_client.get.assert_called_once_with(
+        "rest/api/2/issue/PROJ-1/transitions",
+        params={"expand": "transitions.fields"},
+    )
+    provider.close()
+
+
+def test_transition_issue_success_with_fields() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    mock_client.get.return_value = _transitions_response()
+    post_response = MagicMock(status_code=204)
+    post_response.raise_for_status = MagicMock()
+    mock_client.post.return_value = post_response
+    provider._client = mock_client
+
+    data = json.loads(provider.transition_issue(
+        "PROJ-1",
+        "31",
+        fields={"resolution": {"id": "1"}},
+    ))
+
+    assert data["transitioned"] is True
+    assert data["transition"]["name"] == "Resolve Issue"
+    mock_client.post.assert_called_once_with(
+        "rest/api/2/issue/PROJ-1/transitions",
+        json={
+            "transition": {"id": "31"},
+            "fields": {"resolution": {"id": "1"}},
+        },
+    )
+    provider.close()
+
+
+def test_transition_issue_rejects_unavailable_transition_before_post() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    mock_client.get.return_value = _transitions_response()
+    provider._client = mock_client
+
+    data = json.loads(provider.transition_issue("PROJ-1", "99"))
+
+    assert data["error_code"] == "transition_unavailable"
+    assert data["available_transitions"][0]["id"] == "31"
+    mock_client.post.assert_not_called()
+    provider.close()
+
+
+def test_transition_issue_rejects_unavailable_fields_before_post() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    mock_client.get.return_value = _transitions_response()
+    provider._client = mock_client
+
+    data = json.loads(provider.transition_issue(
+        "PROJ-1",
+        "31",
+        fields={"assignee": {"name": "john"}},
+    ))
+
+    assert data["error_code"] == "unavailable_transition_fields"
+    assert data["unavailable_fields"] == ["assignee"]
+    assert data["available_fields"] == ["resolution"]
+    mock_client.post.assert_not_called()
+    provider.close()
+
+
+def test_transition_issue_rejects_invalid_id_without_request() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    provider._client = mock_client
+
+    data = json.loads(provider.transition_issue("PROJ-1", "done"))
+
+    assert data["error_code"] == "invalid_transition_id"
+    mock_client.get.assert_not_called()
+    mock_client.post.assert_not_called()
+    provider.close()
+
+
+# ---------------------------------------------------------------------------
 # get_comments
 # ---------------------------------------------------------------------------
 
@@ -412,6 +537,7 @@ def test_get_comments_success(monkeypatch: pytest.MonkeyPatch) -> None:
             "total": 1,
             "comments": [
                 {
+                    "id": "10001",
                     "author": {"displayName": "John"},
                     "body": "Test comment",
                     "created": "2025-01-16T10:00:00.000+0800",
@@ -426,6 +552,7 @@ def test_get_comments_success(monkeypatch: pytest.MonkeyPatch) -> None:
     result = json.loads(provider.get_comments("PROJ-1"))
     assert result["issue_key"] == "PROJ-1"
     assert result["total"] == 1
+    assert result["comments"][0]["id"] == "10001"
     assert result["comments"][0]["author"] == "John"
     provider.close()
 
@@ -445,12 +572,213 @@ def test_get_comments_rejects_malformed_comments_list() -> None:
 
 
 # ---------------------------------------------------------------------------
+# comment mutations
+# ---------------------------------------------------------------------------
+
+
+def _comment_response(comment_id: str = "10001", body: str = "Updated") -> MagicMock:
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        "id": comment_id,
+        "author": {"displayName": "John"},
+        "body": body,
+        "created": "2025-01-16T10:00:00.000+0800",
+        "updated": "2025-01-16T11:00:00.000+0800",
+    }
+    response.raise_for_status = MagicMock()
+    return response
+
+
+def test_add_comment_success() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    mock_client.post.return_value = _comment_response(body="New comment")
+    provider._client = mock_client
+
+    data = json.loads(provider.add_comment("PROJ-1", "New comment"))
+
+    assert data["added"] is True
+    assert data["comment"]["id"] == "10001"
+    assert data["comment"]["body"] == "New comment"
+    mock_client.post.assert_called_once_with(
+        "rest/api/2/issue/PROJ-1/comment",
+        json={"body": "New comment"},
+    )
+    provider.close()
+
+
+def test_update_comment_success() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    mock_client.put.return_value = _comment_response()
+    provider._client = mock_client
+
+    data = json.loads(provider.update_comment("PROJ-1", "10001", "Updated"))
+
+    assert data["updated"] is True
+    assert data["comment_id"] == "10001"
+    mock_client.put.assert_called_once_with(
+        "rest/api/2/issue/PROJ-1/comment/10001",
+        json={"body": "Updated"},
+    )
+    provider.close()
+
+
+def test_delete_comment_success() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    response = MagicMock(status_code=204)
+    response.raise_for_status = MagicMock()
+    mock_client.delete.return_value = response
+    provider._client = mock_client
+
+    data = json.loads(provider.delete_comment("PROJ-1", "10001"))
+
+    assert data == {"issue_key": "PROJ-1", "comment_id": "10001", "deleted": True}
+    mock_client.delete.assert_called_once_with("rest/api/2/issue/PROJ-1/comment/10001")
+    provider.close()
+
+
+def test_comment_mutations_reject_invalid_values_without_request() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    provider._client = mock_client
+
+    assert json.loads(provider.add_comment("PROJ-1", "  "))["error_code"] == "invalid_comment_body"
+    assert json.loads(provider.update_comment("PROJ-1", "abc", "body"))["error_code"] == "invalid_comment_id"
+    assert json.loads(provider.delete_comment("PROJ-1", "abc"))["error_code"] == "invalid_comment_id"
+    mock_client.post.assert_not_called()
+    mock_client.put.assert_not_called()
+    mock_client.delete.assert_not_called()
+    provider.close()
+
+
+# ---------------------------------------------------------------------------
+# update_issue
+# ---------------------------------------------------------------------------
+
+
+def test_update_issue_success() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    editmeta_response = MagicMock(status_code=200)
+    editmeta_response.json.return_value = {
+        "fields": {
+            "summary": {"name": "Summary", "operations": ["set"]},
+            "customfield_11122": {"name": "Test notes", "operations": ["set"]},
+        }
+    }
+    editmeta_response.raise_for_status = MagicMock()
+    mock_client.get.return_value = editmeta_response
+    response = MagicMock(status_code=204)
+    response.raise_for_status = MagicMock()
+    mock_client.put.return_value = response
+    provider._client = mock_client
+
+    data = json.loads(provider.update_issue(
+        "PROJ-1",
+        {"summary": "Updated summary", "customfield_11122": None},
+    ))
+
+    assert data == {
+        "issue_key": "PROJ-1",
+        "updated": True,
+        "updated_fields": ["summary", "customfield_11122"],
+    }
+    mock_client.put.assert_called_once_with(
+        "rest/api/2/issue/PROJ-1",
+        json={"fields": {"summary": "Updated summary", "customfield_11122": None}},
+    )
+    provider.close()
+
+
+def test_update_issue_rejects_invalid_fields_without_request() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    provider._client = mock_client
+
+    assert json.loads(provider.update_issue("PROJ-1", {}))["error_code"] == "invalid_fields"
+    assert json.loads(provider.update_issue("PROJ-1", {" ": "value"}))["error_code"] == "invalid_fields"
+    assert mock_client.put.call_count == 0
+    provider.close()
+
+
+def test_update_issue_rejects_uneditable_fields_before_put() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    editmeta_response = MagicMock(status_code=200)
+    editmeta_response.json.return_value = {
+        "fields": {
+            "summary": {"name": "Summary", "operations": ["set"]},
+            "priority": {"name": "Priority", "operations": []},
+        }
+    }
+    editmeta_response.raise_for_status = MagicMock()
+    mock_client.get.return_value = editmeta_response
+    provider._client = mock_client
+
+    data = json.loads(provider.update_issue("PROJ-1", {"summary": "Updated", "priority": "High"}))
+
+    assert data["error_code"] == "uneditable_fields"
+    assert data["uneditable_fields"] == ["priority"]
+    assert data["editable_fields"] == ["summary"]
+    mock_client.put.assert_not_called()
+    provider.close()
+
+
+def test_update_issue_does_not_put_when_editmeta_fails() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    request = httpx.Request(
+        "GET",
+        "https://jira.example.com/rest/api/2/issue/PROJ-1/editmeta",
+    )
+    mock_client.get.return_value = httpx.Response(
+        403,
+        request=request,
+        json={"errorMessages": ["Editing is forbidden"]},
+    )
+    provider._client = mock_client
+
+    data = json.loads(provider.update_issue("PROJ-1", {"summary": "Updated"}))
+
+    assert data["error_code"] == "authentication_error"
+    assert "Editing is forbidden" in data["error"]
+    mock_client.put.assert_not_called()
+    provider.close()
+
+
+def test_update_issue_returns_jira_validation_details() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    editmeta_response = MagicMock(status_code=200)
+    editmeta_response.json.return_value = {
+        "fields": {"priority": {"name": "Priority", "operations": ["set"]}}
+    }
+    editmeta_response.raise_for_status = MagicMock()
+    mock_client.get.return_value = editmeta_response
+    request = httpx.Request("PUT", "https://jira.example.com/rest/api/2/issue/PROJ-1")
+    response = httpx.Response(
+        400,
+        request=request,
+        json={"errors": {"priority": "Priority is required"}},
+    )
+    mock_client.put.return_value = response
+    provider._client = mock_client
+
+    data = json.loads(provider.update_issue("PROJ-1", {"priority": None}))
+    assert data["error_code"] == "upstream_error"
+    assert "priority: Priority is required" in data["error"]
+    provider.close()
+
+
+# ---------------------------------------------------------------------------
 # get_attachment
 # ---------------------------------------------------------------------------
 
 
-def test_get_attachment_saves_to_file(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    """get_attachment downloads and saves file to disk."""
+def test_download_attachment_saves_to_file(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """download_attachment downloads and saves file to disk."""
     monkeypatch.setenv("JIRA_URL", "https://jira.example.com")
     monkeypatch.setenv("JIRA_USERNAME", "user")
     monkeypatch.setenv("JIRA_PASSWORD", "pass")
@@ -481,7 +809,7 @@ def test_get_attachment_saves_to_file(monkeypatch: pytest.MonkeyPatch, tmp_path)
 
     save_path = str(tmp_path / "error.log")
     with patch.object(JiraProvider, "_get_client", return_value=mock_client):
-        result = json.loads(provider.get_attachment("10001", save_to=save_path))
+        result = json.loads(provider.download_attachment("10001", save_to=save_path))
     assert result["filename"] == "error.log"
     assert result["saved_to"] == save_path
     assert os.path.exists(save_path)
@@ -490,8 +818,41 @@ def test_get_attachment_saves_to_file(monkeypatch: pytest.MonkeyPatch, tmp_path)
     provider.close()
 
 
-def test_get_attachment_size_limit(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    """get_attachment rejects attachments exceeding size limit."""
+def test_get_attachment_reads_content_without_writing(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """get_attachment returns bounded content and does not need an output path."""
+    monkeypatch.setenv("JIRA_URL", "https://jira.example.com")
+    monkeypatch.setenv("JIRA_USERNAME", "user")
+    monkeypatch.setenv("JIRA_PASSWORD", "pass")
+
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    meta_resp = MagicMock(status_code=200)
+    meta_resp.json.return_value = {
+        "filename": "error.log",
+        "size": 5,
+        "mimeType": "text/plain",
+        "content": "https://jira.example.com/secure/attachment/10001/error.log",
+    }
+    meta_resp.raise_for_status = MagicMock()
+    mock_client.get.return_value = meta_resp
+    stream_resp = MagicMock()
+    stream_resp.raise_for_status = MagicMock()
+    stream_resp.__enter__ = MagicMock(return_value=stream_resp)
+    stream_resp.__exit__ = MagicMock(return_value=False)
+    stream_resp.iter_bytes.return_value = [b"hello"]
+    mock_client.stream.return_value = stream_resp
+    provider._client = mock_client
+
+    result = json.loads(provider.get_attachment("10001"))
+
+    assert result["filename"] == "error.log"
+    assert base64.b64decode(result["content_base64"]) == b"hello"
+    assert not list(tmp_path.iterdir())
+    provider.close()
+
+
+def test_attachment_size_limit(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """Attachment reads and downloads reject oversized attachments."""
     monkeypatch.setenv("JIRA_URL", "https://jira.example.com")
     monkeypatch.setenv("JIRA_USERNAME", "user")
     monkeypatch.setenv("JIRA_PASSWORD", "pass")
@@ -511,7 +872,7 @@ def test_get_attachment_size_limit(monkeypatch: pytest.MonkeyPatch, tmp_path) ->
     mock_client.get.return_value = meta_resp
     provider._client = mock_client
 
-    result = json.loads(provider.get_attachment("10001", save_to=str(tmp_path / "huge.zip")))
+    result = json.loads(provider.get_attachment("10001"))
     assert "error" in result
     assert "exceeds limit" in result["error"]
     provider.close()
@@ -585,10 +946,10 @@ def test_get_issue_valid_key_format() -> None:
     assert JiraProvider._validate_issue_key("proj-123") is None
 
 
-def test_get_attachment_invalid_id(tmp_path) -> None:
+def test_get_attachment_invalid_id() -> None:
     """get_attachment rejects non-numeric attachment IDs."""
     provider = JiraProvider()
-    result = json.loads(provider.get_attachment("abc", save_to=str(tmp_path / "test.txt")))
+    result = json.loads(provider.get_attachment("abc"))
     assert "error" in result
     assert "Invalid attachment ID" in result["error"]
     provider.close()
@@ -680,7 +1041,7 @@ def test_attachment_rejects_cross_origin_download(tmp_path) -> None:
     }
     client.get.return_value = metadata
     provider._client = client
-    data = json.loads(provider.get_attachment("10001", str(tmp_path / "file.txt")))
+    data = json.loads(provider.download_attachment("10001", str(tmp_path / "file.txt")))
     assert data["error_code"] == "invalid_attachment_url"
     client.stream.assert_not_called()
 
@@ -713,7 +1074,7 @@ def test_attachment_enforces_actual_stream_size_and_cleans_partial_file(tmp_path
     provider._client = client
 
     destination = tmp_path / "file.txt"
-    data = json.loads(provider.get_attachment("10001", str(destination)))
+    data = json.loads(provider.download_attachment("10001", str(destination)))
     assert data["error_code"] == "attachment_too_large"
     assert not destination.exists()
     assert list(tmp_path.glob(".archon-jira-*.part")) == []

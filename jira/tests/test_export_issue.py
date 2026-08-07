@@ -40,7 +40,7 @@ class StubProvider:
             }],
         }
 
-    def get_attachment(self, attachment_id: str, save_to: str, **kwargs) -> str:
+    def download_attachment(self, attachment_id: str, save_to: str, **kwargs) -> str:
         Path(save_to).write_text("Attachment content", encoding="utf-8")
         return json.dumps({"id": attachment_id, "saved_to": save_to})
 
@@ -128,11 +128,11 @@ def test_export_uses_controlled_temp_attachment_name(tmp_path, monkeypatch) -> N
     issue = provider.get_issue_json("TEST-1")
     issue["attachments"][0]["filename"] = "../../outside.txt"
     provider.get_issue_json = MagicMock(return_value=issue)
-    provider.get_attachment = MagicMock(side_effect=provider.get_attachment)
+    provider.download_attachment = MagicMock(side_effect=provider.download_attachment)
     register("unsafe-name", provider)
     result = json.loads(get_func("unsafe-name")("TEST-1", str(tmp_path / "issue.docx")))
     assert "error" not in result
-    requested_path = Path(provider.get_attachment.call_args.args[1])
+    requested_path = Path(provider.download_attachment.call_args.args[1])
     assert requested_path.name.startswith("attachment-")
     assert requested_path.is_relative_to(tmp_path)
     assert not (tmp_path.parent / "outside.txt").exists()

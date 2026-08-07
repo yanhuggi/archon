@@ -1,5 +1,6 @@
 """Jira REST API provider implementation."""
 
+import base64
 import json
 import logging
 import re
@@ -22,6 +23,8 @@ _MAX_CACHED_VALUE_SUGGESTIONS = 1000
 _DEFAULT_TIMEOUT = 30
 _DEFAULT_MAX_ATTACHMENT_SIZE = DEFAULT_MAX_ATTACHMENT_SIZE
 _ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
+_COMMENT_ID_RE = re.compile(r"^\d+$")
+_MAX_COMMENT_LENGTH = 32767
 _DEFAULT_FIELDS = (
     "summary,description,status,assignee,reporter,issuetype,"
     "priority,labels,created,updated,subtasks,issuelinks,"
@@ -93,6 +96,61 @@ def _object_text(value: object, key: str, default: str = "") -> str:
         return default
     candidate = value.get(key)
     return str(candidate) if candidate is not None else default
+
+
+def _normalize_comment(comment: dict, fallback_body: str = "") -> dict:
+    """Return a bounded, consistent comment representation."""
+    body = str(comment.get("body") or fallback_body)
+    if len(body) > _MAX_FIELD_LENGTH:
+        body = body[:_MAX_FIELD_LENGTH] + "..."
+    return {
+        "id": str(comment.get("id") or ""),
+        "author": _object_text(comment.get("author"), "displayName"),
+        "body": body,
+        "created": comment.get("created", ""),
+        "updated": comment.get("updated", ""),
+    }
+
+
+def _normalize_transition(raw: dict) -> dict:
+    """Return bounded transition metadata suitable for MCP output."""
+    destination = raw.get("to") if isinstance(raw.get("to"), dict) else {}
+    raw_fields = raw.get("fields") if isinstance(raw.get("fields"), dict) else {}
+    fields = []
+    for field_id, metadata in raw_fields.items():
+        if not isinstance(metadata, dict):
+            continue
+        schema = metadata.get("schema") if isinstance(metadata.get("schema"), dict) else {}
+        allowed_values = []
+        raw_allowed_values = metadata.get("allowedValues")
+        if isinstance(raw_allowed_values, list):
+            for value in raw_allowed_values[:50]:
+                if isinstance(value, dict):
+                    value_id = value.get("id")
+                    value_name = value.get("name") or value.get("value")
+                    allowed_values.append({
+                        "id": str(value_id) if value_id is not None else "",
+                        "name": str(value_name) if value_name is not None else "",
+                    })
+                elif value is not None:
+                    allowed_values.append({"id": "", "name": str(value)})
+        fields.append({
+            "id": str(field_id),
+            "name": str(metadata.get("name") or field_id),
+            "required": bool(metadata.get("required")),
+            "schema_type": str(schema.get("type") or ""),
+            "operations": _string_list(metadata.get("operations")),
+            "allowed_values": allowed_values,
+        })
+    return {
+        "id": str(raw.get("id") or ""),
+        "name": str(raw.get("name") or ""),
+        "to": {
+            "id": str(destination.get("id") or ""),
+            "name": str(destination.get("name") or ""),
+        },
+        "fields": fields,
+    }
 
 
 def _normalize_field_catalog(field_data: list, autocomplete_data: dict | None) -> list[dict]:
@@ -269,6 +327,13 @@ class JiraProvider:
         """Return None if valid, else an error message."""
         if not attachment_id.isdigit():
             return f"Invalid attachment ID: {attachment_id!r}"
+        return None
+
+    @staticmethod
+    def _validate_comment_id(comment_id: str) -> str | None:
+        """Return None if valid, else an error message."""
+        if not _COMMENT_ID_RE.fullmatch(comment_id):
+            return f"Invalid comment ID: {comment_id!r}"
         return None
 
     def _get_field_map(self) -> dict[str, str]:
@@ -1084,6 +1149,248 @@ class JiraProvider:
 
         return "\n".join(lines)
 
+    # ── workflow transitions ──────────────────────────────────────
+
+    def _fetch_transitions(self, issue_key: str) -> list[dict]:
+        client = self._get_client()
+        response = client.get(
+            f"rest/api/2/issue/{issue_key}/transitions",
+            params={"expand": "transitions.fields"},
+        )
+        response.raise_for_status()
+        data = response.json()
+        raw_transitions = data.get("transitions") if isinstance(data, dict) else None
+        if not isinstance(raw_transitions, list) or any(
+            not isinstance(transition, dict) for transition in raw_transitions
+        ):
+            raise TypeError("Jira transitions response must contain a transitions array")
+        return [_normalize_transition(transition) for transition in raw_transitions]
+
+    def get_transitions(self, issue_key: str, **kwargs) -> str:
+        """Get the workflow transitions currently available to this account."""
+        err = self._validate_issue_key(issue_key)
+        if err:
+            return _json_error(
+                err,
+                "invalid_issue_key",
+                issue_key=issue_key,
+                transitions=[],
+                transition_count=0,
+            )
+        try:
+            transitions = self._fetch_transitions(issue_key)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 401:
+                self._invalidate_client()
+            LOGGER.warning("Jira transitions lookup returned HTTP %d", status)
+            return _json_error(
+                _http_error_message(exc),
+                _status_error_code(status),
+                issue_key=issue_key,
+                transitions=[],
+                transition_count=0,
+            )
+        except httpx.RequestError as exc:
+            LOGGER.warning("Jira transitions request failed: %s", exc)
+            return _json_error(
+                f"Request failed: {exc}",
+                "upstream_error",
+                issue_key=issue_key,
+                transitions=[],
+                transition_count=0,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize provider failures to MCP errors
+            LOGGER.exception("Jira transitions lookup failed")
+            if isinstance(exc, TypeError):
+                code = "invalid_provider_response"
+            else:
+                code = "configuration_error" if isinstance(exc, RuntimeError) else "provider_error"
+            return _json_error(
+                f"{type(exc).__name__}: {exc}",
+                code,
+                issue_key=issue_key,
+                transitions=[],
+                transition_count=0,
+            )
+
+        return json.dumps(
+            {
+                "issue_key": issue_key,
+                "transitions": transitions,
+                "transition_count": len(transitions),
+            },
+            ensure_ascii=False,
+        )
+
+    def transition_issue(
+        self,
+        issue_key: str,
+        transition_id: str,
+        fields: dict[str, object] | None = None,
+        **kwargs,
+    ) -> str:
+        """Execute one currently available Jira workflow transition."""
+        issue_error = self._validate_issue_key(issue_key)
+        if issue_error:
+            return _json_error(
+                issue_error,
+                "invalid_issue_key",
+                issue_key=issue_key,
+                transition_id=transition_id,
+                transitioned=False,
+            )
+        if not isinstance(transition_id, str) or not transition_id.isdigit():
+            return _json_error(
+                f"Invalid transition ID: {transition_id!r}",
+                "invalid_transition_id",
+                issue_key=issue_key,
+                transition_id=transition_id,
+                transitioned=False,
+            )
+        if fields is not None and not isinstance(fields, dict):
+            return _json_error(
+                "fields must be an object when provided",
+                "invalid_fields",
+                issue_key=issue_key,
+                transition_id=transition_id,
+                transitioned=False,
+            )
+        raw_transition_fields = fields or {}
+        if len(raw_transition_fields) > 50:
+            return _json_error(
+                "fields must contain at most 50 entries",
+                "invalid_fields",
+                issue_key=issue_key,
+                transition_id=transition_id,
+                transitioned=False,
+            )
+        transition_fields: dict[str, object] = {}
+        for raw_name, value in raw_transition_fields.items():
+            if not isinstance(raw_name, str):
+                return _json_error(
+                    "field names must be strings",
+                    "invalid_fields",
+                    issue_key=issue_key,
+                    transition_id=transition_id,
+                    transitioned=False,
+                )
+            name = raw_name.strip()
+            if not name or len(name) > 255:
+                return _json_error(
+                    "field names must contain 1 to 255 characters",
+                    "invalid_fields",
+                    issue_key=issue_key,
+                    transition_id=transition_id,
+                    transitioned=False,
+                )
+            transition_fields[name] = value
+        try:
+            serialized_fields = json.dumps(transition_fields, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            return _json_error(
+                f"fields must contain JSON-compatible values: {exc}",
+                "invalid_fields",
+                issue_key=issue_key,
+                transition_id=transition_id,
+                transitioned=False,
+            )
+        if len(serialized_fields.encode("utf-8")) > 1_000_000:
+            return _json_error(
+                "serialized fields must not exceed 1 MB",
+                "invalid_fields",
+                issue_key=issue_key,
+                transition_id=transition_id,
+                transitioned=False,
+            )
+
+        try:
+            transitions = self._fetch_transitions(issue_key)
+            selected = next(
+                (transition for transition in transitions if transition["id"] == transition_id),
+                None,
+            )
+            if selected is None:
+                return _json_error(
+                    "The requested transition is not currently available",
+                    "transition_unavailable",
+                    issue_key=issue_key,
+                    transition_id=transition_id,
+                    transitioned=False,
+                    available_transitions=transitions,
+                )
+            available_field_ids = {
+                field["id"]
+                for field in selected["fields"]
+                if isinstance(field, dict) and field.get("id")
+            }
+            unavailable_fields = [
+                name for name in transition_fields if name not in available_field_ids
+            ]
+            if unavailable_fields:
+                return _json_error(
+                    "One or more fields are unavailable on the selected transition",
+                    "unavailable_transition_fields",
+                    issue_key=issue_key,
+                    transition_id=transition_id,
+                    transitioned=False,
+                    unavailable_fields=unavailable_fields,
+                    available_fields=sorted(available_field_ids),
+                )
+            payload: dict[str, object] = {"transition": {"id": transition_id}}
+            if fields is not None:
+                payload["fields"] = transition_fields
+            client = self._get_client()
+            response = client.post(
+                f"rest/api/2/issue/{issue_key}/transitions",
+                json=payload,
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 401:
+                self._invalidate_client()
+            LOGGER.warning("Jira issue transition returned HTTP %d", status)
+            return _json_error(
+                _http_error_message(exc),
+                _status_error_code(status),
+                issue_key=issue_key,
+                transition_id=transition_id,
+                transitioned=False,
+            )
+        except httpx.RequestError as exc:
+            LOGGER.warning("Jira issue transition request failed: %s", exc)
+            return _json_error(
+                f"Request failed: {exc}",
+                "upstream_error",
+                issue_key=issue_key,
+                transition_id=transition_id,
+                transitioned=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize provider failures to MCP errors
+            LOGGER.exception("Jira issue transition failed")
+            if isinstance(exc, TypeError):
+                code = "invalid_provider_response"
+            else:
+                code = "configuration_error" if isinstance(exc, RuntimeError) else "provider_error"
+            return _json_error(
+                f"{type(exc).__name__}: {exc}",
+                code,
+                issue_key=issue_key,
+                transition_id=transition_id,
+                transitioned=False,
+            )
+
+        return json.dumps(
+            {
+                "issue_key": issue_key,
+                "transition_id": transition_id,
+                "transitioned": True,
+                "transition": selected,
+            },
+            ensure_ascii=False,
+        )
+
     # ── get_comments ───────────────────────────────────────────────
 
     def get_comments(
@@ -1164,15 +1471,7 @@ class JiraProvider:
 
         comments = []
         for c in raw_comments:
-            body = str(c.get("body") or "")
-            if len(body) > _MAX_FIELD_LENGTH:
-                body = body[:_MAX_FIELD_LENGTH] + "..."
-            comments.append({
-                "author": _object_text(c.get("author"), "displayName"),
-                "body": body,
-                "created": c.get("created", ""),
-                "updated": c.get("updated", ""),
-            })
+            comments.append(_normalize_comment(c))
 
         return json.dumps(
             {
@@ -1190,19 +1489,286 @@ class JiraProvider:
             ensure_ascii=False,
         )
 
-    # ── get_attachment ─────────────────────────────────────────────
+    # ── comment mutations ─────────────────────────────────────────
 
-    def get_attachment(self, attachment_id: str, save_to: str, **kwargs) -> str:
-        err = self._validate_attachment_id(attachment_id)
-        if err:
-            return _json_error(err, "invalid_attachment_id", id=attachment_id)
+    @staticmethod
+    def _validate_comment_body(body: str) -> str | None:
+        if not isinstance(body, str) or not body.strip():
+            return "Comment body must not be empty"
+        if len(body) > _MAX_COMMENT_LENGTH:
+            return f"Comment body must not exceed {_MAX_COMMENT_LENGTH} characters"
+        return None
 
-        config = self._config()
+    def add_comment(self, issue_key: str, body: str, **kwargs) -> str:
+        """Add a new comment to a Jira issue."""
+        issue_error = self._validate_issue_key(issue_key)
+        if issue_error:
+            return _json_error(issue_error, "invalid_issue_key", issue_key=issue_key, added=False)
+        body_error = self._validate_comment_body(body)
+        if body_error:
+            return _json_error(body_error, "invalid_comment_body", issue_key=issue_key, added=False)
+
         try:
-            save_path = resolve_output_path(save_to, config)
-        except OutputPathError as exc:
-            return _json_error(str(exc), "invalid_output_path", id=attachment_id)
+            client = self._get_client()
+            response = client.post(
+                f"rest/api/2/issue/{issue_key}/comment",
+                json={"body": body},
+            )
+            response.raise_for_status()
+            comment = response.json()
+            if not isinstance(comment, dict):
+                return _json_error(
+                    "Jira add-comment response must be an object",
+                    "invalid_provider_response",
+                    issue_key=issue_key,
+                    added=False,
+                )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 401:
+                self._invalidate_client()
+            LOGGER.warning("Jira comment creation returned HTTP %d", status)
+            return _json_error(_http_error_message(exc), _status_error_code(status), issue_key=issue_key, added=False)
+        except httpx.RequestError as exc:
+            LOGGER.warning("Jira comment creation request failed: %s", exc)
+            return _json_error(f"Request failed: {exc}", "upstream_error", issue_key=issue_key, added=False)
+        except Exception as exc:  # noqa: BLE001 - normalize provider failures to MCP errors
+            LOGGER.exception("Jira comment creation failed")
+            code = "configuration_error" if isinstance(exc, RuntimeError) else "provider_error"
+            return _json_error(f"{type(exc).__name__}: {exc}", code, issue_key=issue_key, added=False)
 
+        return json.dumps(
+            {"issue_key": issue_key, "added": True, "comment": _normalize_comment(comment, body)},
+            ensure_ascii=False,
+        )
+
+    def update_comment(self, issue_key: str, comment_id: str, body: str, **kwargs) -> str:
+        """Replace the body of an existing Jira comment."""
+        issue_error = self._validate_issue_key(issue_key)
+        if issue_error:
+            return _json_error(issue_error, "invalid_issue_key", issue_key=issue_key, comment_id=comment_id, updated=False)
+        comment_error = self._validate_comment_id(comment_id)
+        if comment_error:
+            return _json_error(comment_error, "invalid_comment_id", issue_key=issue_key, comment_id=comment_id, updated=False)
+        body_error = self._validate_comment_body(body)
+        if body_error:
+            return _json_error(body_error, "invalid_comment_body", issue_key=issue_key, comment_id=comment_id, updated=False)
+
+        try:
+            client = self._get_client()
+            response = client.put(
+                f"rest/api/2/issue/{issue_key}/comment/{comment_id}",
+                json={"body": body},
+            )
+            response.raise_for_status()
+            comment = response.json()
+            if not isinstance(comment, dict):
+                return _json_error(
+                    "Jira update-comment response must be an object",
+                    "invalid_provider_response",
+                    issue_key=issue_key,
+                    comment_id=comment_id,
+                    updated=False,
+                )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 401:
+                self._invalidate_client()
+            LOGGER.warning("Jira comment update returned HTTP %d", status)
+            return _json_error(_http_error_message(exc), _status_error_code(status), issue_key=issue_key, comment_id=comment_id, updated=False)
+        except httpx.RequestError as exc:
+            LOGGER.warning("Jira comment update request failed: %s", exc)
+            return _json_error(f"Request failed: {exc}", "upstream_error", issue_key=issue_key, comment_id=comment_id, updated=False)
+        except Exception as exc:  # noqa: BLE001 - normalize provider failures to MCP errors
+            LOGGER.exception("Jira comment update failed")
+            code = "configuration_error" if isinstance(exc, RuntimeError) else "provider_error"
+            return _json_error(f"{type(exc).__name__}: {exc}", code, issue_key=issue_key, comment_id=comment_id, updated=False)
+
+        return json.dumps(
+            {
+                "issue_key": issue_key,
+                "comment_id": comment_id,
+                "updated": True,
+                "comment": _normalize_comment(comment, body),
+            },
+            ensure_ascii=False,
+        )
+
+    def delete_comment(self, issue_key: str, comment_id: str, **kwargs) -> str:
+        """Delete an existing Jira comment."""
+        issue_error = self._validate_issue_key(issue_key)
+        if issue_error:
+            return _json_error(issue_error, "invalid_issue_key", issue_key=issue_key, comment_id=comment_id, deleted=False)
+        comment_error = self._validate_comment_id(comment_id)
+        if comment_error:
+            return _json_error(comment_error, "invalid_comment_id", issue_key=issue_key, comment_id=comment_id, deleted=False)
+
+        try:
+            client = self._get_client()
+            response = client.delete(f"rest/api/2/issue/{issue_key}/comment/{comment_id}")
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 401:
+                self._invalidate_client()
+            LOGGER.warning("Jira comment deletion returned HTTP %d", status)
+            return _json_error(_http_error_message(exc), _status_error_code(status), issue_key=issue_key, comment_id=comment_id, deleted=False)
+        except httpx.RequestError as exc:
+            LOGGER.warning("Jira comment deletion request failed: %s", exc)
+            return _json_error(f"Request failed: {exc}", "upstream_error", issue_key=issue_key, comment_id=comment_id, deleted=False)
+        except Exception as exc:  # noqa: BLE001 - normalize provider failures to MCP errors
+            LOGGER.exception("Jira comment deletion failed")
+            code = "configuration_error" if isinstance(exc, RuntimeError) else "provider_error"
+            return _json_error(f"{type(exc).__name__}: {exc}", code, issue_key=issue_key, comment_id=comment_id, deleted=False)
+
+        return json.dumps(
+            {"issue_key": issue_key, "comment_id": comment_id, "deleted": True},
+            ensure_ascii=False,
+        )
+
+    # ── update_issue ──────────────────────────────────────────────
+
+    def update_issue(self, issue_key: str, fields: dict[str, object], **kwargs) -> str:
+        """Replace editable fields on an existing Jira issue.
+
+        Jira's edit metadata is checked first so a request containing a field
+        that this account cannot edit is rejected without partially updating the
+        issue.
+        """
+        err = self._validate_issue_key(issue_key)
+        if err:
+            return _json_error(err, "invalid_issue_key", issue_key=issue_key)
+        if not isinstance(fields, dict) or not fields:
+            return _json_error(
+                "fields must be a non-empty object",
+                "invalid_fields",
+                issue_key=issue_key,
+            )
+        if len(fields) > 50:
+            return _json_error(
+                "fields must contain at most 50 entries",
+                "invalid_fields",
+                issue_key=issue_key,
+            )
+
+        normalized_fields: dict[str, object] = {}
+        for raw_name, value in fields.items():
+            if not isinstance(raw_name, str):
+                return _json_error(
+                    "field names must be strings",
+                    "invalid_fields",
+                    issue_key=issue_key,
+                )
+            name = raw_name.strip()
+            if not name or len(name) > 255:
+                return _json_error(
+                    "field names must contain 1 to 255 characters",
+                    "invalid_fields",
+                    issue_key=issue_key,
+                )
+            normalized_fields[name] = value
+
+        try:
+            serialized = json.dumps(normalized_fields, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            return _json_error(
+                f"fields must contain JSON-compatible values: {exc}",
+                "invalid_fields",
+                issue_key=issue_key,
+            )
+        if len(serialized.encode("utf-8")) > 1_000_000:
+            return _json_error(
+                "serialized fields must not exceed 1 MB",
+                "invalid_fields",
+                issue_key=issue_key,
+            )
+
+        try:
+            client = self._get_client()
+            editmeta_response = client.get(f"rest/api/2/issue/{issue_key}/editmeta")
+            editmeta_response.raise_for_status()
+            editmeta = editmeta_response.json()
+            metadata_fields = editmeta.get("fields") if isinstance(editmeta, dict) else None
+            if not isinstance(metadata_fields, dict):
+                return _json_error(
+                    "Jira edit metadata response must contain a fields object",
+                    "invalid_provider_response",
+                    issue_key=issue_key,
+                )
+
+            editable_aliases: dict[str, str] = {}
+            for field_id, metadata in metadata_fields.items():
+                if not isinstance(metadata, dict):
+                    continue
+                operations = metadata.get("operations")
+                if isinstance(operations, list) and "set" not in operations:
+                    continue
+                identifiers = (
+                    field_id,
+                    metadata.get("key"),
+                    metadata.get("id"),
+                )
+                for identifier in identifiers:
+                    if isinstance(identifier, str) and identifier.strip():
+                        editable_aliases[identifier.strip()] = str(field_id)
+
+            uneditable_fields = [
+                name for name in normalized_fields if name not in editable_aliases
+            ]
+            if uneditable_fields:
+                return _json_error(
+                    "The Jira account cannot edit one or more requested fields",
+                    "uneditable_fields",
+                    issue_key=issue_key,
+                    uneditable_fields=uneditable_fields,
+                    editable_fields=sorted(set(editable_aliases.values()))[:200],
+                )
+
+            response = client.put(
+                f"rest/api/2/issue/{issue_key}",
+                json={"fields": normalized_fields},
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 401:
+                self._invalidate_client()
+            LOGGER.warning("Jira issue edit metadata/update returned HTTP %d", status)
+            return _json_error(
+                _http_error_message(exc),
+                _status_error_code(status),
+                issue_key=issue_key,
+            )
+        except httpx.RequestError as exc:
+            LOGGER.warning("Jira issue update request failed: %s", exc)
+            return _json_error(
+                f"Request failed: {exc}",
+                "upstream_error",
+                issue_key=issue_key,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize provider failures to MCP errors
+            LOGGER.exception("Jira issue update failed")
+            code = "configuration_error" if isinstance(exc, RuntimeError) else "provider_error"
+            return _json_error(
+                f"{type(exc).__name__}: {exc}",
+                code,
+                issue_key=issue_key,
+            )
+
+        return json.dumps(
+            {
+                "issue_key": issue_key,
+                "updated": True,
+                "updated_fields": list(normalized_fields),
+            },
+            ensure_ascii=False,
+        )
+
+    # ── attachment content ────────────────────────────────────────
+
+    def _fetch_attachment_content(self, attachment_id: str) -> tuple[dict, bytes] | str:
+        """Fetch bounded attachment bytes without writing to disk."""
+        config = self._config()
         try:
             client = self._get_client()
             meta_resp = client.get(f"rest/api/2/attachment/{attachment_id}")
@@ -1228,14 +1794,13 @@ class JiraProvider:
             code = "configuration_error" if isinstance(exc, RuntimeError) else "provider_error"
             return _json_error(f"{type(exc).__name__}: {exc}", code, id=attachment_id)
 
-        filename = meta.get("filename", "")
+        filename = str(meta.get("filename") or "")
         try:
-            size = int(meta.get("size", 0))
+            declared_size = max(int(meta.get("size", 0)), 0)
         except (TypeError, ValueError):
-            size = 0
-        mime_type = meta.get("mimeType", "")
+            declared_size = 0
+        mime_type = str(meta.get("mimeType") or "application/octet-stream")
         content_url = meta.get("content", "")
-
         if not isinstance(content_url, str) or not content_url:
             return _json_error(
                 f"Attachment {attachment_id} has no download URL",
@@ -1243,13 +1808,13 @@ class JiraProvider:
                 id=attachment_id,
                 filename=filename,
             )
-        if size > config.max_attachment_size:
+        if declared_size > config.max_attachment_size:
             return _json_error(
-                f"Attachment size ({size} bytes) exceeds limit ({config.max_attachment_size} bytes)",
+                f"Attachment size ({declared_size} bytes) exceeds limit ({config.max_attachment_size} bytes)",
                 "attachment_too_large",
                 id=attachment_id,
                 filename=filename,
-                size=size,
+                size=declared_size,
                 mime_type=mime_type,
             )
 
@@ -1270,33 +1835,20 @@ class JiraProvider:
                 filename=filename,
             )
 
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path: Path | None = None
         try:
-            with tempfile.NamedTemporaryFile(
-                prefix=".archon-jira-",
-                suffix=".part",
-                dir=save_path.parent,
-                delete=False,
-            ) as temporary:
-                temporary_path = Path(temporary.name)
-            written = 0
+            chunks: list[bytes] = []
+            downloaded_size = 0
             with client.stream("GET", download_url) as download_resp:
                 download_resp.raise_for_status()
-                with temporary_path.open("wb") as output:
-                    for chunk in download_resp.iter_bytes(chunk_size=8192):
-                        written += len(chunk)
-                        if written > config.max_attachment_size:
-                            raise _AttachmentTooLarge(
-                                f"Downloaded content exceeds limit ({config.max_attachment_size} bytes)"
-                            )
-                        output.write(chunk)
-            commit_output_file(temporary_path, save_path, config)
-            temporary_path = None
+                for chunk in download_resp.iter_bytes(chunk_size=8192):
+                    downloaded_size += len(chunk)
+                    if downloaded_size > config.max_attachment_size:
+                        raise _AttachmentTooLarge(
+                            f"Downloaded content exceeds limit ({config.max_attachment_size} bytes)"
+                        )
+                    chunks.append(chunk)
         except _AttachmentTooLarge as exc:
             return _json_error(str(exc), "attachment_too_large", id=attachment_id, filename=filename)
-        except OutputPathError as exc:
-            return _json_error(str(exc), "invalid_output_path", id=attachment_id, filename=filename)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if status == 401:
@@ -1308,18 +1860,74 @@ class JiraProvider:
             return _json_error(f"Download failed: {exc}", "upstream_error", id=attachment_id)
         except Exception as exc:
             LOGGER.exception("Jira attachment download failed")
-            return _json_error(f"{type(exc).__name__}: {exc}", "download_failed", id=attachment_id)
+            return _json_error(f"Download failed: {exc}", "download_failed", id=attachment_id)
+
+        return {
+            "id": attachment_id,
+            "filename": filename,
+            "size": downloaded_size,
+            "declared_size": declared_size,
+            "mime_type": mime_type,
+        }, b"".join(chunks)
+
+    def get_attachment(self, attachment_id: str, **kwargs) -> str:
+        """Read an attachment without writing a local file."""
+        err = self._validate_attachment_id(attachment_id)
+        if err:
+            return _json_error(err, "invalid_attachment_id", id=attachment_id)
+        fetched = self._fetch_attachment_content(attachment_id)
+        if isinstance(fetched, str):
+            return fetched
+        metadata, content = fetched
+        return json.dumps(
+            {
+                **metadata,
+                "content_base64": base64.b64encode(content).decode("ascii"),
+            },
+            ensure_ascii=False,
+        )
+
+    def download_attachment(self, attachment_id: str, save_to: str, **kwargs) -> str:
+        """Download an attachment to an authorized path for internal exports."""
+        err = self._validate_attachment_id(attachment_id)
+        if err:
+            return _json_error(err, "invalid_attachment_id", id=attachment_id)
+        config = self._config()
+        try:
+            save_path = resolve_output_path(save_to, config)
+        except OutputPathError as exc:
+            return _json_error(str(exc), "invalid_output_path", id=attachment_id)
+
+        fetched = self._fetch_attachment_content(attachment_id)
+        if isinstance(fetched, str):
+            return fetched
+        metadata, content = fetched
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=".archon-jira-",
+                suffix=".part",
+                dir=save_path.parent,
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                temporary.write(content)
+            commit_output_file(temporary_path, save_path, config)
+            temporary_path = None
+        except OutputPathError as exc:
+            return _json_error(str(exc), "invalid_output_path", id=attachment_id, filename=metadata["filename"])
+        except Exception as exc:
+            LOGGER.exception("Jira attachment file write failed")
+            return _json_error(f"Download failed: {exc}", "download_failed", id=attachment_id)
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
 
         return json.dumps(
             {
-                "id": attachment_id,
-                "filename": filename,
+                **metadata,
                 "saved_to": str(save_path),
-                "size": save_path.stat().st_size,
-                "mime_type": mime_type,
             },
             ensure_ascii=False,
         )

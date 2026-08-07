@@ -14,7 +14,7 @@ class StubProvider:
             "total": 1,
             "start_at": start_at,
             "max_results": max_results,
-            "comments": [{"author": "User", "body": "Decision"}],
+            "comments": [{"id": "10001", "author": "User", "body": "Decision"}],
             "comment_count": 1,
         })
 

@@ -37,14 +37,48 @@ class JiraProvider(Protocol):
         """Get full issue details and return structured JSON dictionary."""
         ...
 
+    def get_transitions(self, issue_key: str, **kwargs) -> str:
+        """Get currently available workflow transitions for a Jira issue."""
+        ...
+
+    def transition_issue(
+        self,
+        issue_key: str,
+        transition_id: str,
+        fields: dict[str, object] | None = None,
+        **kwargs,
+    ) -> str:
+        """Execute one Jira workflow transition."""
+        ...
+
     def get_comments(
         self, issue_key: str, max_results: int = 50, start_at: int = 0, **kwargs
     ) -> str:
         """Get comments for an issue and return formatted result string."""
         ...
 
-    def get_attachment(self, attachment_id: str, save_to: str, **kwargs) -> str:
-        """Download attachment content to a file path and return formatted result string."""
+    def add_comment(self, issue_key: str, body: str, **kwargs) -> str:
+        """Add a comment to a Jira issue and return a structured result string."""
+        ...
+
+    def update_comment(self, issue_key: str, comment_id: str, body: str, **kwargs) -> str:
+        """Update one Jira comment and return a structured result string."""
+        ...
+
+    def delete_comment(self, issue_key: str, comment_id: str, **kwargs) -> str:
+        """Delete one Jira comment and return a structured result string."""
+        ...
+
+    def update_issue(self, issue_key: str, fields: dict[str, object], **kwargs) -> str:
+        """Update Jira issue fields and return a structured result string."""
+        ...
+
+    def get_attachment(self, attachment_id: str, **kwargs) -> str:
+        """Read attachment content without writing a local file."""
+        ...
+
+    def download_attachment(self, attachment_id: str, save_to: str, **kwargs) -> str:
+        """Download attachment content to a file path for internal exports."""
         ...
 
 

@@ -163,7 +163,7 @@ def register(
                             continue
                         temp_file = Path(temp_dir) / f"attachment-{index}-{attachment_id}.txt"
                         try:
-                            result = json.loads(resolved_provider.get_attachment(attachment_id, str(temp_file)))
+                            result = json.loads(resolved_provider.download_attachment(attachment_id, str(temp_file)))
                             if "error" not in result and temp_file.exists():
                                 content = temp_file.read_text(encoding="utf-8", errors="replace")
                                 if len(content) > MAX_EMBEDDED_TEXT_CHARS:

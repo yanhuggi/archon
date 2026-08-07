@@ -1,6 +1,6 @@
 # archon-jira
 
-`archon-jira` 是一个面向 Jira Server REST API v2 的 MCP（Model Context Protocol）服务，为 AI 编程助手提供 JQL 元数据发现、任务搜索、详情、评论、附件下载和 Word 导出能力。
+`archon-jira` 是一个面向 Jira Server REST API v2 的 MCP（Model Context Protocol）服务，为 AI 编程助手提供 JQL 元数据发现、任务搜索、详情、工作流流转、评论读写、任务编辑、附件下载和 Word 导出能力。
 
 ## 能力概览
 
@@ -10,25 +10,37 @@
 | `get_jql_value_suggestions` | Jira 只读 | 获取某个字段的候选值和可直接使用的 JQL literal |
 | `search_issues` | Jira 只读 | 使用 JQL 搜索任务 |
 | `get_issue` | Jira 只读 | 获取任务详情、关系、子任务和附件 ID |
+| `get_transitions` | Jira 只读 | 获取任务当前可用的工作流流转 |
 | `get_comments` | Jira 只读 | 分页获取评论与讨论记录 |
-| `get_attachment` | 本地写入 | 下载一个附件到授权目录 |
+| `add_comment` | Jira 写入 | 为任务新增评论 |
+| `update_comment` | Jira 写入 | 编辑指定评论正文 |
+| `delete_comment` | Jira 写入 | 删除指定评论 |
+| `update_issue` | Jira 写入 | 编辑现有任务的标准字段或自定义字段 |
+| `transition_issue` | Jira 写入 | 使用精确 transition ID 执行工作流流转 |
+| `get_attachment` | Jira 只读 | 内联读取文本或图片附件 |
 | `export_issue` | 本地写入 | 将任务导出为 `.docx` |
 
 服务默认使用 `stdio`，也支持 Streamable HTTP 和兼容模式 SSE。
 
 主要特性：
 
-- 七个工具始终可发现；配置不完整时返回稳定的 `configuration_error`。
-- server instructions 和工具描述明确 JQL 探索、查询、评论、下载和导出的使用边界。
+- 十三个工具始终可发现；配置不完整时返回稳定的 `configuration_error`。
+- server instructions 和工具描述明确 JQL 探索、查询、评论、编辑、附件读取和导出的使用边界。
 - JQL 字段与候选值使用进程内缓存和原子 JSON 快照，避免每次搜索前请求元数据。
 - 工具参数不暴露内部 provider 选择。
 - 支持带 context path 的 Jira 地址，例如 `https://jira.example.com/jira`。
-- 附件同时校验元数据大小和实际下载字节数，只接受与 Jira 同源的下载 URL。
+- 附件读取同时校验元数据大小和实际下载字节数，只接受与 Jira 同源的下载 URL。
 - 附件和 DOCX 使用临时文件与原子替换，失败时不会留下半文件。
 - 本地输出限制在授权目录内，默认拒绝覆盖已有文件。
 - `.env` 不会覆盖 MCP 客户端显式传入的凭据。
 
-> `get_attachment` 和 `export_issue` 会写入本地磁盘。仅在用户明确要求下载或导出时调用，并为 `JIRA_ALLOWED_OUTPUT_DIR` 设置尽可能小的范围。
+> `get_attachment` 只读返回附件内容，不写入本地磁盘。`export_issue` 会写入本地磁盘，仅在用户明确要求导出时调用，并为 `JIRA_ALLOWED_OUTPUT_DIR` 设置尽可能小的范围。
+>
+> `update_issue` 会直接修改远端 Jira 数据。仅在用户明确要求编辑任务时调用，并只发送用户要求变更的字段。
+>
+> `transition_issue` 会直接修改远端工作流状态。先用 `get_transitions` 获取当前可用的数字 transition ID；不要通过 `update_issue` 修改 `status`。
+>
+> `add_comment`、`update_comment` 和 `delete_comment` 会直接修改远端讨论记录。编辑或删除前先用 `get_comments` 获取数字评论 ID，并仅在用户明确要求时调用。
 
 ## 快速开始
 
@@ -199,6 +211,37 @@ search_issues(jql="assignee = currentUser() AND resolution = Unresolved")
 
 评论不自动混入详情；只有需要讨论历史时才调用 `get_comments`。
 
+### `get_transitions`
+
+返回当前账号对指定任务此刻可执行的工作流流转，包括数字 transition ID、
+名称、目标状态和流转页面字段。流转可能随任务状态和权限变化，因此执行前应
+即时查询，不根据状态名称猜测 ID。
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `issue_key` | 必填 | Jira issue key |
+
+### `transition_issue`
+
+使用 `get_transitions` 返回的精确数字 ID 执行流转。工具会在 POST 前重新
+查询可用流转；ID 已过期或不可用时返回 `transition_unavailable`，不会提交。
+传入的 `fields` 也必须出现在该流转的字段元数据中，否则整体拒绝且不会静默
+丢弃字段。
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `issue_key` | 必填 | Jira issue key |
+| `transition_id` | 必填 | `get_transitions` 返回的数字 ID |
+| `fields` | `null` | 可选流转页面字段，使用 Jira 原生 JSON 结构 |
+
+```text
+transition_issue(
+  issue_key="APP-123",
+  transition_id="31",
+  fields={"resolution": {"id": "1"}}
+)
+```
+
 ### `get_comments`
 
 | 参数 | 默认值 | 说明 |
@@ -207,26 +250,77 @@ search_issues(jql="assignee = currentUser() AND resolution = Unresolved")
 | `max_results` | `50` | 每页评论数，范围 1–100 |
 | `start_at` | `0` | 分页偏移 |
 
-评论正文单条最多返回 2000 字符，以控制模型上下文。返回 `has_more` 和
+评论返回数字 `id`，用于后续编辑或删除。评论正文单条最多返回 2000 字符，以控制模型上下文。返回 `has_more` 和
 `next_start_at`，有更多结果时可直接用下一偏移继续请求。
 
+### `add_comment`
+
+仅在用户明确要求添加备注/评论时调用。新增评论是非幂等的，每次调用都会
+创建一条新的远端记录。
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `issue_key` | 必填 | Jira issue key |
+| `body` | 必填 | 评论正文，最多 32767 字符 |
+
+### `update_comment`
+
+仅在用户明确要求编辑评论时调用。先使用 `get_comments` 获取准确的数字评论
+ID，不按正文猜测目标评论。
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `issue_key` | 必填 | Jira issue key |
+| `comment_id` | 必填 | `get_comments` 返回的数字评论 ID |
+| `body` | 必填 | 新评论正文，最多 32767 字符 |
+
+### `delete_comment`
+
+仅在用户明确要求删除评论时调用。删除是破坏性远端操作，先使用
+`get_comments` 获取准确的数字评论 ID。
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `issue_key` | 必填 | Jira issue key |
+| `comment_id` | 必填 | `get_comments` 返回的数字评论 ID |
+
+### `update_issue`
+
+仅在用户明确要求修改 Jira 任务时调用。工具会先查询 Jira `editmeta`，确认
+当前账号可以编辑所有请求字段；只要有一个字段不可编辑，就不会提交任何字段，
+并返回 `uneditable_fields`。`fields` 使用 Jira REST API v2 原生字段结构，
+工具只覆盖传入的字段，未传字段保持不变。
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `issue_key` | 必填 | Jira issue key |
+| `fields` | 必填 | 非空字段对象，最多 50 个字段；`null` 可在 Jira 允许时清空字段 |
+
+```text
+update_issue(
+  issue_key="APP-123",
+  fields={"summary": "新的标题", "labels": ["backend", "urgent"]}
+)
+```
+
+自定义字段应使用确切的 `customfield_12345` ID 和 Jira 要求的 JSON 形状。
+状态流转和评论不属于此工具；它们需要独立的 Jira API 操作。
+
 ### `get_attachment`
+
+只读读取附件，不接受本地路径，也不会创建目录或写入文件。文本附件返回
+UTF-8 正文，图片以内联 MCP 图片内容返回；其他二进制附件只返回元数据。
 
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
 | `attachment_id` | 必填 | 从 `get_issue` 获得的数字附件 ID |
-| `save_to` | 必填 | 授权输出目录内的本地路径 |
 
-```text
-get_attachment(attachment_id="10001", save_to="./jira-files/error.log")
-```
-
-下载流程：
+读取流程：
 
 1. 查询 Jira 附件元数据并检查声明大小。
 2. 验证下载地址与 `JIRA_URL` 同源。
-3. 下载到目标目录内的随机临时文件，同时累计实际字节数。
-4. 成功后原子替换到目标路径；失败则删除临时文件。
+3. 在内存中读取并检查实际字节数。
+4. 按 MIME 类型返回文本、图片或元数据，不落盘。
 
 ### `export_issue`
 
@@ -253,6 +347,10 @@ JSON 工具调用失败时返回 `error` 与 `error_code`。`get_issue` 成功�
 | `ambiguous_jql_field` | 字段名称对应多个字段，需要改用 ID 或 `cf[ID]` |
 | `metadata_unsupported` | 当前 Jira 不支持候选值接口 |
 | `invalid_issue_key` | Issue key 格式不合法 |
+| `invalid_transition_id` | Transition ID 不是数字 |
+| `transition_unavailable` | 请求的流转当前不可用，未提交状态变更 |
+| `unavailable_transition_fields` | 请求字段不在流转页面中，未提交状态变更 |
+| `invalid_comment_id` / `invalid_comment_body` | 评论 ID 或正文格式不合法 |
 | `invalid_attachment_id` | 附件 ID 不是数字 |
 | `invalid_output_path` | 输出路径越界、为目录或不允许覆盖 |
 | `invalid_attachment_url` | 下载地址与 Jira 不同源 |
@@ -262,11 +360,13 @@ JSON 工具调用失败时返回 `error` 与 `error_code`。`get_issue` 成功�
 | `rate_limited` | Jira 返回 429 |
 | `upstream_error` | 网络或其他 Jira HTTP 错误 |
 | `invalid_provider_response` | Jira 返回内容不符合预期 |
+| `invalid_fields` | 编辑字段为空、过多、名称无效或值不是合法 JSON |
+| `uneditable_fields` | 当前账号无法编辑一个或多个请求字段，未提交更新 |
 | `export_failed` / `download_failed` | 本地导出或下载失败 |
 
 ## Claude Code 模型策略
 
-Tool Search 可以通过七个工具的名称和描述发现相应能力。为了提高调用稳定性，可在项目 `CLAUDE.md` 中加入：
+Tool Search 可以通过十三个工具的名称和描述发现相应能力。为了提高调用稳定性，可在项目 `CLAUDE.md` 中加入：
 
 ```markdown
 ## Jira
@@ -285,14 +385,25 @@ relationships, attachments, or comments.
   is uncertain. Use the returned `jql_literal`; do not invent custom values.
 - Use `search_issues` when the issue key is unknown or a list/filter is needed.
 - Use `get_issue` when a specific issue key is known.
+- Use `get_transitions` immediately before a requested workflow change.
+- Use `transition_issue` only with an exact transition ID returned by
+  `get_transitions`; never update `status` as a normal field.
 - Use `get_comments` only when discussion or comment history matters.
-- Use `get_attachment` only when the user explicitly asks to download an
-  attachment, after obtaining its numeric ID from `get_issue`.
+- Use `add_comment` only when the user explicitly asks to add a comment.
+- Use `update_comment` only when the user explicitly asks to edit a comment,
+  after obtaining its numeric ID from `get_comments`.
+- Use `delete_comment` only when the user explicitly asks to delete a comment,
+  after obtaining its numeric ID from `get_comments`.
+- Use `update_issue` only when the user explicitly asks to change an issue. Read
+  the issue first when current state matters, and send only requested fields.
+- Use `get_attachment` when the user needs to inspect an attachment, after
+  obtaining its numeric ID from `get_issue`; it returns inline content and does
+  not write files.
 - Use `export_issue` only when the user explicitly asks for a local Word export.
 
-`get_attachment` and `export_issue` write local files. Keep output paths inside
-the configured directory and do not overwrite existing files unless the user
-has requested replacement and overwrite is enabled.
+Only `export_issue` writes a local file. Keep its output path inside the
+configured directory and do not overwrite existing files unless the user has
+requested replacement and overwrite is enabled.
 
 If a Jira tool returns an error or incomplete evidence, report that limitation.
 Do not invent issue keys, attachment IDs, custom fields, or issue contents.
@@ -431,7 +542,13 @@ jira/
 │       ├── get_jql_value_suggestions.py
 │       ├── search_issues.py
 │       ├── get_issue.py
+│       ├── get_transitions.py
 │       ├── get_comments.py
+│       ├── add_comment.py
+│       ├── update_comment.py
+│       ├── delete_comment.py
+│       ├── update_issue.py
+│       ├── transition_issue.py
 │       ├── get_attachment.py
 │       └── export_issue.py
 └── tests/

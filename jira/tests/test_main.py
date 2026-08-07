@@ -38,11 +38,21 @@ def test_create_server_always_exposes_stable_tools() -> None:
         "get_jql_value_suggestions",
         "search_issues",
         "get_issue",
+        "get_transitions",
         "get_comments",
+        "add_comment",
+        "update_comment",
+        "delete_comment",
+        "update_issue",
+        "transition_issue",
         "get_attachment",
         "export_issue",
     ]
     assert all("provider" not in tool.input_schema["properties"] for tool in tools)
+    attachment = next(tool for tool in tools if tool.name == "get_attachment")
+    assert attachment.input_schema["required"] == ["attachment_id"]
+    assert attachment.annotations.read_only_hint is True
+    assert attachment.annotations.destructive_hint is False
     assert prompts == []
     assert server._lowlevel_server.name == SERVER_NAME
 

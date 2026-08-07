@@ -14,15 +14,21 @@ from mcp.server import MCPServer
 from server.config import SUPPORTED_TRANSPORTS, JiraConfig
 from server.instructions import SERVER_INSTRUCTIONS
 from server.providers.jira import JiraProvider
+from server.tools.add_comment import register as register_add_comment
+from server.tools.delete_comment import register as register_delete_comment
 from server.tools.export_issue import register as register_export_issue
 from server.tools.get_attachment import register as register_get_attachment
 from server.tools.get_comments import register as register_get_comments
 from server.tools.get_issue import register as register_get_issue
+from server.tools.get_transitions import register as register_get_transitions
 from server.tools.get_jql_value_suggestions import (
     register as register_get_jql_value_suggestions,
 )
 from server.tools.search_issues import register as register_search_issues
 from server.tools.search_jql_fields import register as register_search_jql_fields
+from server.tools.update_comment import register as register_update_comment
+from server.tools.update_issue import register as register_update_issue
+from server.tools.transition_issue import register as register_transition_issue
 
 LOGGER = logging.getLogger(__name__)
 SERVER_NAME = "archon-jira"
@@ -57,7 +63,7 @@ def create_server(config: JiraConfig | None = None) -> MCPServer:
     server = MCPServer(
         name=SERVER_NAME,
         title="Archon Jira",
-        description="MCP server for Jira issue retrieval and controlled local exports.",
+        description="MCP server for Jira issue/comment retrieval, controlled editing, and local exports.",
         instructions=SERVER_INSTRUCTIONS,
         version=SERVER_VERSION,
         log_level=config.log_level,
@@ -66,7 +72,13 @@ def create_server(config: JiraConfig | None = None) -> MCPServer:
     register_get_jql_value_suggestions(server, provider=provider)
     register_search_issues(server, provider=provider)
     register_get_issue(server, provider=provider)
+    register_get_transitions(server, provider=provider)
     register_get_comments(server, provider=provider)
+    register_add_comment(server, provider=provider)
+    register_update_comment(server, provider=provider)
+    register_delete_comment(server, provider=provider)
+    register_update_issue(server, provider=provider)
+    register_transition_issue(server, provider=provider)
     register_get_attachment(server, provider=provider)
     register_export_issue(server, config=config, provider=provider)
     return server

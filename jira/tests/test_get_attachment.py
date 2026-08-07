@@ -1,21 +1,34 @@
 """Tests for the get_attachment MCP tool."""
 
 import inspect
+import base64
 import json
 from unittest.mock import MagicMock
 
+from mcp.types import ImageContent
 from server.providers import register
 from server.tools.get_attachment import register as register_tool
 
 
 class StubProvider:
-    def get_attachment(self, attachment_id: str, save_to: str, **kwargs) -> str:
+    def get_attachment(self, attachment_id: str, **kwargs) -> str:
         return json.dumps({
             "id": attachment_id,
             "filename": "example.txt",
-            "saved_to": save_to,
             "size": 4,
             "mime_type": "text/plain",
+            "content_base64": base64.b64encode(b"test").decode("ascii"),
+        })
+
+
+class ImageStubProvider:
+    def get_attachment(self, attachment_id: str, **kwargs) -> str:
+        return json.dumps({
+            "id": attachment_id,
+            "filename": "example.png",
+            "size": 4,
+            "mime_type": "image/png",
+            "content_base64": base64.b64encode(b"png!").decode("ascii"),
         })
 
 
@@ -29,20 +42,30 @@ def get_func(provider: str = "stub"):
 
 def test_attachment_calls_provider() -> None:
     register("stub", StubProvider())
-    data = json.loads(get_func()("10001", "/tmp/example.txt"))
+    data = json.loads(get_func()("10001"))
     assert data["id"] == "10001"
-    assert data["saved_to"] == "/tmp/example.txt"
+    assert data["content"] == "test"
 
 
 def test_attachment_rejects_invalid_id() -> None:
-    data = json.loads(get_func()("abc", "/tmp/example.txt"))
+    data = json.loads(get_func()("abc"))
     assert data["error_code"] == "invalid_attachment_id"
 
 
 def test_attachment_reports_missing_provider() -> None:
-    data = json.loads(get_func("missing")("10001", "/tmp/example.txt"))
+    data = json.loads(get_func("missing")("10001"))
     assert data["error_code"] == "provider_unavailable"
 
 
+def test_attachment_returns_inline_image_content() -> None:
+    register("image", ImageStubProvider())
+    result = get_func("image")("10001")
+    assert isinstance(result, list)
+    assert isinstance(result[1], ImageContent)
+    assert result[1].mime_type == "image/png"
+
+
 def test_attachment_does_not_expose_provider_argument() -> None:
-    assert "provider" not in inspect.signature(get_func()).parameters
+    signature = inspect.signature(get_func())
+    assert "provider" not in signature.parameters
+    assert "save_to" not in signature.parameters
