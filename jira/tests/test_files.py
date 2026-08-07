@@ -1,5 +1,7 @@
 """Tests for controlled Jira output paths."""
 
+import threading
+import time
 from unittest.mock import patch
 
 import pytest
@@ -58,6 +60,52 @@ def test_commit_output_file_falls_back_without_hard_links(tmp_path) -> None:
 
     assert destination.read_text(encoding="utf-8") == "new"
     assert not temporary.exists()
+
+
+def test_hard_link_fallback_never_exposes_a_partial_file(tmp_path) -> None:
+    """The fallback publishes by rename, so readers never see half a document."""
+    temporary = tmp_path / "temporary"
+    destination = tmp_path / "destination"
+    payload = b"A" * 2_000_000
+    temporary.write_bytes(payload)
+
+    observed: list[int] = []
+    stop = threading.Event()
+
+    def watch() -> None:
+        while not stop.is_set():
+            try:
+                observed.append(destination.stat().st_size)
+            except OSError:
+                pass
+            time.sleep(0.0005)
+
+    watcher = threading.Thread(target=watch)
+    watcher.start()
+    try:
+        with patch("server.files.os.link", side_effect=OSError(95, "Operation not supported")):
+            commit_output_file(temporary, destination, JiraConfig(output_dir=tmp_path))
+    finally:
+        stop.set()
+        watcher.join()
+
+    assert destination.read_bytes() == payload
+    assert {size for size in observed} <= {len(payload)}
+    assert list(tmp_path.glob(".*.claim")) == []
+
+
+def test_hard_link_fallback_rejects_a_concurrent_publish(tmp_path) -> None:
+    """Two exports racing for one path cannot interleave their writes."""
+    temporary = tmp_path / "temporary"
+    destination = tmp_path / "destination"
+    temporary.write_text("new", encoding="utf-8")
+    (tmp_path / f".{destination.name}.claim").write_text("in progress", encoding="utf-8")
+
+    with patch("server.files.os.link", side_effect=OSError(95, "Operation not supported")):
+        with pytest.raises(OutputPathError, match="already writing"):
+            commit_output_file(temporary, destination, JiraConfig(output_dir=tmp_path))
+
+    assert not destination.exists()
 
 
 def test_hard_link_fallback_still_refuses_to_overwrite(tmp_path) -> None:

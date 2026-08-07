@@ -106,6 +106,7 @@ class JiraConfig:
     jql_value_refresh_interval: int = DEFAULT_JQL_VALUE_REFRESH_INTERVAL
     jql_cache_max_stale: int = DEFAULT_JQL_CACHE_MAX_STALE
     jql_value_cache_max_entries: int = DEFAULT_JQL_VALUE_CACHE_MAX_ENTRIES
+    retry_mutations_on_401: bool = False
     transport: str = DEFAULT_TRANSPORT
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
@@ -183,6 +184,7 @@ class JiraConfig:
                 1,
                 10_000,
             ),
+            retry_mutations_on_401=_read_bool("JIRA_RETRY_MUTATIONS_ON_401"),
             transport=transport,
             host=os.environ.get("ARCHON_JIRA_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST,
             port=_read_int("ARCHON_JIRA_PORT", DEFAULT_PORT, 1, 65535),

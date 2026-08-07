@@ -61,24 +61,44 @@ def commit_output_file(temporary_path: Path, destination: Path, config: JiraConf
         raise OutputPathError(f"Output file already exists: {destination}") from exc
     except OSError:
         # Some mounts (network shares, certain FUSE and Windows-backed paths)
-        # reject hard links outright. An exclusive create keeps the
-        # create-if-absent guarantee without them.
-        _copy_exclusive(temporary_path, destination)
+        # reject hard links outright.
+        _publish_without_hard_link(temporary_path, destination)
     temporary_path.unlink(missing_ok=True)
 
 
-def _copy_exclusive(temporary_path: Path, destination: Path) -> None:
-    """Copy into a newly created destination, refusing to replace an existing file."""
+def _publish_without_hard_link(temporary_path: Path, destination: Path) -> None:
+    """Publish atomically on mounts that reject hard links.
 
+    A plain copy into the destination would make a partially written file
+    visible to readers, so the content goes to a sibling claim file first and is
+    then moved into place with a single ``os.rename``. ``O_EXCL`` on the claim
+    keeps the create-if-absent guarantee: whoever creates it owns the publish,
+    and the final rename only ever exposes a complete file.
+    """
+
+    claim = destination.with_name(f".{destination.name}.claim")
     try:
-        descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        descriptor = os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError as exc:
-        raise OutputPathError(f"Output file already exists: {destination}") from exc
+        raise OutputPathError(
+            f"Another export is already writing {destination}; retry once it finishes."
+        ) from exc
     except OSError as exc:
         raise OutputPathError(f"Could not write output file {destination}: {exc}") from exc
+
     try:
         with open(descriptor, "wb") as handle, temporary_path.open("rb") as source:
             shutil.copyfileobj(source, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # Re-check late: without hard links there is no single syscall that both
+        # creates the destination and copies into it.
+        if destination.exists():
+            raise OutputPathError(f"Output file already exists: {destination}")
+        os.rename(claim, destination)
+    except OutputPathError:
+        claim.unlink(missing_ok=True)
+        raise
     except OSError as exc:
-        destination.unlink(missing_ok=True)
+        claim.unlink(missing_ok=True)
         raise OutputPathError(f"Could not write output file {destination}: {exc}") from exc

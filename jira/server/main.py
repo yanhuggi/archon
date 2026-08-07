@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import logging
+import threading
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -85,6 +86,9 @@ def create_server(config: JiraConfig | None = None) -> MCPServer:
     return server
 
 
+_MCP_INIT_LOCK = threading.Lock()
+
+
 def __getattr__(name: str) -> object:
     """Build the module-level ``mcp`` server only when something asks for it.
 
@@ -92,12 +96,18 @@ def __getattr__(name: str) -> object:
     ``mcp``, ``server``, or ``app``. Constructing it eagerly would make every
     normal ``main()`` startup build a second, unused server and provider, and
     register a stray ``atexit`` close callback.
+
+    The lock keeps a concurrent first access from building two servers, which
+    would leak a provider and its ``atexit`` callback.
     """
 
     if name == "mcp":
-        server = create_server()
-        globals()["mcp"] = server
-        return server
+        with _MCP_INIT_LOCK:
+            server = globals().get("mcp")
+            if server is None:
+                server = create_server()
+                globals()["mcp"] = server
+            return server
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

@@ -19,6 +19,7 @@ def test_config_reads_provider_server_and_output_settings(monkeypatch, tmp_path:
     monkeypatch.setenv("JIRA_JQL_VALUE_REFRESH_INTERVAL", "240")
     monkeypatch.setenv("JIRA_JQL_CACHE_MAX_STALE", "3600")
     monkeypatch.setenv("JIRA_JQL_VALUE_CACHE_MAX_ENTRIES", "25")
+    monkeypatch.setenv("JIRA_RETRY_MUTATIONS_ON_401", "true")
     monkeypatch.setenv("ARCHON_JIRA_TRANSPORT", "streamable-http")
     config = JiraConfig.from_env()
     assert config.url == "https://jira.example.com/context"
@@ -34,8 +35,16 @@ def test_config_reads_provider_server_and_output_settings(monkeypatch, tmp_path:
     assert config.jql_value_refresh_interval == 240
     assert config.jql_cache_max_stale == 3600
     assert config.jql_value_cache_max_entries == 25
+    assert config.retry_mutations_on_401 is True
     assert config.transport == "streamable-http"
     assert config.is_configured
+
+
+def test_mutation_retry_is_disabled_by_default(monkeypatch) -> None:
+    """Repeating a write after a 401 must be an explicit deployment decision."""
+    monkeypatch.delenv("JIRA_RETRY_MUTATIONS_ON_401", raising=False)
+    assert JiraConfig.from_env().retry_mutations_on_401 is False
+    assert JiraConfig().retry_mutations_on_401 is False
 
 
 def test_invalid_url_and_values_fall_back(monkeypatch) -> None:

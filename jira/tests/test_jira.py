@@ -14,6 +14,9 @@ from server.config import JiraConfig
 from server.providers.jira import (
     _DEFAULT_MAX_ATTACHMENT_SIZE,
     _MAX_FIELD_LENGTH,
+    _MAX_INLINE_VALUES,
+    _MAX_ISSUE_CHARS,
+    _MAX_LIST_ITEMS,
     _MAX_OTHER_FIELD_LENGTH,
     _MAX_OTHER_FIELD_ROWS,
     _MAX_SEARCH_RESULTS,
@@ -357,6 +360,54 @@ def test_get_issue_bounds_a_wide_custom_field_instance() -> None:
     assert result.count("\n| Field ") == _MAX_OTHER_FIELD_ROWS
     assert f"（另有 {300 - _MAX_OTHER_FIELD_ROWS} 个自定义字段未显示）" in result
     assert len(result) < 60_000
+    provider.close()
+
+
+def test_get_issue_bounds_every_unbounded_section() -> None:
+    """Lists, multi-value fields and the summary all obey a budget, not just the table."""
+    provider = JiraProvider()
+    provider._field_map = {}
+    provider._field_map_fetched_at = float("inf")
+    count = 400
+    mock_client = _make_mock_client()
+    issue_resp = MagicMock(status_code=200)
+    issue_resp.raise_for_status = MagicMock()
+    issue_resp.json.return_value = {
+        "key": "PROJ-1",
+        "fields": {
+            "summary": "S" * 5000,
+            "status": {"name": "Open"},
+            "issuetype": {"name": "Bug"},
+            "labels": [f"label-{index}" * 20 for index in range(count)],
+            "components": [{"name": f"comp{index}"} for index in range(count)],
+            "versions": [{"name": f"v{index}"} for index in range(count)],
+            "subtasks": [
+                {"key": f"SUB-{index}", "fields": {"summary": "X" * 200}} for index in range(count)
+            ],
+            "issuelinks": [
+                {
+                    "type": {"outward": "blocks"},
+                    "outwardIssue": {"key": f"L-{index}", "fields": {"summary": "Y" * 200}},
+                }
+                for index in range(count)
+            ],
+            "attachment": [
+                {"id": str(index), "filename": "f" * 200, "size": 1} for index in range(count)
+            ],
+        },
+    }
+    mock_client.get.return_value = issue_resp
+
+    provider._client = mock_client
+    result = provider.get_issue("PROJ-1")
+
+    assert len(result) <= _MAX_ISSUE_CHARS
+    assert result.count("\n- SUB-") == _MAX_LIST_ITEMS
+    assert result.count("\n- blocks L-") == _MAX_LIST_ITEMS
+    assert f"（另有 {count - _MAX_LIST_ITEMS} 个子任务未显示）" in result
+    assert f"（另有 {count - _MAX_LIST_ITEMS} 条关联未显示）" in result
+    assert f"(+{count - _MAX_INLINE_VALUES})" in result  # capped multi-value fields
+    assert result.count("S") < 5000  # summary truncated in the heading
     provider.close()
 
 
@@ -1139,10 +1190,49 @@ def test_persistent_401_stops_after_one_retry(tmp_path) -> None:
     provider.close()
 
 
-def test_mutations_are_retried_on_an_expired_session(tmp_path) -> None:
-    """A 401 means Jira never applied the write, so one retry stays safe."""
+def test_mutations_are_not_retried_on_401_by_default(tmp_path) -> None:
+    """A gateway could rewrite a 401 after forwarding the write, so do not repeat it."""
     config = JiraConfig(
         url="https://jira.example.com", username="user", password="pass", output_dir=tmp_path
+    )
+    provider = JiraProvider(config)
+    request = httpx.Request("POST", "https://jira.example.com/rest/api/2/issue/PROJ-1/comment")
+    unauthorized = httpx.Response(401, request=request, json={"errorMessages": ["expired"]})
+    posts: list[str] = []
+
+    def build_client(**_kwargs) -> MagicMock:
+        client = _make_mock_client()
+
+        def post(url, **_kwargs):
+            posts.append(url)
+            return unauthorized
+
+        client.post.side_effect = post
+        return client
+
+    with (
+        patch("server.providers.jira.httpx.Client", build_client),
+        patch.object(JiraProvider, "_login", staticmethod(lambda *a: None)),
+    ):
+        data = json.loads(provider.add_comment("PROJ-1", "Deployed"))
+
+    assert data["error_code"] == "authentication_error"
+    assert data["added"] is False
+    # Exactly one attempt: no chance of a duplicate comment.
+    assert len(posts) == 1
+    # The rejected session is still discarded so the next call re-authenticates.
+    assert provider._client is None
+    provider.close()
+
+
+def test_mutations_are_retried_on_401_when_explicitly_enabled(tmp_path) -> None:
+    """Deployments that verified their edge can opt into write retries."""
+    config = JiraConfig(
+        url="https://jira.example.com",
+        username="user",
+        password="pass",
+        output_dir=tmp_path,
+        retry_mutations_on_401=True,
     )
     provider = JiraProvider(config)
     request = httpx.Request("POST", "https://jira.example.com/rest/api/2/issue/PROJ-1/comment")
@@ -1175,6 +1265,62 @@ def test_mutations_are_retried_on_an_expired_session(tmp_path) -> None:
     assert data["comment"]["id"] == "10001"
     # The rejected attempt plus exactly one retry: no duplicate comment.
     assert len(posts) == 2
+    provider.close()
+
+
+def test_attachment_download_recovers_from_an_expired_session(tmp_path) -> None:
+    """Streamed downloads get the same session recovery as ordinary requests."""
+    config = JiraConfig(
+        url="https://jira.example.com", username="user", password="pass", output_dir=tmp_path
+    )
+    provider = JiraProvider(config)
+    metadata = MagicMock()
+    metadata.raise_for_status = MagicMock()
+    metadata.status_code = 200
+    metadata.json.return_value = {
+        "filename": "file.txt",
+        "size": 5,
+        "mimeType": "text/plain",
+        "content": "https://jira.example.com/secure/attachment/1/file.txt",
+    }
+    request = httpx.Request("GET", "https://jira.example.com/secure/attachment/1/file.txt")
+    unauthorized = httpx.Response(401, request=request, json={"errorMessages": ["expired"]})
+    clients: list[MagicMock] = []
+    streams: list[str] = []
+
+    def build_client(**_kwargs) -> MagicMock:
+        client = _make_mock_client()
+        client.get.return_value = metadata
+
+        def stream(method, url, **_kwargs):
+            streams.append(url)
+            if client is clients[0]:
+                unauthorized.stream = MagicMock()
+                context = MagicMock()
+                context.__enter__ = MagicMock(return_value=unauthorized)
+                context.__exit__ = MagicMock(return_value=False)
+                return context
+            body = MagicMock()
+            body.__enter__ = MagicMock(return_value=body)
+            body.__exit__ = MagicMock(return_value=False)
+            body.raise_for_status = MagicMock()
+            body.status_code = 200
+            body.iter_bytes.return_value = [b"hello"]
+            return body
+
+        client.stream.side_effect = stream
+        clients.append(client)
+        return client
+
+    with (
+        patch("server.providers.jira.httpx.Client", build_client),
+        patch.object(JiraProvider, "_login", staticmethod(lambda *a: None)),
+    ):
+        data = json.loads(provider.get_attachment("1"))
+
+    assert "error" not in data
+    assert base64.b64decode(data["content_base64"]) == b"hello"
+    assert len(streams) == 2  # rejected attempt plus one retry
     provider.close()
 
 

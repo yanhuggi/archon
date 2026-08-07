@@ -7,6 +7,8 @@ import re
 import tempfile
 import threading
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -19,9 +21,16 @@ from server.jql_cache import CacheResult, JsonJqlCache
 _MAX_FIELD_LENGTH = 2000
 _MAX_OTHER_FIELD_ROWS = 60
 _MAX_OTHER_FIELD_LENGTH = 500
+# Per-section item caps plus one overall budget for the rendered issue. The
+# per-section caps keep every section represented; the budget is the backstop
+# for pathological instances where many sections are individually near their cap.
+_MAX_LIST_ITEMS = 50
+_MAX_INLINE_VALUES = 30
+_MAX_ISSUE_CHARS = 60_000
 _MAX_SEARCH_RESULTS = 200
 _MAX_CACHED_VALUE_SUGGESTIONS = 1000
 _DEFAULT_MAX_ATTACHMENT_SIZE = DEFAULT_MAX_ATTACHMENT_SIZE
+_SAFE_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
 _COMMENT_ID_RE = re.compile(r"^\d+$")
 _MAX_COMMENT_LENGTH = 32767
@@ -107,6 +116,32 @@ def _table_cell(value: object) -> str:
 
     text = "" if value is None else str(value)
     return text.replace("\\", "\\\\").replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+
+def _bounded(items: list, limit: int) -> tuple[list, int]:
+    """Return at most ``limit`` items plus how many were left out."""
+
+    return items[:limit], max(len(items) - limit, 0)
+
+
+def _inline_values(values: object, render: Callable[[object], str]) -> str:
+    """Join a Jira multi-value field, capping how many values are listed."""
+
+    items = values if isinstance(values, list) else []
+    shown, omitted = _bounded(items, _MAX_INLINE_VALUES)
+    text = ", ".join(render(item) for item in shown)
+    return f"{text} (+{omitted})" if omitted else text
+
+
+def _truncate_to_budget(lines: list[str], limit: int) -> list[str]:
+    """Drop trailing lines once the rendered issue would exceed ``limit`` chars."""
+
+    total = 0
+    for index, line in enumerate(lines):
+        total += len(line) + 1
+        if total > limit:
+            return [*lines[:index], "", f"（内容超出 {limit} 字符上限，已截断）"]
+    return lines
 
 
 def _normalize_comment(comment: dict, fallback_body: str = "") -> dict:
@@ -338,14 +373,27 @@ class JiraProvider:
         except Exception as exc:  # noqa: BLE001 - invalidation must remain best effort
             LOGGER.debug("Failed to close invalid Jira client: %s", exc)
 
-    def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
-        """Send one authenticated Jira request, re-authenticating once on 401.
+    def _may_retry_after_401(self, method: str) -> bool:
+        """Decide whether a 401 on ``method`` may be retried after re-authenticating.
 
         Jira sessions expire on the server's schedule, so the first call after an
-        idle period can fail even though the credentials are still valid. A 401
-        means Jira rejected the request without applying it, which makes a single
-        retry safe for mutations as well as reads.
+        idle period can fail even though the credentials are still valid. Retrying
+        a read is always safe.
+
+        Writes are not retried by default. A 401 from Jira itself means the
+        request was rejected before it was applied, but a reverse proxy or SSO
+        gateway can rewrite the response *after* forwarding the request, which
+        would turn a retry into a duplicate comment or a second transition.
+        Deployments that have verified their edge can opt in with
+        ``JIRA_RETRY_MUTATIONS_ON_401``.
         """
+
+        if method.upper() in _SAFE_HTTP_METHODS:
+            return True
+        return self._config().retry_mutations_on_401
+
+    def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """Send one authenticated Jira request, re-authenticating once on 401."""
 
         last_attempt = 1
         for attempt in (0, last_attempt):
@@ -359,11 +407,42 @@ class JiraProvider:
                 # Drop exactly this session so the retry, and any later call,
                 # authenticates again instead of reusing a rejected cookie.
                 self._invalidate_client(client)
-                if attempt == last_attempt:
+                if attempt == last_attempt or not self._may_retry_after_401(method):
                     raise
                 LOGGER.info("Jira session rejected %s %s; re-authenticating once", method, url)
                 continue
             return response
+        raise AssertionError("unreachable")  # pragma: no cover - loop always returns or raises
+
+    @contextmanager
+    def _stream(self, method: str, url: str, **kwargs) -> Iterator[httpx.Response]:
+        """Stream one authenticated Jira response, re-authenticating once on 401.
+
+        Downloads go through the same session recovery as _request; without it an
+        expired session would surface an error that the very next call succeeds at.
+        """
+
+        last_attempt = 1
+        for attempt in (0, last_attempt):
+            client = self._get_client()
+            with client.stream(method, url, **kwargs) as response:
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    # A streamed error response has no buffered body yet, and
+                    # _http_error_message needs one to extract Jira's message.
+                    exc.response.read()
+                    if exc.response.status_code != 401:
+                        raise
+                    self._invalidate_client(client)
+                    if attempt == last_attempt or not self._may_retry_after_401(method):
+                        raise
+                    LOGGER.info(
+                        "Jira session rejected stream %s %s; re-authenticating once", method, url
+                    )
+                    continue
+                yield response
+                return
         raise AssertionError("unreachable")  # pragma: no cover - loop always returns or raises
 
     @staticmethod
@@ -987,7 +1066,9 @@ class JiraProvider:
 
         f = issue.get("fields", {})
         key = issue.get("key", "")
-        summary = f.get("summary", "")
+        summary = str(f.get("summary", ""))
+        if len(summary) > _MAX_FIELD_LENGTH:
+            summary = summary[:_MAX_FIELD_LENGTH] + "..."
 
         def _user_name(user_obj: dict | None) -> str:
             return _object_text(user_obj, "displayName") or _object_text(
@@ -1028,13 +1109,16 @@ class JiraProvider:
             ("解决结果", _name(f.get("resolution")) or "未解决"),
         ]
         if f.get("versions"):
-            detail_rows.append(("影响版本", ", ".join(_name(v) for v in f["versions"])))
+            detail_rows.append(("影响版本", _inline_values(f["versions"], _name)))
         if f.get("fixVersions"):
-            detail_rows.append(("修复版本", ", ".join(_name(v) for v in f["fixVersions"])))
+            detail_rows.append(("修复版本", _inline_values(f["fixVersions"], _name)))
         if f.get("components"):
-            detail_rows.append(("组件", ", ".join(_name(c) for c in f["components"])))
+            detail_rows.append(("组件", _inline_values(f["components"], _name)))
         if f.get("labels"):
-            detail_rows.append(("标签", ", ".join(_string_list(f["labels"]))))
+            labels, omitted_labels = _bounded(_string_list(f["labels"]), _MAX_INLINE_VALUES)
+            detail_rows.append(
+                ("标签", ", ".join(labels) + (f" (+{omitted_labels})" if omitted_labels else ""))
+            )
 
         lines += ["**问题详情**", ""]
         lines += ["| 字段 | 值 |", "|---|---|"]
@@ -1091,6 +1175,7 @@ class JiraProvider:
         # ── issue links ──
         links = f.get("issuelinks", []) if isinstance(f.get("issuelinks", []), list) else []
         if links:
+            links, omitted_links = _bounded(links, _MAX_LIST_ITEMS)
             lines += ["", "**关联任务：**", ""]
             for link in links:
                 if not isinstance(link, dict):
@@ -1122,10 +1207,13 @@ class JiraProvider:
                         f"{lf.get('summary', '')} "
                         f"({_object_text(lf.get('status'), 'name')})"
                     )
+            if omitted_links:
+                lines.append(f"- （另有 {omitted_links} 条关联未显示）")
 
         # ── subtasks ──
         subtasks = f.get("subtasks", []) if isinstance(f.get("subtasks", []), list) else []
         if subtasks:
+            subtasks, omitted_subtasks = _bounded(subtasks, _MAX_LIST_ITEMS)
             lines += ["", "**子任务：**", ""]
             for st in subtasks:
                 if not isinstance(st, dict):
@@ -1135,10 +1223,13 @@ class JiraProvider:
                     f"- {st.get('key', '')} {sf.get('summary', '')} "
                     f"({_object_text(sf.get('status'), 'name')})"
                 )
+            if omitted_subtasks:
+                lines.append(f"- （另有 {omitted_subtasks} 个子任务未显示）")
 
         # ── attachments ──
         attachments = f.get("attachment", []) if isinstance(f.get("attachment", []), list) else []
         if attachments:
+            attachments, omitted_attachments = _bounded(attachments, _MAX_LIST_ITEMS)
             lines += ["", "**附件：**", ""]
             for att in attachments:
                 if not isinstance(att, dict):
@@ -1154,6 +1245,8 @@ class JiraProvider:
                     f"by {author} - {att.get('created', '')} "
                     f"[ID: {att_id}]"
                 )
+            if omitted_attachments:
+                lines.append(f"- （另有 {omitted_attachments} 个附件未显示，可用 ID 单独读取）")
 
         # ── 其他信息 (remaining custom fields) ──
         skip_fields = {
@@ -1180,7 +1273,7 @@ class JiraProvider:
             if omitted > 0:
                 lines += ["", f"（另有 {omitted} 个自定义字段未显示）"]
 
-        return "\n".join(lines)
+        return "\n".join(_truncate_to_budget(lines, _MAX_ISSUE_CHARS))
 
     # ── workflow transitions ──────────────────────────────────────
 
@@ -1838,17 +1931,7 @@ class JiraProvider:
         try:
             chunks: list[bytes] = []
             downloaded_size = 0
-            client = self._get_client()
-            with client.stream("GET", download_url) as download_resp:
-                try:
-                    download_resp.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    # A streamed error response has no buffered body yet, and
-                    # _http_error_message needs one to extract Jira's message.
-                    exc.response.read()
-                    if exc.response.status_code == 401:
-                        self._invalidate_client(client)
-                    raise
+            with self._stream("GET", download_url) as download_resp:
                 for chunk in download_resp.iter_bytes(chunk_size=8192):
                     downloaded_size += len(chunk)
                     if downloaded_size > config.max_attachment_size:

@@ -24,11 +24,42 @@ _TEXT_MIME_TYPES = {
 
 # JIRA_MAX_ATTACHMENT_SIZE bounds the download; this bounds what one tool call
 # returns inline, since the download limit alone permits megabytes of text.
-MAX_INLINE_TEXT_CHARS = 200_000
+#
+# The budget is in UTF-8 bytes rather than characters because a character limit
+# costs roughly four times as many tokens for CJK text as for ASCII, so the same
+# nominal cap would blow the context budget on Chinese attachments.
+MAX_INLINE_TEXT_BYTES = 200_000
 
 
 def _is_text_mime(mime_type: str) -> bool:
     return mime_type.startswith("text/") or mime_type in _TEXT_MIME_TYPES
+
+
+def _trim_to_character_boundary(content: bytes, limit: int) -> bytes:
+    """Cut ``content`` to at most ``limit`` bytes without splitting a character.
+
+    Slicing mid-sequence would decode to U+FFFD, which re-encodes to three bytes
+    and could push the payload back over the limit.
+    """
+
+    cut = content[:limit]
+    # A UTF-8 continuation byte is 0b10xxxxxx; back up to the sequence start.
+    end = len(cut)
+    while end > 0 and cut[end - 1] & 0xC0 == 0x80:
+        end -= 1
+    if end == 0:
+        return cut
+    lead = cut[end - 1]
+    if lead & 0x80 == 0:
+        expected = 1
+    elif lead & 0xE0 == 0xC0:
+        expected = 2
+    elif lead & 0xF0 == 0xE0:
+        expected = 3
+    else:
+        expected = 4
+    # Keep the final character only when all of its bytes survived the cut.
+    return cut if len(cut) - (end - 1) == expected else cut[: end - 1]
 
 
 def register(mcp: MCPServer, default_provider: str = "jira", provider: JiraProvider | None = None) -> None:
@@ -87,11 +118,11 @@ def register(mcp: MCPServer, default_provider: str = "jira", provider: JiraProvi
                 ImageContent(data=base64.b64encode(content).decode("ascii"), mimeType=mime_type),
             ]
         if _is_text_mime(mime_type):
-            text = content.decode("utf-8", errors="replace")
-            payload["truncated"] = len(text) > MAX_INLINE_TEXT_CHARS
-            if payload["truncated"]:
-                text = text[:MAX_INLINE_TEXT_CHARS]
-            payload["content"] = text
+            truncated = len(content) > MAX_INLINE_TEXT_BYTES
+            if truncated:
+                content = _trim_to_character_boundary(content, MAX_INLINE_TEXT_BYTES)
+            payload["truncated"] = truncated
+            payload["content"] = content.decode("utf-8", errors="replace")
             return json.dumps(payload, ensure_ascii=False)
 
         payload["readable"] = False

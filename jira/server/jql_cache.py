@@ -9,8 +9,9 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +19,17 @@ from server.config import JiraConfig
 
 LOGGER = logging.getLogger(__name__)
 CACHE_SCHEMA_VERSION = 1
+# Upper bound on how long a stat-only fast path may hide a marker change on
+# mounts where (inode, mtime, size) is not a reliable identity.
+_MARKER_RECHECK_INTERVAL = 30.0
+
+
+@dataclass(slots=True)
+class _EntryLock:
+    """One cache entry's loader lock plus its active-holder count."""
+
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    waiters: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,24 +57,43 @@ class JsonJqlCache:
         self._instance_key = hashlib.sha256(identity).hexdigest()[:20]
         self._memory: dict[str, dict] = {}
         self._lock = threading.RLock()
-        self._entry_locks: dict[str, threading.RLock] = {}
+        self._entry_locks: dict[str, _EntryLock] = {}
         self._marker_fingerprint: tuple[int, int, int] | None = None
         self._marker_value: dict | None = None
+        self._marker_checked_at = float("-inf")
 
-    def _entry_lock(self, cache_id: str) -> threading.RLock:
-        """Return the per-entry lock that serializes one snapshot's loader.
+    @contextmanager
+    def _entry_lock(self, cache_id: str) -> Iterator[None]:
+        """Serialize one snapshot's loader, coalescing concurrent callers.
 
         Loaders perform Jira HTTP calls, so holding a single global lock across
         them would make an in-flight field refresh block every unrelated value
         lookup. Coalescing stays per cache entry, which is where it matters.
+
+        The lock is reference counted and reclaimed only once no caller holds
+        it. Dropping it while a loader is still running would hand the next
+        caller a *different* lock for the same entry, which reintroduces both
+        duplicate upstream requests and a last-writer-wins race where a slow
+        stale response overwrites a newer one.
         """
 
         with self._lock:
-            lock = self._entry_locks.get(cache_id)
-            if lock is None:
-                lock = threading.RLock()
-                self._entry_locks[cache_id] = lock
-            return lock
+            entry = self._entry_locks.get(cache_id)
+            if entry is None:
+                entry = _EntryLock()
+                self._entry_locks[cache_id] = entry
+            entry.waiters += 1
+            lock = entry.lock
+        try:
+            with lock:
+                yield
+        finally:
+            with self._lock:
+                entry.waiters -= 1
+                # Reclaim only when nobody else is waiting on or holding it, and
+                # only if this is still the lock registered for the entry.
+                if entry.waiters <= 0 and self._entry_locks.get(cache_id) is entry:
+                    del self._entry_locks[cache_id]
 
     def get_fields(self, loader: Callable[[], dict], *, refresh: bool = False) -> CacheResult:
         with self._entry_lock("fields"):
@@ -102,6 +133,7 @@ class JsonJqlCache:
             self._memory["__invalidated__"] = {"invalidated_at": invalidated_at}
             self._marker_fingerprint = None
             self._marker_value = None
+            self._marker_checked_at = float("-inf")
             if self._config.jql_disk_cache_enabled:
                 self._write_json(self._invalidation_path(), {"invalidated_at": invalidated_at})
 
@@ -166,10 +198,9 @@ class JsonJqlCache:
         overflow = len(value_keys) - self._config.jql_value_cache_max_entries
         for key in value_keys[: max(0, overflow)]:
             self._memory.pop(key, None)
-            # Keep the lock table bounded alongside the snapshots it guards. A
-            # concurrent holder keeps its own reference, so dropping the entry
-            # only means the next caller allocates a fresh lock.
-            self._entry_locks.pop(key, None)
+            # Entry locks are deliberately left alone: they are reclaimed by
+            # _entry_lock once their last holder releases, so evicting a
+            # snapshot never splits an in-flight load across two locks.
 
     def _prune_value_files(self, directory: Path, *, keep: Path) -> None:
         """Keep the newest value snapshots, always retaining the one just written.
@@ -220,8 +251,13 @@ class JsonJqlCache:
 
         This runs on every cache hit, so it stats the marker and reuses the
         previous parse while the file's identity is unchanged. Another process
-        writes the marker via ``os.replace``, which always yields a new
-        (inode, mtime, size) triple, so a real invalidation is never missed.
+        writes the marker via ``os.replace``, which yields a new
+        (inode, mtime, size) triple on a local filesystem.
+
+        That fingerprint is a fast path, not a guarantee: network and FUSE
+        mounts can recycle inodes or report coarse timestamps. The parse is
+        therefore forced every ``_MARKER_RECHECK_INTERVAL`` seconds so a missed
+        change self-corrects instead of persisting for the snapshot's lifetime.
         """
 
         path = self._invalidation_path()
@@ -230,13 +266,16 @@ class JsonJqlCache:
             fingerprint = (status.st_ino, status.st_mtime_ns, status.st_size)
         except OSError:
             fingerprint = None
+        now = self._clock()
         with self._lock:
-            if fingerprint is not None and fingerprint == self._marker_fingerprint:
+            fresh_enough = now - self._marker_checked_at < _MARKER_RECHECK_INTERVAL
+            if fingerprint is not None and fingerprint == self._marker_fingerprint and fresh_enough:
                 return self._marker_value
         value = self._read_json(path) if fingerprint is not None else None
         with self._lock:
             self._marker_fingerprint = fingerprint
             self._marker_value = value
+            self._marker_checked_at = now
         return value
 
     def _read_snapshot(self, path: Path) -> dict | None:

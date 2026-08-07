@@ -5,9 +5,10 @@ import base64
 import json
 from unittest.mock import MagicMock
 
+import pytest
 from mcp.types import ImageContent
 from server.providers import register
-from server.tools.get_attachment import MAX_INLINE_TEXT_CHARS
+from server.tools.get_attachment import MAX_INLINE_TEXT_BYTES, _trim_to_character_boundary
 from server.tools.get_attachment import register as register_tool
 
 
@@ -77,7 +78,7 @@ def test_attachment_bounds_inline_text() -> None:
 
     class LargeTextProvider:
         def get_attachment(self, attachment_id: str, **kwargs) -> str:
-            body = b"x" * (MAX_INLINE_TEXT_CHARS + 500)
+            body = b"x" * (MAX_INLINE_TEXT_BYTES + 500)
             return json.dumps({
                 "id": attachment_id,
                 "filename": "big.log",
@@ -90,7 +91,43 @@ def test_attachment_bounds_inline_text() -> None:
     data = json.loads(get_func("large")("10001"))
 
     assert data["truncated"] is True
-    assert len(data["content"]) == MAX_INLINE_TEXT_CHARS
+    assert len(data["content"]) == MAX_INLINE_TEXT_BYTES
+
+
+def test_attachment_budget_is_measured_in_bytes_not_characters() -> None:
+    """CJK text costs ~4x the tokens per character, so the cap counts UTF-8 bytes."""
+
+    class ChineseTextProvider:
+        def get_attachment(self, attachment_id: str, **kwargs) -> str:
+            body = "测试内容".encode() * (MAX_INLINE_TEXT_BYTES // 12 + 100)
+            return json.dumps({
+                "id": attachment_id,
+                "filename": "big.txt",
+                "size": len(body),
+                "mime_type": "text/plain",
+                "content_base64": base64.b64encode(body).decode("ascii"),
+            })
+
+    register("chinese", ChineseTextProvider())
+    data = json.loads(get_func("chinese")("10001"))
+
+    assert data["truncated"] is True
+    # A character-based cap would have returned ~4x this many bytes.
+    assert len(data["content"].encode()) <= MAX_INLINE_TEXT_BYTES
+    assert "测试" in data["content"]
+    assert "�" not in data["content"]  # no character split at the boundary
+
+
+@pytest.mark.parametrize(
+    "text", ["abcdef", "中文中文", "ééééé", "😀😀😀"], ids=["ascii", "cjk", "latin1", "emoji"]
+)
+def test_byte_trim_never_splits_a_character(text: str) -> None:
+    """Every cut point yields strictly decodable UTF-8, for 1- to 4-byte characters."""
+    encoded = text.encode()
+    for limit in range(1, len(encoded) + 1):
+        trimmed = _trim_to_character_boundary(encoded, limit)
+        assert len(trimmed) <= limit
+        trimmed.decode("utf-8")  # strict: raises if a sequence was cut
 
 
 def test_attachment_marks_small_text_as_complete() -> None:

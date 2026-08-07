@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from server.config import JiraConfig
-from server.jql_cache import JsonJqlCache
+from server.jql_cache import _MARKER_RECHECK_INTERVAL, JsonJqlCache
 
 
 class Clock:
@@ -185,6 +185,60 @@ def test_corrupt_snapshot_is_ignored(tmp_path) -> None:
     assert result.data["version"] == 2
 
 
+def test_eviction_does_not_split_an_inflight_load_across_two_locks(tmp_path) -> None:
+    """Trimming a snapshot must not let a second caller load the same entry.
+
+    Reclaiming an entry lock while its loader is still running would hand the
+    next caller a different lock, producing a duplicate upstream request and
+    letting the slower stale response overwrite the newer one.
+    """
+
+    cache = JsonJqlCache(
+        config(tmp_path, jql_value_cache_max_entries=1, jql_value_refresh_interval=0),
+        clock=Clock(),
+    )
+    cache.get_values("status", "a", lambda: {"suggestions": ["v1"]})
+
+    inflight = threading.Event()
+    release = threading.Event()
+    concurrent: list[int] = []
+
+    def slow_stale() -> dict:
+        inflight.set()
+        release.wait(3)
+        return {"suggestions": ["stale"]}
+
+    first = threading.Thread(target=lambda: cache.get_values("status", "a", slow_stale))
+    first.start()
+    assert inflight.wait(1.0)
+
+    # Writing another key trims the value cache while "a" is still loading.
+    cache.get_values("status", "b", lambda: {"suggestions": ["b"]})
+
+    def competing() -> dict:
+        concurrent.append(1)
+        return {"suggestions": ["fresh"]}
+
+    second = threading.Thread(target=lambda: cache.get_values("status", "a", competing))
+    second.start()
+    time.sleep(0.3)
+    assert concurrent == []  # serialized behind the same lock, not run in parallel
+
+    release.set()
+    first.join()
+    second.join()
+    assert cache._entry_locks == {}  # reclaimed once the last holder released
+
+
+def test_entry_locks_do_not_leak_across_many_queries(tmp_path) -> None:
+    """Reference-counted locks are reclaimed instead of growing without bound."""
+    cache = JsonJqlCache(config(tmp_path, jql_value_cache_max_entries=500), clock=Clock())
+    for index in range(50):
+        cache.get_values("status", f"q{index}", lambda i=index: {"suggestions": [str(i)]})
+
+    assert cache._entry_locks == {}
+
+
 def test_unrelated_entries_do_not_block_each_other(tmp_path) -> None:
     """A slow field refresh must not serialize unrelated value lookups."""
     cache = JsonJqlCache(config(tmp_path))
@@ -224,6 +278,36 @@ def test_warm_hits_do_not_reread_the_invalidation_marker(tmp_path) -> None:
             cache.get_fields(lambda: pytest.fail("memory cache should be used"))
 
     assert reads == []
+
+
+def test_marker_is_reparsed_periodically_when_stat_cannot_be_trusted(tmp_path) -> None:
+    """A mount that reuses (inode, mtime, size) must not hide an invalidation forever."""
+    clock = Clock()
+    # A long refresh interval isolates the marker path: age alone never triggers.
+    cache = JsonJqlCache(config(tmp_path, jql_field_refresh_interval=10_000), clock=clock)
+    marker = cache._invalidation_path()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"invalidated_at": 0}), encoding="utf-8")
+
+    cache.get_fields(lambda: {"version": 1})
+    # The cold load has no snapshot to serve, so it never consults the marker.
+    # One warm hit primes the stat fingerprint that the fast path compares against.
+    cache.get_fields(lambda: pytest.fail("snapshot should already be cached"))
+
+    # Rewrite the marker in place, keeping stat's answer identical — what an
+    # inode-recycling mount with coarse timestamps reports.
+    frozen = os.stat_result(list(marker.stat()), {"st_mtime_ns": marker.stat().st_mtime_ns})
+    marker.write_text(json.dumps({"invalidated_at": clock.value + 5}), encoding="utf-8")
+
+    with patch.object(Path, "stat", lambda self, **kwargs: frozen):
+        cached = cache.get_fields(lambda: pytest.fail("stat fast path should hold"))
+        assert cached.data["version"] == 1
+
+        # Past the recheck interval the parse is forced and the change lands.
+        clock.value += _MARKER_RECHECK_INTERVAL + 1
+        refreshed = cache.get_fields(lambda: {"version": 2})
+
+    assert refreshed.data["version"] == 2
 
 
 def test_marker_written_by_another_process_is_still_observed(tmp_path) -> None:
