@@ -1,11 +1,13 @@
 """Tests for controlled Jira output paths."""
 
+import errno
 import threading
 import time
 from unittest.mock import patch
 
 import pytest
 
+from server import files
 from server.config import JiraConfig
 from server.files import OutputPathError, commit_output_file, resolve_output_path
 
@@ -94,18 +96,98 @@ def test_hard_link_fallback_never_exposes_a_partial_file(tmp_path) -> None:
     assert list(tmp_path.glob(".*.claim")) == []
 
 
-def test_hard_link_fallback_rejects_a_concurrent_publish(tmp_path) -> None:
-    """Two exports racing for one path cannot interleave their writes."""
+def test_hard_link_fallback_survives_a_crashed_previous_publish(tmp_path) -> None:
+    """A publish killed mid-write must not wedge every later export.
+
+    A fixed staging name would still be on disk after the crash and block the
+    retry forever, so the staging name has to be unique per attempt.
+    """
+
+    destination = tmp_path / "destination"
+    config = JiraConfig(output_dir=tmp_path)
+    crashed = tmp_path / "crashed"
+    crashed.write_text("interrupted", encoding="utf-8")
+
+    # Kill the first publish after it has created its staging file but before it
+    # can move that file into place, leaving whatever residue it had created.
+    with (
+        patch("server.files.os.link", side_effect=OSError(95, "Operation not supported")),
+        patch("server.files.shutil.copyfileobj", side_effect=KeyboardInterrupt),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            commit_output_file(crashed, destination, config)
+
+    retry = tmp_path / "retry"
+    retry.write_text("new", encoding="utf-8")
+    with patch("server.files.os.link", side_effect=OSError(95, "Operation not supported")):
+        commit_output_file(retry, destination, config)
+
+    assert destination.read_text(encoding="utf-8") == "new"
+
+
+def test_concurrent_publishes_produce_exactly_one_winner(tmp_path) -> None:
+    """Racing exports to one path: one succeeds, the rest refuse, nothing is mixed."""
+    destination = tmp_path / "destination"
+    outcomes: list[str] = []
+    lock = threading.Lock()
+
+    def publish(index: int) -> None:
+        temporary = tmp_path / f"temporary-{index}"
+        temporary.write_text(f"writer-{index}", encoding="utf-8")
+        try:
+            with patch("server.files.os.link", side_effect=OSError(95, "not supported")):
+                commit_output_file(temporary, destination, JiraConfig(output_dir=tmp_path))
+            result = f"{index}:ok"
+        except OutputPathError:
+            result = f"{index}:refused"
+        with lock:
+            outcomes.append(result)
+
+    threads = [threading.Thread(target=publish, args=(index,)) for index in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    winners = [item for item in outcomes if item.endswith(":ok")]
+    assert len(winners) == 1
+    assert destination.read_text(encoding="utf-8") == f"writer-{winners[0].split(':')[0]}"
+    assert list(tmp_path.glob(".*.publish")) == []
+
+
+@pytest.mark.skipif(
+    files._RENAME_NOREPLACE_IMPL is None, reason="renameat2 is unavailable on this platform"
+)
+def test_atomic_no_replace_rejects_an_existing_destination(tmp_path) -> None:
+    """renameat2(RENAME_NOREPLACE) closes the check-then-rename window."""
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_text("new", encoding="utf-8")
+    destination.write_text("existing", encoding="utf-8")
+
+    with pytest.raises(OSError) as caught:
+        files._RENAME_NOREPLACE_IMPL(source, destination)
+
+    assert caught.value.errno == errno.EEXIST
+    assert destination.read_text(encoding="utf-8") == "existing"
+
+
+def test_fallback_rename_path_still_refuses_to_overwrite(tmp_path) -> None:
+    """Platforms without renameat2 keep the no-overwrite guarantee."""
     temporary = tmp_path / "temporary"
     destination = tmp_path / "destination"
     temporary.write_text("new", encoding="utf-8")
-    (tmp_path / f".{destination.name}.claim").write_text("in progress", encoding="utf-8")
+    destination.write_text("existing", encoding="utf-8")
 
-    with patch("server.files.os.link", side_effect=OSError(95, "Operation not supported")):
-        with pytest.raises(OutputPathError, match="already writing"):
+    with (
+        patch("server.files.os.link", side_effect=OSError(95, "Operation not supported")),
+        patch("server.files._RENAME_NOREPLACE_IMPL", None),
+    ):
+        with pytest.raises(OutputPathError, match="already exists"):
             commit_output_file(temporary, destination, JiraConfig(output_dir=tmp_path))
 
-    assert not destination.exists()
+    assert destination.read_text(encoding="utf-8") == "existing"
+    assert list(tmp_path.glob(".*.publish")) == []
 
 
 def test_hard_link_fallback_still_refuses_to_overwrite(tmp_path) -> None:

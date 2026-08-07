@@ -21,6 +21,7 @@ from server.providers.jira import (
     _MAX_OTHER_FIELD_ROWS,
     _MAX_SEARCH_RESULTS,
     JiraProvider,
+    _render_within_budget,
 )
 
 # ---------------------------------------------------------------------------
@@ -409,6 +410,31 @@ def test_get_issue_bounds_every_unbounded_section() -> None:
     assert f"(+{count - _MAX_INLINE_VALUES})" in result  # capped multi-value fields
     assert result.count("S") < 5000  # summary truncated in the heading
     provider.close()
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        ["x" * 100] * 600,
+        ["y" * (_MAX_ISSUE_CHARS - 11), "z" * 100],  # overflows just past the limit
+        ["q" * (_MAX_ISSUE_CHARS * 3)],  # one line larger than the whole budget
+        ["a" * (_MAX_ISSUE_CHARS - 1)],  # exactly at the limit
+        [],
+    ],
+    ids=["many-lines", "near-boundary", "single-oversized", "exact-fit", "empty"],
+)
+def test_issue_budget_is_never_exceeded(lines: list[str]) -> None:
+    """The truncation notice counts against the budget instead of overflowing it."""
+    rendered = _render_within_budget(lines, _MAX_ISSUE_CHARS)
+    assert len(rendered) <= _MAX_ISSUE_CHARS
+
+
+def test_issue_budget_keeps_the_head_of_an_oversized_line() -> None:
+    """An overflowing line is cut, not dropped, so its content still shows."""
+    rendered = _render_within_budget(["HEAD" + "q" * (_MAX_ISSUE_CHARS * 2)], _MAX_ISSUE_CHARS)
+    assert rendered.startswith("HEAD")
+    assert "已截断" in rendered
+    assert len(rendered) <= _MAX_ISSUE_CHARS
 
 
 def test_get_issue_escapes_table_breaking_field_values() -> None:

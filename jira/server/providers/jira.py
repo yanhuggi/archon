@@ -133,15 +133,33 @@ def _inline_values(values: object, render: Callable[[object], str]) -> str:
     return f"{text} (+{omitted})" if omitted else text
 
 
-def _truncate_to_budget(lines: list[str], limit: int) -> list[str]:
-    """Drop trailing lines once the rendered issue would exceed ``limit`` chars."""
+def _render_within_budget(lines: list[str], limit: int) -> str:
+    """Join ``lines`` into at most ``limit`` characters.
 
+    The truncation notice is counted against the budget rather than appended
+    after it, so the returned string is never longer than ``limit``.
+    """
+
+    notice = f"（内容超出 {limit} 字符上限，已截断）"
+    rendered = "\n".join(lines)
+    if len(rendered) <= limit:
+        return rendered
+
+    # Reserve room for the blank separator line and the notice itself.
+    budget = max(limit - len(notice) - 2, 0)
     total = 0
-    for index, line in enumerate(lines):
+    kept: list[str] = []
+    for line in lines:
+        remaining = budget - total
+        if len(line) + 1 > remaining:
+            # Keep the head of the overflowing line rather than dropping it, so a
+            # single long section still contributes what fits.
+            if remaining > 0:
+                kept.append(line[:remaining])
+            break
+        kept.append(line)
         total += len(line) + 1
-        if total > limit:
-            return [*lines[:index], "", f"（内容超出 {limit} 字符上限，已截断）"]
-    return lines
+    return "\n".join([*kept, "", notice])[:limit]
 
 
 def _normalize_comment(comment: dict, fallback_body: str = "") -> dict:
@@ -1273,7 +1291,7 @@ class JiraProvider:
             if omitted > 0:
                 lines += ["", f"（另有 {omitted} 个自定义字段未显示）"]
 
-        return "\n".join(_truncate_to_budget(lines, _MAX_ISSUE_CHARS))
+        return _render_within_budget(lines, _MAX_ISSUE_CHARS)
 
     # ── workflow transitions ──────────────────────────────────────
 

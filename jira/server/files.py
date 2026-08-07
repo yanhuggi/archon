@@ -2,15 +2,63 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
+import logging
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 from server.config import JiraConfig
 
+LOGGER = logging.getLogger(__name__)
+
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+
 
 class OutputPathError(ValueError):
     """Raised when a requested local output path is unsafe."""
+
+
+def _load_rename_noreplace():
+    """Return a ``renameat2(RENAME_NOREPLACE)`` callable, or None if unavailable.
+
+    This is the only primitive that both creates the destination and refuses to
+    replace it in a single syscall. It needs Linux 3.15+ and filesystem support,
+    so callers must keep a fallback.
+    """
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        syscall = libc.renameat2
+    except (AttributeError, OSError):
+        return None
+    syscall.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    syscall.restype = ctypes.c_int
+
+    def rename_noreplace(source: Path, destination: Path) -> None:
+        ctypes.set_errno(0)
+        if syscall(
+            _AT_FDCWD,
+            os.fsencode(source),
+            _AT_FDCWD,
+            os.fsencode(destination),
+            _RENAME_NOREPLACE,
+        ):
+            raise OSError(ctypes.get_errno(), "renameat2 failed", str(destination))
+
+    return rename_noreplace
+
+
+_RENAME_NOREPLACE_IMPL = _load_rename_noreplace()
 
 
 def resolve_output_path(
@@ -69,20 +117,24 @@ def commit_output_file(temporary_path: Path, destination: Path, config: JiraConf
 def _publish_without_hard_link(temporary_path: Path, destination: Path) -> None:
     """Publish atomically on mounts that reject hard links.
 
-    A plain copy into the destination would make a partially written file
-    visible to readers, so the content goes to a sibling claim file first and is
-    then moved into place with a single ``os.rename``. ``O_EXCL`` on the claim
-    keeps the create-if-absent guarantee: whoever creates it owns the publish,
-    and the final rename only ever exposes a complete file.
+    Copying straight into the destination would expose a partially written file,
+    so content lands in a uniquely named sibling and is then moved into place.
+    The staging name is unique per attempt: a fixed name would survive a crash
+    and permanently block later exports.
+
+    ``renameat2(RENAME_NOREPLACE)`` performs the move without replacing an
+    existing destination. Where it is unavailable, a plain ``os.rename`` is used
+    after an existence check, which leaves a small window in which a racing
+    writer's file could be replaced. That is unavoidable without the syscall,
+    and it is narrower than the fully non-atomic copy it replaces.
     """
 
-    claim = destination.with_name(f".{destination.name}.claim")
+    staging: Path | None = None
     try:
-        descriptor = os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError as exc:
-        raise OutputPathError(
-            f"Another export is already writing {destination}; retry once it finishes."
-        ) from exc
+        descriptor, name = tempfile.mkstemp(
+            prefix=f".{destination.name}-", suffix=".publish", dir=destination.parent
+        )
+        staging = Path(name)
     except OSError as exc:
         raise OutputPathError(f"Could not write output file {destination}: {exc}") from exc
 
@@ -91,14 +143,26 @@ def _publish_without_hard_link(temporary_path: Path, destination: Path) -> None:
             shutil.copyfileobj(source, handle)
             handle.flush()
             os.fsync(handle.fileno())
-        # Re-check late: without hard links there is no single syscall that both
-        # creates the destination and copies into it.
+
+        if _RENAME_NOREPLACE_IMPL is not None:
+            try:
+                _RENAME_NOREPLACE_IMPL(staging, destination)
+                return
+            except OSError as exc:
+                if exc.errno == errno.EEXIST:
+                    raise OutputPathError(f"Output file already exists: {destination}") from exc
+                if exc.errno not in {errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP}:
+                    raise
+                LOGGER.debug(
+                    "renameat2 unsupported for %s; falling back to rename", destination
+                )
+
         if destination.exists():
             raise OutputPathError(f"Output file already exists: {destination}")
-        os.rename(claim, destination)
+        os.rename(staging, destination)
     except OutputPathError:
-        claim.unlink(missing_ok=True)
+        staging.unlink(missing_ok=True)
         raise
     except OSError as exc:
-        claim.unlink(missing_ok=True)
+        staging.unlink(missing_ok=True)
         raise OutputPathError(f"Could not write output file {destination}: {exc}") from exc
