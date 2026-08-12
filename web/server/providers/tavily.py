@@ -96,7 +96,6 @@ class TavilyProvider:
             return _error_response(normalized_query, "TAVILY_API_KEY is not configured", "missing_api_key")
 
         payload: dict[str, object] = {
-            "api_key": api_key,
             "query": normalized_query,
             "search_depth": config.tavily_search_depth,
             "topic": config.tavily_topic,
@@ -110,16 +109,31 @@ class TavilyProvider:
         request = Request(
             TAVILY_SEARCH_URL,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "User-Agent": "archon-web/0.1"},
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "archon-web/0.1",
+            },
             method="POST",
         )
         try:
             with urlopen(request, timeout=config.timeout) as response:
                 body = response.read().decode("utf-8")
             data = json.loads(body)
-            if not isinstance(data, Mapping):
-                return _error_response(normalized_query, "Tavily returned invalid JSON", "invalid_provider_response")
-            results = _format_results(data.get("results"), limit)
+            if not isinstance(data, Mapping) or not isinstance(data.get("results"), list):
+                return _error_response(
+                    normalized_query,
+                    "Tavily response must contain a results array",
+                    "invalid_provider_response",
+                )
+            raw_results = data["results"]
+            results = _format_results(raw_results, limit)
+            if raw_results and not results:
+                return _error_response(
+                    normalized_query,
+                    "Tavily response contains no valid search results",
+                    "invalid_provider_response",
+                )
             return json.dumps({"query": normalized_query, "results": results, "result_count": len(results)}, ensure_ascii=False)
         except HTTPError as exc:
             code = "rate_limited" if exc.code == 429 else "upstream_error"

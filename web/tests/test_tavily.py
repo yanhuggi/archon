@@ -47,7 +47,8 @@ def test_search_posts_tavily_payload_and_normalizes_results() -> None:
 
     request = opener.call_args.args[0]
     payload = json.loads(request.data)
-    assert payload["api_key"] == "tvly-test"
+    assert request.get_header("Authorization") == "Bearer tvly-test"
+    assert "api_key" not in payload
     assert payload["query"] == "python news"
     assert payload["search_depth"] == "advanced"
     assert payload["topic"] == "news"
@@ -76,3 +77,51 @@ def test_rate_limit_and_invalid_response_have_specific_codes() -> None:
 
     with patch("server.providers.tavily.urlopen", return_value=InvalidResponse()):
         assert json.loads(provider.search("python"))["error_code"] == "invalid_provider_response"
+
+
+def test_malformed_success_responses_are_not_empty_results() -> None:
+    provider = TavilyProvider(WebConfig(tavily_api_key="tvly-test"))
+
+    class Response:
+        def __init__(self, body: object) -> None:
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps(self.body).encode()
+
+    for body in ({}, {"error": "invalid key"}, {"results": {}}):
+        with patch("server.providers.tavily.urlopen", return_value=Response(body)):
+            data = json.loads(provider.search("python"))
+        assert data["error_code"] == "invalid_provider_response"
+
+
+def test_nonempty_results_with_no_valid_web_result_are_not_empty_results() -> None:
+    provider = TavilyProvider(WebConfig(tavily_api_key="tvly-test"))
+
+    class Response:
+        def __init__(self, body: object) -> None:
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps(self.body).encode()
+
+    for results in ([1, 2], [{}], [{"url": "javascript:alert(1)"}]):
+        with patch("server.providers.tavily.urlopen", return_value=Response({"results": results})):
+            data = json.loads(provider.search("python"))
+        assert data["error_code"] == "invalid_provider_response"
+
+    with patch("server.providers.tavily.urlopen", return_value=Response({"results": []})):
+        data = json.loads(provider.search("python"))
+    assert data == {"query": "python", "results": [], "result_count": 0}
