@@ -355,6 +355,7 @@ def test_sends_correct_request(provider: MimoVisionProvider,
 
     # Auth header
     assert call_kwargs["headers"]["api-key"] == "my-secret-key"
+    assert call_kwargs["headers"]["Authorization"] == "Bearer my-secret-key"
     assert call_kwargs["headers"]["Content-Type"] == "application/json"
 
     # Request body
@@ -394,6 +395,24 @@ def test_custom_api_url(provider: MimoVisionProvider,
 
             req_url = mock_client.post.call_args[0][0]
     assert req_url == expected_url
+
+
+def test_opencode_zen_plan_url_gets_v1_prefix(provider: MimoVisionProvider,
+                                              mimo_api_response: dict) -> None:
+    """OpenCode Zen plan shortcuts resolve to their OpenAI-compatible API root."""
+    with patch.dict("os.environ", {
+        "MIMO_API_KEY": "test-key",
+        "MIMO_BASE_URL": "https://opencode.ai/zen/go",
+    }):
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client = mock_client_cls.return_value
+            mock_client.post.return_value.status_code = 200
+            mock_client.post.return_value.json.return_value = mimo_api_response
+
+            provider.understand("https://example.com/img.jpg")
+
+            req_url = mock_client.post.call_args[0][0]
+    assert req_url == "https://opencode.ai/zen/go/v1/chat/completions"
 
 
 def test_custom_model_env(provider: MimoVisionProvider,

@@ -40,6 +40,11 @@ def test_invalid_values_fall_back_or_clamp(monkeypatch) -> None:
     assert config.transport == "stdio"
 
 
+def test_opencode_zen_plan_base_url_is_normalized(monkeypatch) -> None:
+    monkeypatch.setenv("MIMO_BASE_URL", "https://opencode.ai/zen/go/")
+    assert VisionConfig.from_env().base_url == "https://opencode.ai/zen/go/v1"
+
+
 def test_non_finite_timeout_uses_default(monkeypatch) -> None:
     monkeypatch.setenv("MIMO_TIMEOUT", "nan")
     assert VisionConfig.from_env().timeout == 120

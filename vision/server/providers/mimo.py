@@ -315,6 +315,9 @@ class MimoVisionProvider:
                 self._api_url(config),
                 headers={
                     "api-key": config.api_key,
+                    # OpenCode Zen uses the standard OpenAI bearer convention.
+                    # Keep api-key for the native MiMo endpoint.
+                    "Authorization": f"Bearer {config.api_key}",
                     "Accept": "application/json",
                     "Content-Type": "application/json",
                 },

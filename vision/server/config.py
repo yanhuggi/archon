@@ -87,6 +87,18 @@ def _read_path(name: str, default: str) -> str:
     return value if value.startswith("/") else f"/{value}"
 
 
+def _normalize_base_url(value: str) -> str:
+    """Normalize provider roots, including OpenCode Zen's plan shortcut."""
+
+    value = value.strip().rstrip("/")
+    parsed = urlparse(value)
+    # OpenCode documents plan URLs such as /zen/go, while its OpenAI
+    # compatible API is mounted below /v1.
+    if parsed.hostname == "opencode.ai" and parsed.path.startswith("/zen/") and not parsed.path.endswith("/v1"):
+        value += "/v1"
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class VisionConfig:
     """Configuration shared by the MCP server and MiMo provider."""
@@ -116,7 +128,7 @@ class VisionConfig:
     @classmethod
     def from_env(cls) -> "VisionConfig":
         api_key = os.environ.get("MIMO_API_KEY", "").strip() or None
-        base_url = os.environ.get("MIMO_BASE_URL", DEFAULT_BASE_URL).strip().rstrip("/")
+        base_url = _normalize_base_url(os.environ.get("MIMO_BASE_URL", DEFAULT_BASE_URL))
         parsed_base_url = urlparse(base_url)
         if parsed_base_url.scheme not in {"http", "https"} or not parsed_base_url.netloc:
             LOGGER.warning("Invalid MIMO_BASE_URL=%r; using the default", base_url)
