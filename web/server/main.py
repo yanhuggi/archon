@@ -12,7 +12,7 @@ from mcp.server import MCPServer
 
 from server.config import SUPPORTED_TRANSPORTS, WebConfig
 from server.instructions import SERVER_INSTRUCTIONS
-from server.providers.duckduckgo import DuckDuckGoProvider
+from server.providers.tavily import TavilyProvider
 from server.tools.web_search import register as register_web_search
 
 
@@ -50,7 +50,7 @@ def create_server(config: WebConfig | None = None) -> MCPServer:
     """Create an isolated MCP server with one stable public tool."""
 
     config = config or WebConfig.from_env()
-    provider = DuckDuckGoProvider(config)
+    provider = TavilyProvider(config)
 
     server = MCPServer(
         name=SERVER_NAME,
@@ -112,10 +112,10 @@ def _config_from_args(args: argparse.Namespace, base: WebConfig) -> WebConfig:
     if not 1 <= values["port"] <= 65535:
         raise ValueError("--port must be between 1 and 65535")
     return WebConfig(
-        interval=base.interval,
         timeout=base.timeout,
-        proxy=base.proxy,
-        rate_limit_file=base.rate_limit_file,
+        tavily_api_key=base.tavily_api_key,
+        tavily_search_depth=base.tavily_search_depth,
+        tavily_topic=base.tavily_topic,
         transport=values["transport"],
         host=values["host"],
         port=values["port"],

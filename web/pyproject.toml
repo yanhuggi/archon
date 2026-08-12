@@ -1,7 +1,7 @@
 [project]
 name = "archon-web"
 version = "0.1.0"
-description = "MCP server for focused, no-key public web search"
+description = "MCP server for Tavily-powered public web search"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -11,7 +11,6 @@ dependencies = [
     # future minor release must be re-verified rather than picked up silently.
     "mcp>=2.0.0,<2.1",
     "python-dotenv>=1.0.0,<2",
-    "ddgs>=9,<10",
 ]
 
 [dependency-groups]

@@ -1,1 +1,1 @@
-"""DuckDuckGo-backed search implementation."""
+"""Search provider implementations."""

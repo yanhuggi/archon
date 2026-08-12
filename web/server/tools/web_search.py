@@ -11,7 +11,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from server.instructions import WEB_SEARCH_DESCRIPTION
-from server.providers.duckduckgo import DuckDuckGoProvider
+from server.providers.tavily import TavilyProvider
 
 
 LOGGER = logging.getLogger(__name__)
@@ -101,22 +101,22 @@ def _normalize_time_range(value: object) -> tuple[str | None, str | None]:
 
 
 def _ensure_json_response(raw: object, query: str) -> str:
-    """Keep DuckDuckGo output JSON-compatible and preserve the public contract."""
+    """Keep Tavily output JSON-compatible and preserve the public contract."""
 
     if isinstance(raw, str):
         try:
             data = json.loads(raw)
         except (TypeError, ValueError):
-            return _json_error(query, "invalid_provider_response", "DuckDuckGo returned invalid JSON")
+            return _json_error(query, "invalid_provider_response", "Tavily returned invalid JSON")
     elif isinstance(raw, dict):
         data = raw
     else:
-        return _json_error(query, "invalid_provider_response", "DuckDuckGo returned an unsupported response")
+        return _json_error(query, "invalid_provider_response", "Tavily returned an unsupported response")
 
     if not isinstance(data, dict):
-        return _json_error(query, "invalid_provider_response", "DuckDuckGo response must be a JSON object")
+        return _json_error(query, "invalid_provider_response", "Tavily response must be a JSON object")
 
-    # DuckDuckGo should return this envelope itself, but filling missing fields
+    # Tavily should return this envelope itself, but filling missing fields
     # here preserves the MCP contract if the library returns an unusual shape.
     data.setdefault("query", query)
     results = data.get("results")
@@ -194,12 +194,11 @@ def _query_is_advertised_as_required(mcp: MCPServer) -> bool:
 
 def register(
     mcp: MCPServer,
-    provider: DuckDuckGoProvider,
+    provider: TavilyProvider,
 ) -> None:
     """Register the ``web_search`` tool on an MCP server.
 
-    ``provider`` is the DuckDuckGo client bound to this server instance, so
-    concurrent servers retain their own timeout, proxy, and rate-limit settings.
+    ``provider`` is the Tavily client bound to this server instance.
     """
 
     @mcp.tool(
@@ -278,11 +277,11 @@ def register(
         try:
             raw = provider.search(normalized_query, max_results=normalized_limit, **kwargs)
         except Exception as exc:  # pragma: no cover - defensive boundary around the upstream client
-            LOGGER.exception("web_search DuckDuckGo client failed")
+            LOGGER.exception("web_search Tavily client failed")
             return _json_error(
                 normalized_query,
                 "upstream_error",
-                f"DuckDuckGo search failed: {type(exc).__name__}: {exc}",
+                f"Tavily search failed: {type(exc).__name__}: {exc}",
             )
         return _ensure_json_response(raw, normalized_query)
 

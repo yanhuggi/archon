@@ -1,71 +1,29 @@
 """Runtime configuration for the archon-web MCP server.
 
-Configuration is intentionally read from the environment at the point where it
-is used.  This keeps the DuckDuckGo client easy to exercise in tests and allows a
-long-running process to be configured through a normal ``.env`` file without
-introducing a second configuration format.
+Configuration is read from the environment at the point where it is used.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_INTERVAL = 2.0
 DEFAULT_TIMEOUT = 10
 DEFAULT_TRANSPORT = "stdio"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 DEFAULT_LOG_LEVEL = "INFO"
 
-MIN_INTERVAL = 0.0
-MAX_INTERVAL = 60.0
 MIN_TIMEOUT = 1
 MAX_TIMEOUT = 120
 
 SUPPORTED_TRANSPORTS = ("stdio", "sse", "streamable-http")
-
-
-def default_rate_limit_file() -> Path:
-    """Return a per-user state file shared by all archon-web processes."""
-
-    if os.name == "nt":
-        cache_root = os.environ.get("LOCALAPPDATA")
-        base = Path(cache_root) if cache_root else Path.home() / "AppData/Local"
-    else:
-        cache_root = os.environ.get("XDG_CACHE_HOME")
-        base = Path(cache_root) if cache_root else Path.home() / ".cache"
-    return base / "archon-web/duckduckgo-rate-limit"
-
-
-def _read_float(name: str, default: float, minimum: float, maximum: float) -> float:
-    """Read and clamp a floating-point environment value."""
-
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        logger.warning("Invalid %s=%r; using %.1f", name, raw, default)
-        return default
-
-    if value < minimum or value > maximum:
-        logger.warning(
-            "%s=%s is outside [%.1f, %.1f]; clamping",
-            name,
-            raw,
-            minimum,
-            maximum,
-        )
-        return min(max(value, minimum), maximum)
-    return value
+SUPPORTED_TAVILY_SEARCH_DEPTHS = ("basic", "advanced")
+SUPPORTED_TAVILY_TOPICS = ("general", "news", "finance")
 
 
 def _read_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -93,14 +51,24 @@ def _read_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return value
 
 
+def _read_choice(name: str, default: str, choices: tuple[str, ...]) -> str:
+    """Read a case-insensitive enum and fall back to its documented default."""
+
+    value = os.environ.get(name, default).strip().lower() or default
+    if value not in choices:
+        logger.warning("Unsupported %s=%r; using %s", name, value, default)
+        return default
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class WebConfig:
-    """Validated settings used by the server and DuckDuckGo provider."""
+    """Validated settings used by the server and Tavily provider."""
 
-    interval: float = DEFAULT_INTERVAL
     timeout: int = DEFAULT_TIMEOUT
-    proxy: str | None = None
-    rate_limit_file: Path = field(default_factory=default_rate_limit_file)
+    tavily_api_key: str | None = None
+    tavily_search_depth: str = "basic"
+    tavily_topic: str = "general"
     transport: str = DEFAULT_TRANSPORT
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
@@ -129,21 +97,13 @@ class WebConfig:
             log_level = DEFAULT_LOG_LEVEL
 
         host = os.environ.get("ARCHON_WEB_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST
-        proxy = os.environ.get("ARCHON_WEB_PROXY") or os.environ.get("DDGS_PROXY") or None
-        rate_limit_file = Path(
-            os.environ.get("ARCHON_WEB_RATE_LIMIT_FILE") or default_rate_limit_file()
-        ).expanduser()
-
         return cls(
-            interval=_read_float(
-                "ARCHON_WEB_DUCKDUCKGO_INTERVAL",
-                DEFAULT_INTERVAL,
-                MIN_INTERVAL,
-                MAX_INTERVAL,
-            ),
             timeout=_read_int("ARCHON_WEB_TIMEOUT", DEFAULT_TIMEOUT, MIN_TIMEOUT, MAX_TIMEOUT),
-            proxy=proxy,
-            rate_limit_file=rate_limit_file,
+            tavily_api_key=_read_secret("TAVILY_API_KEY", "ARCHON_WEB_TAVILY_API_KEY"),
+            tavily_search_depth=_read_choice(
+                "TAVILY_SEARCH_DEPTH", "basic", SUPPORTED_TAVILY_SEARCH_DEPTHS
+            ),
+            tavily_topic=_read_choice("TAVILY_TOPIC", "general", SUPPORTED_TAVILY_TOPICS),
             transport=transport,
             host=host,
             port=_read_int("ARCHON_WEB_PORT", DEFAULT_PORT, 1, 65535),
@@ -171,3 +131,13 @@ def _as_bool(value: str | None, *, default: bool) -> bool:
         return False
     logger.warning("Invalid boolean value %r; using %s", value, default)
     return default
+
+
+def _read_secret(*names: str) -> str | None:
+    """Return the first non-blank secret without altering its value."""
+
+    for name in names:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value
+    return None
