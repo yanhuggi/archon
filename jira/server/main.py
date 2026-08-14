@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import logging
+import os
 import threading
 from collections.abc import Sequence
 from dataclasses import replace
@@ -37,13 +38,23 @@ SERVER_NAME = "archon-jira"
 SERVER_VERSION = "0.1.0"
 
 
+def user_config_dir() -> Path:
+    """Return the platform's conventional per-user configuration directory."""
+
+    if os.name == "nt":
+        root_value = os.environ.get("APPDATA")
+        root = Path(root_value) if root_value else Path.home() / "AppData" / "Roaming"
+        return root / "archon-jira"
+    return Path.home() / ".config" / "archon-jira"
+
+
 def load_environment() -> Path | None:
     """Load the first available .env without overriding client settings."""
 
     candidates = (
         Path(__file__).resolve().parent.parent / ".env",
         Path.cwd() / ".env",
-        Path.home() / ".config/archon-jira/.env",
+        user_config_dir() / ".env",
     )
     for path in candidates:
         if path.exists():

@@ -40,10 +40,13 @@ def _load_rename_noreplace():
     so callers must keep a fallback.
     """
 
+    if os.name == "nt":
+        return None
+
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         syscall = libc.renameat2
-    except (AttributeError, OSError):
+    except (AttributeError, OSError, TypeError):
         return None
     syscall.argtypes = [
         ctypes.c_int,

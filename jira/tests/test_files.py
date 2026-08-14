@@ -14,6 +14,11 @@ from server.config import JiraConfig
 from server.files import OutputPathError, commit_output_file, resolve_output_path
 
 
+def test_rename_noreplace_is_disabled_on_windows() -> None:
+    with patch("server.files.os.name", "nt"):
+        assert files._load_rename_noreplace() is None
+
+
 def test_resolve_output_path_accepts_child_and_changes_suffix(tmp_path) -> None:
     config = JiraConfig(output_dir=tmp_path)
     result = resolve_output_path(str(tmp_path / "nested" / "issue.txt"), config, suffix=".docx")
