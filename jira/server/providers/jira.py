@@ -640,6 +640,36 @@ class JiraProvider:
         data["deduplicated"] = True
         return json.dumps(data, ensure_ascii=False)
 
+    @staticmethod
+    def _unknown_create_result(raw: str, project_key: str) -> str:
+        """Mark a post-submit failure as unsafe to retry automatically."""
+
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        upstream_error = data.get("error")
+        upstream_error_code = data.get("error_code")
+        data.update({
+            "project_key": project_key,
+            "created": None,
+            "outcome_unknown": True,
+            "retry_blocked": True,
+            "error": (
+                "Jira may have accepted the create request, but no valid Issue Key was "
+                "confirmed. Search Jira before any manual retry and reuse the same "
+                "idempotency key."
+            ),
+            "error_code": "create_outcome_unknown",
+        })
+        if upstream_error:
+            data["upstream_error"] = _bounded_text(upstream_error, 500)
+        if upstream_error_code:
+            data["upstream_error_code"] = _bounded_text(upstream_error_code, 100)
+        return json.dumps(data, ensure_ascii=False)
+
     def _begin_create_dedupe(
         self,
         token: str,
@@ -691,9 +721,13 @@ class JiraProvider:
         except (TypeError, ValueError):
             data = {}
         successful = isinstance(data, dict) and data.get("created") is True
-        ttl = _CREATE_EXPLICIT_DEDUPE_TTL if explicit_key and successful else _CREATE_IMPLICIT_DEDUPE_TTL
-        if not successful:
+        outcome_unknown = isinstance(data, dict) and data.get("outcome_unknown") is True
+        if explicit_key and (successful or outcome_unknown):
+            ttl = _CREATE_EXPLICIT_DEDUPE_TTL
+        elif not successful:
             ttl = _CREATE_ERROR_DEDUPE_TTL
+        else:
+            ttl = _CREATE_IMPLICIT_DEDUPE_TTL
         with self._create_dedupe_lock:
             entry = self._create_inflight.pop(token, None)
             self._create_dedupe_cache[token] = (
@@ -1769,7 +1803,7 @@ class JiraProvider:
         start_at: int = 0,
         **kwargs,
     ) -> str:
-        """Get bounded issue history with an older-Jira compatibility path."""
+        """Get bounded Jira Server/DC history from the embedded changelog."""
 
         error = self._validate_issue_key(issue_key)
         if error:
@@ -1782,24 +1816,13 @@ class JiraProvider:
             )
         max_results = min(max(max_results, 1), _MAX_CHANGELOG_RESULTS)
         start_at = max(start_at, 0)
-        source = "endpoint"
         try:
-            try:
-                data = self._request(
-                    "GET",
-                    f"rest/api/2/issue/{issue_key}/changelog",
-                    params={"startAt": start_at, "maxResults": max_results},
-                ).json()
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code != 404:
-                    raise
-                source = "embedded"
-                issue = self._request(
-                    "GET",
-                    f"rest/api/2/issue/{issue_key}",
-                    params={"fields": "summary", "expand": "changelog"},
-                ).json()
-                data = issue.get("changelog") if isinstance(issue, dict) else None
+            issue = self._request(
+                "GET",
+                f"rest/api/2/issue/{issue_key}",
+                params={"fields": "summary", "expand": "changelog"},
+            ).json()
+            data = issue.get("changelog") if isinstance(issue, dict) else None
             if not isinstance(data, dict):
                 return _json_error(
                     "Jira changelog response must be an object",
@@ -1866,30 +1889,23 @@ class JiraProvider:
                 history_count=0,
             )
 
+        local_start = start_at - source_start
+        page = (
+            raw_histories[local_start : local_start + max_results]
+            if local_start >= 0
+            else []
+        )
+        available_end = source_start + len(raw_histories)
+        pagination_supported = source_start == 0 and total <= available_end
         warning: str | None = None
-        if source == "embedded":
-            local_start = start_at - source_start
-            page = (
-                raw_histories[local_start : local_start + max_results]
-                if local_start >= 0
-                else []
+        if not pagination_supported:
+            warning = (
+                "Jira Server/DC returned only a bounded embedded changelog; "
+                "history beyond the returned window is unavailable"
             )
-            available_end = source_start + len(raw_histories)
-            pagination_supported = total <= available_end
-            if not pagination_supported:
-                warning = (
-                    "This Jira version exposes only a bounded embedded changelog; "
-                    "history beyond the returned window is unavailable"
-                )
-            next_start_at = start_at + len(page)
-            if next_start_at >= total or next_start_at >= available_end or not page:
-                next_start_at = None
-        else:
-            page = raw_histories[:max_results]
-            pagination_supported = True
-            next_start_at = start_at + len(page)
-            if next_start_at >= total or not page:
-                next_start_at = None
+        next_start_at = start_at + len(page)
+        if next_start_at >= total or next_start_at >= available_end or not page:
+            next_start_at = None
 
         payload: dict[str, object] = {
             "issue_key": issue_key,
@@ -1900,7 +1916,7 @@ class JiraProvider:
             "history_count": len(page),
             "has_more": start_at + len(page) < total,
             "next_start_at": next_start_at,
-            "source": source,
+            "source": "embedded",
             "pagination_supported": pagination_supported,
         }
         if warning:
@@ -2434,13 +2450,17 @@ class JiraProvider:
             project_key=normalized_project,
             created=False,
         )
+        write_state = {"outcome": "not_attempted"}
         try:
             result = self._create_issue_once(
                 normalized_project,
                 normalized_type,
                 fields,
+                _write_state=write_state,
                 **kwargs,
             )
+            if write_state.get("outcome") == "unknown":
+                result = self._unknown_create_result(result, normalized_project)
         except Exception as exc:  # noqa: BLE001 - always release duplicate waiters
             LOGGER.exception("Jira issue creation failed outside provider boundary")
             result = _json_error(
@@ -2449,6 +2469,8 @@ class JiraProvider:
                 project_key=normalized_project,
                 created=False,
             )
+            if write_state.get("outcome") == "unknown":
+                result = self._unknown_create_result(result, normalized_project)
         finally:
             self._finish_create_dedupe(token, fingerprint, explicit_key, result)
         return result
@@ -2461,6 +2483,10 @@ class JiraProvider:
         **kwargs,
     ) -> str:
         """Create one issue after validating Jira create metadata."""
+
+        write_state = kwargs.get("_write_state")
+        if not isinstance(write_state, dict):
+            write_state = None
 
         project_error = self._validate_project_key(project_key)
         if project_error:
@@ -2733,11 +2759,14 @@ class JiraProvider:
                 "issuetype": {"id": issue_type_id},
                 **canonical_fields,
             }
-            created_issue = self._request(
+            if write_state is not None:
+                write_state["outcome"] = "unknown"
+            create_response = self._request(
                 "POST",
                 "rest/api/2/issue",
                 json={"fields": payload_fields},
-            ).json()
+            )
+            created_issue = create_response.json()
             if not isinstance(created_issue, dict):
                 return _json_error(
                     "Jira create-issue response must be an object",
@@ -2753,6 +2782,8 @@ class JiraProvider:
                     project_key=project_key,
                     created=False,
                 )
+            if write_state is not None:
+                write_state["outcome"] = "confirmed"
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             LOGGER.warning("Jira create metadata/issue request returned HTTP %d", status)

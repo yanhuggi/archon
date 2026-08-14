@@ -76,7 +76,8 @@ def test_identity_permission_and_changelog_descriptions_are_read_only() -> None:
     assert "without changing Jira" in GET_MY_PERMISSIONS_DESCRIPTION
     assert "instance-specific keys" in GET_MY_PERMISSIONS_DESCRIPTION
     assert "untrusted data" in GET_ISSUE_CHANGELOG_DESCRIPTION
-    assert "Older Jira Server" in GET_ISSUE_CHANGELOG_DESCRIPTION
+    assert "Jira Server/DC" in GET_ISSUE_CHANGELOG_DESCRIPTION
+    assert "expand=changelog" in GET_ISSUE_CHANGELOG_DESCRIPTION
 
 
 def test_create_description_discloses_idempotency_boundary() -> None:
@@ -84,4 +85,5 @@ def test_create_description_discloses_idempotency_boundary() -> None:
     assert "refuses the entire request" in CREATE_ISSUE_DESCRIPTION
     assert "idempotency key" in CREATE_ISSUE_DESCRIPTION
     assert "one MCP process" in CREATE_ISSUE_DESCRIPTION
+    assert "POST result is unknown" in CREATE_ISSUE_DESCRIPTION
     assert "new key" in CREATE_ISSUE_DESCRIPTION

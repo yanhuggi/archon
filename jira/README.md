@@ -266,7 +266,7 @@ search_issues(jql="assignee = currentUser() AND resolution = Unresolved")
 | `max_results` | `50` | 每页历史数量，范围 1–100 |
 | `start_at` | `0` | 分页偏移 |
 
-返回每次变更的作者、时间以及字段变更前后的 ID 和显示值，单值和单次变更项数量均有上限。新版 Jira 使用独立 changelog 分页接口；旧版 Jira 自动回退到 `expand=changelog`。如果旧版接口只返回部分历史，结果会设置 `pagination_supported=false`、`warning` 和空的 `next_start_at`，不会伪装为完整证据。
+返回每次变更的作者、时间以及字段变更前后的 ID 和显示值，单值和单次变更项数量均有上限。Jira Server/DC 通过任务详情的 `expand=changelog` 返回嵌入历史，工具只在该响应已包含完整历史时进行本地分页。如果 Jira 返回的嵌入窗口小于 `total`，结果会设置 `pagination_supported=false`、`warning` 和空的 `next_start_at`，不会伪装为完整证据。
 
 ### `get_transitions`
 
@@ -367,8 +367,9 @@ create_issue(
 
 - 未传 `idempotency_key` 时，5 秒内项目、类型和字段完全相同的请求只创建一次，后续调用返回同一 Issue Key 并设置 `deduplicated=true`。
 - 传入稳定 key 时，同一 key 和相同数据的成功结果最多保留 24 小时；同一 key 搭配不同数据会返回 `idempotency_key_reused`，不会创建。
+- POST 已发出但没有确认到有效 Issue Key 时返回 `create_outcome_unknown`，并用原 key 保留 24 小时阻断状态；重复调用不会再次 POST，必须先搜索 Jira 确认结果。
 
-去重缓存不跨 MCP 进程持久化，因此界面仍应在首次点击后立即禁用提交按钮，并为一次表单提交生成一个 key。未知结果或连接中断后必须复用原 key，不能生成新 key 直接重试。
+去重缓存不跨 MCP 进程持久化，因此界面仍应在首次点击后立即禁用提交按钮，并为一次表单提交生成一个 key。未知结果或连接中断后必须复用原 key 以获得阻断结果，不能生成新 key 直接重试；MCP 进程重启后仍需先搜索 Jira。
 
 ### `update_issue`
 
