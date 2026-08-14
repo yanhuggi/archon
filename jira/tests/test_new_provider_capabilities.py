@@ -149,10 +149,10 @@ def test_get_issue_changelog_reports_embedded_history_limit() -> None:
         },
     }))
 
-    data = json.loads(jira.get_issue_changelog("SAAS-2762", max_results=1, start_at=1))
+    data = json.loads(jira.get_issue_changelog("SAAS-2762", max_results=1, start_at=0))
 
     assert data["source"] == "embedded"
-    assert data["histories"][0]["id"] == "2"
+    assert data["histories"][0]["id"] == "1"
     assert data["pagination_supported"] is False
     assert data["has_more"] is True
     assert data["next_start_at"] is None
@@ -437,3 +437,52 @@ def test_pre_submit_create_failure_is_only_cached_briefly() -> None:
     assert second["error_code"] == "missing_required_fields"
     assert "deduplicated" not in second
     assert jira._request.call_count == 2
+
+
+def test_rejected_create_is_only_cached_briefly() -> None:
+    jira = provider()
+    request = httpx.Request("POST", "https://jira.example.com/rest/api/2/issue")
+    bad_request = httpx.Response(
+        400,
+        request=request,
+        json={"errorMessages": ["Summary is required"]},
+    )
+    rejection = httpx.HTTPStatusError(
+        "Bad request", request=request, response=bad_request
+    )
+    jira._request = MagicMock(
+        side_effect=[
+            response(create_metadata()),
+            rejection,
+            response(create_metadata()),
+            rejection,
+        ]
+    )
+    clock = {"now": 100.0}
+
+    with patch("server.providers.jira.time.monotonic", side_effect=lambda: clock["now"]):
+        first = json.loads(
+            jira.create_issue(
+                "SAAS",
+                "Task",
+                {"summary": "Rejected"},
+                idempotency_key="submission-rejected",
+            )
+        )
+        clock["now"] += 11.0
+        second = json.loads(
+            jira.create_issue(
+                "SAAS",
+                "Task",
+                {"summary": "Rejected"},
+                idempotency_key="submission-rejected",
+            )
+        )
+
+    assert first["error_code"] == "invalid_fields"
+    assert first["created"] is False
+    assert first.get("outcome_unknown") is not True
+    assert second["error_code"] == "invalid_fields"
+    assert second["created"] is False
+    assert second.get("deduplicated") is not True
+    assert jira._request.call_count == 4

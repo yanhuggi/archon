@@ -1903,9 +1903,12 @@ class JiraProvider:
                 "Jira Server/DC returned only a bounded embedded changelog; "
                 "history beyond the returned window is unavailable"
             )
-        next_start_at = start_at + len(page)
-        if next_start_at >= total or next_start_at >= available_end or not page:
+        if not pagination_supported:
             next_start_at = None
+        else:
+            next_start_at = start_at + len(page)
+            if next_start_at >= total or not page:
+                next_start_at = None
 
         payload: dict[str, object] = {
             "issue_key": issue_key,
@@ -2459,7 +2462,7 @@ class JiraProvider:
                 _write_state=write_state,
                 **kwargs,
             )
-            if write_state.get("outcome") == "unknown":
+            if write_state.get("outcome") == "submitted_unknown":
                 result = self._unknown_create_result(result, normalized_project)
         except Exception as exc:  # noqa: BLE001 - always release duplicate waiters
             LOGGER.exception("Jira issue creation failed outside provider boundary")
@@ -2469,7 +2472,7 @@ class JiraProvider:
                 project_key=normalized_project,
                 created=False,
             )
-            if write_state.get("outcome") == "unknown":
+            if write_state.get("outcome") == "submitted_unknown":
                 result = self._unknown_create_result(result, normalized_project)
         finally:
             self._finish_create_dedupe(token, fingerprint, explicit_key, result)
@@ -2760,7 +2763,7 @@ class JiraProvider:
                 **canonical_fields,
             }
             if write_state is not None:
-                write_state["outcome"] = "unknown"
+                write_state["outcome"] = "submitted_unknown"
             create_response = self._request(
                 "POST",
                 "rest/api/2/issue",
@@ -2787,6 +2790,8 @@ class JiraProvider:
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             LOGGER.warning("Jira create metadata/issue request returned HTTP %d", status)
+            if write_state is not None and write_state.get("outcome") == "submitted_unknown":
+                write_state["outcome"] = "rejected" if status < 500 else "submitted_unknown"
             code = "invalid_fields" if status == 400 else _status_error_code(status)
             return _json_error(
                 _http_error_message(exc),
