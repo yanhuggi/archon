@@ -1,10 +1,14 @@
 """Tests for Jira model-facing instructions."""
 
 from server.instructions import (
+    CREATE_ISSUE_DESCRIPTION,
     GET_ATTACHMENT_DESCRIPTION,
     ADD_COMMENT_DESCRIPTION,
     DELETE_COMMENT_DESCRIPTION,
+    GET_CURRENT_USER_DESCRIPTION,
+    GET_ISSUE_CHANGELOG_DESCRIPTION,
     GET_JQL_VALUE_SUGGESTIONS_DESCRIPTION,
+    GET_MY_PERMISSIONS_DESCRIPTION,
     GET_TRANSITIONS_DESCRIPTION,
     SEARCH_JQL_FIELDS_DESCRIPTION,
     SERVER_INSTRUCTIONS,
@@ -28,6 +32,11 @@ def test_server_instructions_distinguish_read_and_write_workflows() -> None:
     assert "delete_comment" in SERVER_INSTRUCTIONS
     assert "get_transitions" in SERVER_INSTRUCTIONS
     assert "transition_issue" in SERVER_INSTRUCTIONS
+    assert "get_current_user" in SERVER_INSTRUCTIONS
+    assert "get_my_permissions" in SERVER_INSTRUCTIONS
+    assert "get_issue_changelog" in SERVER_INSTRUCTIONS
+    assert "create_issue" in SERVER_INSTRUCTIONS
+    assert "idempotency_key" in SERVER_INSTRUCTIONS
 
 
 def test_jql_metadata_descriptions_discourage_unnecessary_refreshes() -> None:
@@ -60,3 +69,19 @@ def test_transition_descriptions_require_discovery_and_explicit_write() -> None:
     assert "exact transition IDs" in GET_TRANSITIONS_DESCRIPTION
     assert "explicitly asks" in TRANSITION_ISSUE_DESCRIPTION
     assert "not idempotent" in TRANSITION_ISSUE_DESCRIPTION
+
+
+def test_identity_permission_and_changelog_descriptions_are_read_only() -> None:
+    assert "never returns credentials" in GET_CURRENT_USER_DESCRIPTION
+    assert "without changing Jira" in GET_MY_PERMISSIONS_DESCRIPTION
+    assert "instance-specific keys" in GET_MY_PERMISSIONS_DESCRIPTION
+    assert "untrusted data" in GET_ISSUE_CHANGELOG_DESCRIPTION
+    assert "Older Jira Server" in GET_ISSUE_CHANGELOG_DESCRIPTION
+
+
+def test_create_description_discloses_idempotency_boundary() -> None:
+    assert "explicitly requests" in CREATE_ISSUE_DESCRIPTION
+    assert "refuses the entire request" in CREATE_ISSUE_DESCRIPTION
+    assert "idempotency key" in CREATE_ISSUE_DESCRIPTION
+    assert "one MCP process" in CREATE_ISSUE_DESCRIPTION
+    assert "new key" in CREATE_ISSUE_DESCRIPTION

@@ -1,6 +1,7 @@
 """Jira REST API provider implementation."""
 
 import base64
+import hashlib
 import json
 import logging
 import re
@@ -32,8 +33,18 @@ _MAX_CACHED_VALUE_SUGGESTIONS = 1000
 _DEFAULT_MAX_ATTACHMENT_SIZE = DEFAULT_MAX_ATTACHMENT_SIZE
 _SAFE_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
+_PROJECT_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 _COMMENT_ID_RE = re.compile(r"^\d+$")
 _MAX_COMMENT_LENGTH = 32767
+_MAX_PERMISSION_RESULTS = 200
+_MAX_CHANGELOG_RESULTS = 100
+_MAX_CREATE_FIELDS = 50
+_MAX_CREATE_PAYLOAD_BYTES = 1_000_000
+_CREATE_IMPLICIT_DEDUPE_TTL = 5.0
+_CREATE_EXPLICIT_DEDUPE_TTL = 24 * 60 * 60.0
+_CREATE_ERROR_DEDUPE_TTL = 10.0
+_CREATE_DEDUPE_MAX_ENTRIES = 1024
+_CREATE_DEDUPE_WAIT_TIMEOUT = 120.0
 _DEFAULT_FIELDS = (
     "summary,description,status,assignee,reporter,issuetype,"
     "priority,labels,created,updated,subtasks,issuelinks,"
@@ -174,6 +185,89 @@ def _normalize_comment(comment: dict, fallback_body: str = "") -> dict:
         "created": comment.get("created", ""),
         "updated": comment.get("updated", ""),
     }
+
+
+def _bounded_text(value: object, limit: int = _MAX_FIELD_LENGTH) -> str:
+    text = "" if value is None else str(value)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _normalize_user(user: dict) -> dict:
+    """Return bounded account data without credentials or session details."""
+
+    raw_groups = user.get("groups") if isinstance(user.get("groups"), dict) else {}
+    items = raw_groups.get("items") if isinstance(raw_groups.get("items"), list) else []
+    groups = [
+        _bounded_text(item.get("name"), 255)
+        for item in items[:50]
+        if isinstance(item, dict) and item.get("name")
+    ]
+    declared_group_count = raw_groups.get("size")
+    if isinstance(declared_group_count, bool) or not isinstance(declared_group_count, int):
+        declared_group_count = len(groups)
+    return {
+        "name": _bounded_text(user.get("name"), 255),
+        "key": _bounded_text(user.get("key"), 255),
+        "display_name": _bounded_text(user.get("displayName"), 255),
+        "email_address": _bounded_text(user.get("emailAddress"), 320),
+        "active": bool(user.get("active")),
+        "time_zone": _bounded_text(user.get("timeZone"), 100),
+        "groups": groups,
+        "group_count": declared_group_count,
+        "groups_truncated": declared_group_count > len(groups) or len(items) > len(groups),
+    }
+
+
+def _normalize_history(history: dict) -> dict:
+    """Return one bounded Jira changelog history entry."""
+
+    raw_items = history.get("items") if isinstance(history.get("items"), list) else []
+    items = []
+    for item in raw_items[:50]:
+        if not isinstance(item, dict):
+            continue
+        items.append({
+            "field": _bounded_text(item.get("field"), 255),
+            "field_id": _bounded_text(item.get("fieldId"), 255),
+            "field_type": _bounded_text(item.get("fieldtype"), 100),
+            "from": _bounded_text(item.get("from")),
+            "from_string": _bounded_text(item.get("fromString")),
+            "to": _bounded_text(item.get("to")),
+            "to_string": _bounded_text(item.get("toString")),
+        })
+    author = history.get("author") if isinstance(history.get("author"), dict) else {}
+    return {
+        "id": _bounded_text(history.get("id"), 100),
+        "author": {
+            "name": _bounded_text(author.get("name"), 255),
+            "key": _bounded_text(author.get("key"), 255),
+            "display_name": _bounded_text(author.get("displayName"), 255),
+        },
+        "created": _bounded_text(history.get("created"), 100),
+        "items": items,
+        "item_count": len(items),
+        "items_truncated": len(raw_items) > len(items),
+    }
+
+
+def _normalize_allowed_values(values: object, limit: int = 50) -> list[dict[str, str]]:
+    """Return bounded create/transition choices without arbitrary nested data."""
+
+    if not isinstance(values, list):
+        return []
+    normalized = []
+    for value in values[:limit]:
+        if isinstance(value, dict):
+            normalized.append({
+                "id": _bounded_text(value.get("id") or value.get("key"), 255),
+                "name": _bounded_text(
+                    value.get("name") or value.get("value") or value.get("displayName"),
+                    500,
+                ),
+            })
+        elif value is not None:
+            normalized.append({"id": "", "name": _bounded_text(value, 500)})
+    return normalized
 
 
 def _normalize_transition(raw: dict) -> dict:
@@ -324,6 +418,9 @@ class JiraProvider:
         self._field_map: dict[str, str] | None = None
         self._field_map_fetched_at = 0.0
         self._jql_cache = JsonJqlCache(config or JiraConfig.from_env())
+        self._create_dedupe_lock = threading.Lock()
+        self._create_dedupe_cache: dict[str, tuple[float, str, str]] = {}
+        self._create_inflight: dict[str, tuple[threading.Event, str]] = {}
 
     def _config(self) -> JiraConfig:
         return self._fixed_config or JiraConfig.from_env()
@@ -471,6 +568,13 @@ class JiraProvider:
         return None
 
     @staticmethod
+    def _validate_project_key(project_key: str) -> str | None:
+        """Return None if valid, else an error message."""
+        if not _PROJECT_KEY_RE.fullmatch(project_key):
+            return f"Invalid project key format: {project_key!r}"
+        return None
+
+    @staticmethod
     def _validate_attachment_id(attachment_id: str) -> str | None:
         """Return None if valid, else an error message."""
         if not attachment_id.isdigit():
@@ -483,6 +587,369 @@ class JiraProvider:
         if not _COMMENT_ID_RE.fullmatch(comment_id):
             return f"Invalid comment ID: {comment_id!r}"
         return None
+
+    @staticmethod
+    def _create_fingerprint(
+        project_key: str,
+        issue_type: str,
+        fields: dict[str, object],
+    ) -> str | None:
+        """Build a stable fingerprint for implicit double-submit protection."""
+
+        try:
+            serialized = json.dumps(
+                {
+                    "project_key": project_key.casefold(),
+                    "issue_type": issue_type.casefold(),
+                    "fields": fields,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            return None
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _purge_create_dedupe_cache(self, now: float) -> None:
+        expired = [
+            token
+            for token, (expires_at, _fingerprint, _result) in self._create_dedupe_cache.items()
+            if expires_at <= now
+        ]
+        for token in expired:
+            self._create_dedupe_cache.pop(token, None)
+        if len(self._create_dedupe_cache) > _CREATE_DEDUPE_MAX_ENTRIES:
+            excess = len(self._create_dedupe_cache) - _CREATE_DEDUPE_MAX_ENTRIES
+            oldest = sorted(
+                self._create_dedupe_cache.items(),
+                key=lambda item: item[1][0],
+            )[:excess]
+            for token, _entry in oldest:
+                self._create_dedupe_cache.pop(token, None)
+
+    @staticmethod
+    def _replayed_create_result(raw: str) -> str:
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return raw
+        if not isinstance(data, dict):
+            return raw
+        data["deduplicated"] = True
+        return json.dumps(data, ensure_ascii=False)
+
+    def _begin_create_dedupe(
+        self,
+        token: str,
+        fingerprint: str,
+    ) -> tuple[str, str | threading.Event | None]:
+        """Claim a create request or return a cached/in-flight duplicate."""
+
+        now = time.monotonic()
+        with self._create_dedupe_lock:
+            self._purge_create_dedupe_cache(now)
+            cached = self._create_dedupe_cache.get(token)
+            if cached is not None:
+                _expires_at, cached_fingerprint, result = cached
+                if cached_fingerprint != fingerprint:
+                    return (
+                        "conflict",
+                        _json_error(
+                            "The idempotency key is already associated with different create data",
+                            "idempotency_key_reused",
+                            deduplicated=False,
+                        ),
+                    )
+                return "cached", result
+            inflight = self._create_inflight.get(token)
+            if inflight is not None:
+                event, inflight_fingerprint = inflight
+                if inflight_fingerprint != fingerprint:
+                    return (
+                        "conflict",
+                        _json_error(
+                            "The idempotency key is already in use for different create data",
+                            "idempotency_key_reused",
+                            deduplicated=False,
+                        ),
+                    )
+                return "wait", event
+            self._create_inflight[token] = (threading.Event(), fingerprint)
+            return "owner", None
+
+    def _finish_create_dedupe(
+        self,
+        token: str,
+        fingerprint: str,
+        explicit_key: bool,
+        result: str,
+    ) -> None:
+        try:
+            data = json.loads(result)
+        except (TypeError, ValueError):
+            data = {}
+        successful = isinstance(data, dict) and data.get("created") is True
+        ttl = _CREATE_EXPLICIT_DEDUPE_TTL if explicit_key and successful else _CREATE_IMPLICIT_DEDUPE_TTL
+        if not successful:
+            ttl = _CREATE_ERROR_DEDUPE_TTL
+        with self._create_dedupe_lock:
+            entry = self._create_inflight.pop(token, None)
+            self._create_dedupe_cache[token] = (
+                time.monotonic() + ttl,
+                fingerprint,
+                result,
+            )
+            self._purge_create_dedupe_cache(time.monotonic())
+            if entry is not None:
+                entry[0].set()
+
+    def _wait_for_create_dedupe(
+        self,
+        token: str,
+        event: threading.Event,
+        fingerprint: str,
+    ) -> str:
+        if not event.wait(_CREATE_DEDUPE_WAIT_TIMEOUT):
+            return _json_error(
+                "The original create request is still in progress; search Jira before retrying",
+                "dedupe_wait_timeout",
+                deduplicated=False,
+            )
+        with self._create_dedupe_lock:
+            cached = self._create_dedupe_cache.get(token)
+            if cached is not None and cached[1] == fingerprint:
+                return self._replayed_create_result(cached[2])
+        return _json_error(
+            "The original create request completed without a reusable result; search Jira before retrying",
+            "dedupe_result_unavailable",
+            deduplicated=False,
+        )
+
+    # ── identity and permissions ──────────────────────────────────
+
+    def get_current_user(self, **kwargs) -> str:
+        """Get the Jira account authenticated by this provider."""
+
+        try:
+            try:
+                user = self._request("GET", "rest/api/2/myself").json()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 404:
+                    raise
+                # Older Jira Server releases do not expose /myself. The session
+                # login still authenticates one exact configured username.
+                username = self._config().username
+                user = self._request(
+                    "GET",
+                    "rest/api/2/user",
+                    params={"username": username},
+                ).json()
+            if not isinstance(user, dict):
+                return _json_error(
+                    "Jira current-user response must be an object",
+                    "invalid_provider_response",
+                    authenticated=False,
+                )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            LOGGER.warning("Jira current-user lookup returned HTTP %d", status)
+            return _json_error(
+                _http_error_message(exc),
+                _status_error_code(status),
+                authenticated=False,
+            )
+        except httpx.RequestError as exc:
+            LOGGER.warning("Jira current-user request failed: %s", exc)
+            return _json_error(
+                f"Request failed: {exc}",
+                "upstream_error",
+                authenticated=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize provider failures to MCP errors
+            LOGGER.exception("Jira current-user lookup failed")
+            code = "configuration_error" if isinstance(exc, RuntimeError) else "provider_error"
+            return _json_error(
+                f"{type(exc).__name__}: {exc}",
+                code,
+                authenticated=False,
+            )
+
+        return json.dumps(
+            {"authenticated": True, "user": _normalize_user(user)},
+            ensure_ascii=False,
+        )
+
+    def get_my_permissions(
+        self,
+        issue_key: str | None = None,
+        project_key: str | None = None,
+        permissions: list[str] | None = None,
+        **kwargs,
+    ) -> str:
+        """Get current-account permissions without mutating Jira."""
+
+        if issue_key and project_key:
+            return _json_error(
+                "Provide either issue_key or project_key, not both",
+                "invalid_permission_context",
+                permissions=[],
+                permission_count=0,
+            )
+        if issue_key:
+            error = self._validate_issue_key(issue_key)
+            if error:
+                return _json_error(
+                    error,
+                    "invalid_issue_key",
+                    issue_key=issue_key,
+                    permissions=[],
+                    permission_count=0,
+                )
+        if project_key:
+            error = self._validate_project_key(project_key)
+            if error:
+                return _json_error(
+                    error,
+                    "invalid_project_key",
+                    project_key=project_key,
+                    permissions=[],
+                    permission_count=0,
+                )
+
+        requested: list[str] | None = None
+        if permissions is not None:
+            if not isinstance(permissions, list) or len(permissions) > 50:
+                return _json_error(
+                    "permissions must be an array containing at most 50 values",
+                    "invalid_permissions",
+                    permissions=[],
+                    permission_count=0,
+                )
+            requested = []
+            seen: set[str] = set()
+            for value in permissions:
+                if not isinstance(value, str) or not value.strip() or len(value.strip()) > 100:
+                    return _json_error(
+                        "permission values must contain 1 to 100 characters",
+                        "invalid_permissions",
+                        permissions=[],
+                        permission_count=0,
+                    )
+                candidate = value.strip()
+                if candidate.casefold() not in seen:
+                    requested.append(candidate)
+                    seen.add(candidate.casefold())
+
+        params: dict[str, str] = {}
+        if issue_key:
+            params["issueKey"] = issue_key
+        elif project_key:
+            params["projectKey"] = project_key
+        try:
+            data = self._request(
+                "GET",
+                "rest/api/2/mypermissions",
+                params=params,
+            ).json()
+            raw_permissions = data.get("permissions") if isinstance(data, dict) else None
+            if not isinstance(raw_permissions, dict) or any(
+                not isinstance(value, dict) for value in raw_permissions.values()
+            ):
+                return _json_error(
+                    "Jira permissions response must contain a permissions object",
+                    "invalid_provider_response",
+                    permissions=[],
+                    permission_count=0,
+                )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            LOGGER.warning("Jira permission lookup returned HTTP %d", status)
+            return _json_error(
+                _http_error_message(exc),
+                _status_error_code(status),
+                issue_key=issue_key,
+                project_key=project_key,
+                permissions=[],
+                permission_count=0,
+            )
+        except httpx.RequestError as exc:
+            LOGGER.warning("Jira permission request failed: %s", exc)
+            return _json_error(
+                f"Request failed: {exc}",
+                "upstream_error",
+                issue_key=issue_key,
+                project_key=project_key,
+                permissions=[],
+                permission_count=0,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize provider failures to MCP errors
+            LOGGER.exception("Jira permission lookup failed")
+            code = "configuration_error" if isinstance(exc, RuntimeError) else "provider_error"
+            return _json_error(
+                f"{type(exc).__name__}: {exc}",
+                code,
+                issue_key=issue_key,
+                project_key=project_key,
+                permissions=[],
+                permission_count=0,
+            )
+
+        normalized = []
+        for response_key, value in raw_permissions.items():
+            normalized.append({
+                "id": _bounded_text(value.get("id"), 100),
+                "key": _bounded_text(value.get("key") or response_key, 255),
+                "name": _bounded_text(value.get("name"), 255),
+                "description": _bounded_text(value.get("description"), 500),
+                "type": _bounded_text(value.get("type"), 100),
+                "have_permission": bool(value.get("havePermission")),
+            })
+        normalized.sort(key=lambda item: (item["key"].casefold(), item["id"]))
+        total_available = len(normalized)
+        unknown_permissions: list[str] = []
+        if requested is not None:
+            selected = []
+            for requested_value in requested:
+                needle = requested_value.casefold()
+                match = next(
+                    (
+                        item
+                        for item in normalized
+                        if needle
+                        in {
+                            item["id"].casefold(),
+                            item["key"].casefold(),
+                            item["name"].casefold(),
+                        }
+                    ),
+                    None,
+                )
+                if match is None:
+                    unknown_permissions.append(requested_value)
+                elif match not in selected:
+                    selected.append(match)
+            normalized = selected
+        truncated = len(normalized) > _MAX_PERMISSION_RESULTS
+        normalized = normalized[:_MAX_PERMISSION_RESULTS]
+
+        context: dict[str, str] = {"scope": "global"}
+        if issue_key:
+            context = {"scope": "issue", "issue_key": issue_key}
+        elif project_key:
+            context = {"scope": "project", "project_key": project_key}
+        return json.dumps(
+            {
+                "context": context,
+                "permissions": normalized,
+                "permission_count": len(normalized),
+                "total_available": total_available,
+                "unknown_permissions": unknown_permissions,
+                "truncated": truncated,
+            },
+            ensure_ascii=False,
+        )
 
     def _get_field_map(self) -> dict[str, str]:
         """Return a short-lived custom field map used to enrich issue details."""
@@ -1293,6 +1760,153 @@ class JiraProvider:
 
         return _render_within_budget(lines, _MAX_ISSUE_CHARS)
 
+    # ── issue changelog ───────────────────────────────────────────
+
+    def get_issue_changelog(
+        self,
+        issue_key: str,
+        max_results: int = 50,
+        start_at: int = 0,
+        **kwargs,
+    ) -> str:
+        """Get bounded issue history with an older-Jira compatibility path."""
+
+        error = self._validate_issue_key(issue_key)
+        if error:
+            return _json_error(
+                error,
+                "invalid_issue_key",
+                issue_key=issue_key,
+                histories=[],
+                history_count=0,
+            )
+        max_results = min(max(max_results, 1), _MAX_CHANGELOG_RESULTS)
+        start_at = max(start_at, 0)
+        source = "endpoint"
+        try:
+            try:
+                data = self._request(
+                    "GET",
+                    f"rest/api/2/issue/{issue_key}/changelog",
+                    params={"startAt": start_at, "maxResults": max_results},
+                ).json()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 404:
+                    raise
+                source = "embedded"
+                issue = self._request(
+                    "GET",
+                    f"rest/api/2/issue/{issue_key}",
+                    params={"fields": "summary", "expand": "changelog"},
+                ).json()
+                data = issue.get("changelog") if isinstance(issue, dict) else None
+            if not isinstance(data, dict):
+                return _json_error(
+                    "Jira changelog response must be an object",
+                    "invalid_provider_response",
+                    issue_key=issue_key,
+                    histories=[],
+                    history_count=0,
+                )
+            raw_histories = data.get("histories")
+            if not isinstance(raw_histories, list) or any(
+                not isinstance(history, dict) for history in raw_histories
+            ):
+                return _json_error(
+                    "Jira changelog response must contain a histories array",
+                    "invalid_provider_response",
+                    issue_key=issue_key,
+                    histories=[],
+                    history_count=0,
+                )
+            total = data.get("total", len(raw_histories))
+            source_start = data.get("startAt", 0)
+            if (
+                isinstance(total, bool)
+                or not isinstance(total, int)
+                or total < 0
+                or isinstance(source_start, bool)
+                or not isinstance(source_start, int)
+                or source_start < 0
+            ):
+                return _json_error(
+                    "Jira changelog response contains invalid pagination metadata",
+                    "invalid_provider_response",
+                    issue_key=issue_key,
+                    histories=[],
+                    history_count=0,
+                )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            LOGGER.warning("Jira changelog lookup returned HTTP %d", status)
+            return _json_error(
+                _http_error_message(exc),
+                _status_error_code(status),
+                issue_key=issue_key,
+                histories=[],
+                history_count=0,
+            )
+        except httpx.RequestError as exc:
+            LOGGER.warning("Jira changelog request failed: %s", exc)
+            return _json_error(
+                f"Request failed: {exc}",
+                "upstream_error",
+                issue_key=issue_key,
+                histories=[],
+                history_count=0,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize provider failures to MCP errors
+            LOGGER.exception("Jira changelog lookup failed")
+            code = "configuration_error" if isinstance(exc, RuntimeError) else "provider_error"
+            return _json_error(
+                f"{type(exc).__name__}: {exc}",
+                code,
+                issue_key=issue_key,
+                histories=[],
+                history_count=0,
+            )
+
+        warning: str | None = None
+        if source == "embedded":
+            local_start = start_at - source_start
+            page = (
+                raw_histories[local_start : local_start + max_results]
+                if local_start >= 0
+                else []
+            )
+            available_end = source_start + len(raw_histories)
+            pagination_supported = total <= available_end
+            if not pagination_supported:
+                warning = (
+                    "This Jira version exposes only a bounded embedded changelog; "
+                    "history beyond the returned window is unavailable"
+                )
+            next_start_at = start_at + len(page)
+            if next_start_at >= total or next_start_at >= available_end or not page:
+                next_start_at = None
+        else:
+            page = raw_histories[:max_results]
+            pagination_supported = True
+            next_start_at = start_at + len(page)
+            if next_start_at >= total or not page:
+                next_start_at = None
+
+        payload: dict[str, object] = {
+            "issue_key": issue_key,
+            "total": total,
+            "start_at": start_at,
+            "max_results": max_results,
+            "histories": [_normalize_history(history) for history in page],
+            "history_count": len(page),
+            "has_more": start_at + len(page) < total,
+            "next_start_at": next_start_at,
+            "source": source,
+            "pagination_supported": pagination_supported,
+        }
+        if warning:
+            payload["warning"] = warning
+        return json.dumps(payload, ensure_ascii=False)
+
     # ── workflow transitions ──────────────────────────────────────
 
     def _fetch_transitions(self, issue_key: str) -> list[dict]:
@@ -1744,6 +2358,444 @@ class JiraProvider:
 
         return json.dumps(
             {"issue_key": issue_key, "comment_id": comment_id, "deleted": True},
+            ensure_ascii=False,
+        )
+
+    # ── create_issue ──────────────────────────────────────────────
+
+    def create_issue(
+        self,
+        project_key: str,
+        issue_type: str,
+        fields: dict[str, object],
+        idempotency_key: str | None = None,
+        **kwargs,
+    ) -> str:
+        """Create one issue with concurrency and double-submit protection."""
+
+        normalized_project = project_key.strip().upper() if isinstance(project_key, str) else ""
+        normalized_type = issue_type.strip() if isinstance(issue_type, str) else ""
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str):
+                return _json_error(
+                    "idempotency_key must be a string",
+                    "invalid_idempotency_key",
+                    project_key=normalized_project,
+                    created=False,
+                )
+            idempotency_key = idempotency_key.strip()
+            if (
+                not idempotency_key
+                or len(idempotency_key) > 200
+                or any(ord(char) < 32 for char in idempotency_key)
+            ):
+                return _json_error(
+                    "idempotency_key must contain 1 to 200 printable characters",
+                    "invalid_idempotency_key",
+                    project_key=normalized_project,
+                    created=False,
+                )
+
+        fingerprint = (
+            self._create_fingerprint(normalized_project, normalized_type, fields)
+            if isinstance(fields, dict)
+            else None
+        )
+        if fingerprint is None:
+            return self._create_issue_once(
+                normalized_project,
+                normalized_type,
+                fields,
+                **kwargs,
+            )
+
+        explicit_key = idempotency_key is not None
+        token_prefix = "key:" if explicit_key else "fingerprint:"
+        token_value = idempotency_key if explicit_key else fingerprint
+        token = token_prefix + hashlib.sha256(token_value.encode("utf-8")).hexdigest()
+        mode, payload = self._begin_create_dedupe(token, fingerprint)
+        if mode == "conflict":
+            return str(payload)
+        if mode == "cached":
+            return self._replayed_create_result(str(payload))
+        if mode == "wait":
+            if isinstance(payload, threading.Event):
+                return self._wait_for_create_dedupe(token, payload, fingerprint)
+            return _json_error(
+                "The create request could not be coordinated safely",
+                "dedupe_result_unavailable",
+                project_key=normalized_project,
+                created=False,
+            )
+
+        result = _json_error(
+            "The create request did not return a result",
+            "provider_error",
+            project_key=normalized_project,
+            created=False,
+        )
+        try:
+            result = self._create_issue_once(
+                normalized_project,
+                normalized_type,
+                fields,
+                **kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 - always release duplicate waiters
+            LOGGER.exception("Jira issue creation failed outside provider boundary")
+            result = _json_error(
+                f"{type(exc).__name__}: {exc}",
+                "provider_error",
+                project_key=normalized_project,
+                created=False,
+            )
+        finally:
+            self._finish_create_dedupe(token, fingerprint, explicit_key, result)
+        return result
+
+    def _create_issue_once(
+        self,
+        project_key: str,
+        issue_type: str,
+        fields: dict[str, object],
+        **kwargs,
+    ) -> str:
+        """Create one issue after validating Jira create metadata."""
+
+        project_error = self._validate_project_key(project_key)
+        if project_error:
+            return _json_error(
+                project_error,
+                "invalid_project_key",
+                project_key=project_key,
+                created=False,
+            )
+        normalized_type = issue_type.strip() if isinstance(issue_type, str) else ""
+        if not normalized_type or len(normalized_type) > 255:
+            return _json_error(
+                "issue_type must contain 1 to 255 characters",
+                "invalid_issue_type",
+                project_key=project_key,
+                created=False,
+            )
+        if not isinstance(fields, dict) or not fields:
+            return _json_error(
+                "fields must be a non-empty object",
+                "invalid_fields",
+                project_key=project_key,
+                created=False,
+            )
+        if len(fields) > _MAX_CREATE_FIELDS:
+            return _json_error(
+                f"fields must contain at most {_MAX_CREATE_FIELDS} entries",
+                "invalid_fields",
+                project_key=project_key,
+                created=False,
+            )
+
+        normalized_fields: dict[str, object] = {}
+        for raw_name, value in fields.items():
+            if not isinstance(raw_name, str):
+                return _json_error(
+                    "field names must be strings",
+                    "invalid_fields",
+                    project_key=project_key,
+                    created=False,
+                )
+            name = raw_name.strip()
+            if not name or len(name) > 255:
+                return _json_error(
+                    "field names must contain 1 to 255 characters",
+                    "invalid_fields",
+                    project_key=project_key,
+                    created=False,
+                )
+            if name.casefold() in {"project", "issuetype"}:
+                return _json_error(
+                    "project and issuetype must be supplied through their dedicated arguments",
+                    "reserved_fields",
+                    project_key=project_key,
+                    reserved_fields=[name],
+                    created=False,
+                )
+            normalized_fields[name] = value
+
+        try:
+            serialized = json.dumps(normalized_fields, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            return _json_error(
+                f"fields must contain JSON-compatible values: {exc}",
+                "invalid_fields",
+                project_key=project_key,
+                created=False,
+            )
+        if len(serialized.encode("utf-8")) > _MAX_CREATE_PAYLOAD_BYTES:
+            return _json_error(
+                "serialized fields must not exceed 1 MB",
+                "invalid_fields",
+                project_key=project_key,
+                created=False,
+            )
+
+        metadata_params = {
+            "projectKeys": project_key,
+            "expand": "projects.issuetypes.fields",
+        }
+        metadata_params[
+            "issuetypeIds" if normalized_type.isdigit() else "issuetypeNames"
+        ] = normalized_type
+        try:
+            metadata = self._request(
+                "GET",
+                "rest/api/2/issue/createmeta",
+                params=metadata_params,
+            ).json()
+            projects = metadata.get("projects") if isinstance(metadata, dict) else None
+            if not isinstance(projects, list) or any(
+                not isinstance(project, dict) for project in projects
+            ):
+                return _json_error(
+                    "Jira create metadata response must contain a projects array",
+                    "invalid_provider_response",
+                    project_key=project_key,
+                    created=False,
+                )
+            project = next(
+                (
+                    candidate
+                    for candidate in projects
+                    if str(candidate.get("key") or "").casefold() == project_key.casefold()
+                ),
+                None,
+            )
+            if project is None:
+                return _json_error(
+                    "The Jira project is unavailable for issue creation",
+                    "project_unavailable",
+                    project_key=project_key,
+                    available_projects=[
+                        str(candidate.get("key") or "") for candidate in projects[:100]
+                    ],
+                    created=False,
+                )
+            issue_types = project.get("issuetypes")
+            if not isinstance(issue_types, list) or any(
+                not isinstance(candidate, dict) for candidate in issue_types
+            ):
+                return _json_error(
+                    "Jira create metadata project must contain an issuetypes array",
+                    "invalid_provider_response",
+                    project_key=project_key,
+                    created=False,
+                )
+            issue_type_metadata = next(
+                (
+                    candidate
+                    for candidate in issue_types
+                    if (
+                        normalized_type.isdigit()
+                        and str(candidate.get("id") or "") == normalized_type
+                    )
+                    or (
+                        not normalized_type.isdigit()
+                        and str(candidate.get("name") or "").casefold()
+                        == normalized_type.casefold()
+                    )
+                ),
+                None,
+            )
+            if issue_type_metadata is None:
+                return _json_error(
+                    "The Jira issue type is unavailable in this project",
+                    "issue_type_unavailable",
+                    project_key=project_key,
+                    issue_type=normalized_type,
+                    available_issue_types=[
+                        {
+                            "id": str(candidate.get("id") or ""),
+                            "name": _bounded_text(candidate.get("name"), 255),
+                        }
+                        for candidate in issue_types[:100]
+                    ],
+                    created=False,
+                )
+            metadata_fields = issue_type_metadata.get("fields")
+            if not isinstance(metadata_fields, dict) or any(
+                not isinstance(value, dict) for value in metadata_fields.values()
+            ):
+                return _json_error(
+                    "Jira create metadata issue type must contain a fields object",
+                    "invalid_provider_response",
+                    project_key=project_key,
+                    issue_type=normalized_type,
+                    created=False,
+                )
+
+            creatable_aliases: dict[str, str] = {}
+            creatable_metadata: dict[str, dict] = {}
+            for field_id, field_metadata in metadata_fields.items():
+                operations = field_metadata.get("operations")
+                if not isinstance(operations, list) or "set" not in operations:
+                    continue
+                canonical_id = str(field_id)
+                creatable_metadata[canonical_id] = field_metadata
+                schema = (
+                    field_metadata.get("schema")
+                    if isinstance(field_metadata.get("schema"), dict)
+                    else {}
+                )
+                identifiers = (
+                    canonical_id,
+                    field_metadata.get("key"),
+                    field_metadata.get("id"),
+                    schema.get("system"),
+                )
+                for identifier in identifiers:
+                    if isinstance(identifier, str) and identifier.strip():
+                        creatable_aliases[identifier.strip()] = canonical_id
+
+            canonical_fields: dict[str, object] = {}
+            unavailable_fields = []
+            duplicate_fields: list[list[str]] = []
+            canonical_sources: dict[str, str] = {}
+            for name, value in normalized_fields.items():
+                canonical = creatable_aliases.get(name)
+                if canonical is None:
+                    unavailable_fields.append(name)
+                elif canonical in canonical_fields:
+                    duplicate_fields.append([canonical_sources[canonical], name])
+                else:
+                    canonical_fields[canonical] = value
+                    canonical_sources[canonical] = name
+            if unavailable_fields:
+                return _json_error(
+                    "One or more fields are unavailable for issue creation",
+                    "uncreatable_fields",
+                    project_key=project_key,
+                    issue_type=normalized_type,
+                    uncreatable_fields=unavailable_fields,
+                    creatable_fields=sorted(creatable_metadata)[:200],
+                    created=False,
+                )
+            if duplicate_fields:
+                return _json_error(
+                    "Multiple input fields resolve to the same Jira field",
+                    "duplicate_fields",
+                    project_key=project_key,
+                    issue_type=normalized_type,
+                    duplicate_fields=duplicate_fields,
+                    created=False,
+                )
+
+            missing_required_fields = []
+            for field_id, field_metadata in metadata_fields.items():
+                if field_id in {"project", "issuetype"}:
+                    continue
+                if not field_metadata.get("required") or field_metadata.get("hasDefaultValue"):
+                    continue
+                if field_id in canonical_fields and canonical_fields[field_id] is not None:
+                    continue
+                schema = (
+                    field_metadata.get("schema")
+                    if isinstance(field_metadata.get("schema"), dict)
+                    else {}
+                )
+                allowed = field_metadata.get("allowedValues")
+                missing_required_fields.append({
+                    "id": str(field_id),
+                    "name": _bounded_text(field_metadata.get("name") or field_id, 255),
+                    "schema_type": _bounded_text(schema.get("type"), 100),
+                    "allowed_values": _normalize_allowed_values(allowed),
+                })
+            if missing_required_fields:
+                required_fields_truncated = len(missing_required_fields) > 50
+                return _json_error(
+                    "One or more required create fields are missing",
+                    "missing_required_fields",
+                    project_key=project_key,
+                    issue_type=normalized_type,
+                    required_fields=missing_required_fields[:50],
+                    required_fields_truncated=required_fields_truncated,
+                    created=False,
+                )
+
+            issue_type_id = str(issue_type_metadata.get("id") or "")
+            if not issue_type_id:
+                return _json_error(
+                    "Jira create metadata issue type must contain an ID",
+                    "invalid_provider_response",
+                    project_key=project_key,
+                    issue_type=normalized_type,
+                    created=False,
+                )
+            payload_fields = {
+                "project": {"key": project_key},
+                "issuetype": {"id": issue_type_id},
+                **canonical_fields,
+            }
+            created_issue = self._request(
+                "POST",
+                "rest/api/2/issue",
+                json={"fields": payload_fields},
+            ).json()
+            if not isinstance(created_issue, dict):
+                return _json_error(
+                    "Jira create-issue response must be an object",
+                    "invalid_provider_response",
+                    project_key=project_key,
+                    created=False,
+                )
+            created_key = str(created_issue.get("key") or "")
+            if not _ISSUE_KEY_RE.fullmatch(created_key):
+                return _json_error(
+                    "Jira create-issue response must contain a valid issue key",
+                    "invalid_provider_response",
+                    project_key=project_key,
+                    created=False,
+                )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            LOGGER.warning("Jira create metadata/issue request returned HTTP %d", status)
+            code = "invalid_fields" if status == 400 else _status_error_code(status)
+            return _json_error(
+                _http_error_message(exc),
+                code,
+                project_key=project_key,
+                issue_type=normalized_type,
+                created=False,
+            )
+        except httpx.RequestError as exc:
+            LOGGER.warning("Jira issue creation request failed: %s", exc)
+            return _json_error(
+                f"Request failed: {exc}",
+                "upstream_error",
+                project_key=project_key,
+                issue_type=normalized_type,
+                created=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize provider failures to MCP errors
+            LOGGER.exception("Jira issue creation failed")
+            code = "configuration_error" if isinstance(exc, RuntimeError) else "provider_error"
+            return _json_error(
+                f"{type(exc).__name__}: {exc}",
+                code,
+                project_key=project_key,
+                issue_type=normalized_type,
+                created=False,
+            )
+
+        return json.dumps(
+            {
+                "project_key": project_key,
+                "issue_type": {
+                    "id": issue_type_id,
+                    "name": _bounded_text(issue_type_metadata.get("name"), 255),
+                },
+                "issue_id": str(created_issue.get("id") or ""),
+                "issue_key": created_key,
+                "created": True,
+                "created_fields": list(canonical_fields),
+            },
             ensure_ascii=False,
         )
 

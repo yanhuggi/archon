@@ -1,20 +1,24 @@
 # archon-jira
 
-`archon-jira` 是一个面向 Jira Server REST API v2 的 MCP（Model Context Protocol）服务，为 AI 编程助手提供 JQL 元数据发现、任务搜索、详情、工作流流转、评论读写、任务编辑、附件下载和 Word 导出能力。
+`archon-jira` 是一个面向 Jira Server REST API v2 的 MCP（Model Context Protocol）服务，为 AI 编程助手提供账号与权限检查、JQL 元数据发现、任务搜索、详情、变更历史、创建与编辑、工作流流转、评论读写、附件下载和 Word 导出能力。
 
 ## 能力概览
 
 | Tool | 操作类型 | 说明 |
 |---|---|---|
+| `get_current_user` | Jira 只读 | 获取 MCP 当前认证的 Jira 账号 |
+| `get_my_permissions` | Jira 只读 | 按全局、项目或任务上下文检查当前账号权限 |
 | `search_jql_fields` | Jira 只读 | 查找标准字段和实例自定义字段的 JQL 元数据 |
 | `get_jql_value_suggestions` | Jira 只读 | 获取某个字段的候选值和可直接使用的 JQL literal |
 | `search_issues` | Jira 只读 | 使用 JQL 搜索任务 |
 | `get_issue` | Jira 只读 | 获取任务详情、关系、子任务和附件 ID |
+| `get_issue_changelog` | Jira 只读 | 分页获取任务字段变更历史 |
 | `get_transitions` | Jira 只读 | 获取任务当前可用的工作流流转 |
 | `get_comments` | Jira 只读 | 分页获取评论与讨论记录 |
 | `add_comment` | Jira 写入 | 为任务新增评论 |
 | `update_comment` | Jira 写入 | 编辑指定评论正文 |
 | `delete_comment` | Jira 写入 | 删除指定评论 |
+| `create_issue` | Jira 写入 | 校验创建元数据后新建一个任务 |
 | `update_issue` | Jira 写入 | 编辑现有任务的标准字段或自定义字段 |
 | `transition_issue` | Jira 写入 | 使用精确 transition ID 执行工作流流转 |
 | `get_attachment` | Jira 只读 | 内联读取文本或图片附件 |
@@ -24,7 +28,7 @@
 
 主要特性：
 
-- 十三个工具始终可发现；配置不完整时返回稳定的 `configuration_error`。
+- 十七个工具始终可发现；配置不完整时返回稳定的 `configuration_error`。
 - server instructions 和工具描述明确 JQL 探索、查询、评论、编辑、附件读取和导出的使用边界。
 - JQL 字段与候选值使用进程内缓存和原子 JSON 快照，避免每次搜索前请求元数据。
 - 工具参数不暴露内部 provider 选择。
@@ -37,6 +41,8 @@
 > `get_attachment` 只读返回附件内容，不写入本地磁盘。`export_issue` 会写入本地磁盘，仅在用户明确要求导出时调用，并为 `JIRA_ALLOWED_OUTPUT_DIR` 设置尽可能小的范围。
 >
 > `update_issue` 会直接修改远端 Jira 数据。仅在用户明确要求编辑任务时调用，并只发送用户要求变更的字段。
+>
+> `create_issue` 会创建新的远端 Jira 记录。仅在用户明确要求创建时调用；同一次界面提交及其重试应复用稳定的 `idempotency_key`。
 >
 > `transition_issue` 会直接修改远端工作流状态。先用 `get_transitions` 获取当前可用的数字 transition ID；不要通过 `update_issue` 修改 `status`。
 >
@@ -135,6 +141,22 @@ claude mcp list
 不要将真实密码提交到仓库。优先由 MCP 客户端的用户级配置或私有 `.env` 提供凭据。
 
 ## 工具详情
+
+### `get_current_user`
+
+无参数。返回当前 MCP 会话实际使用的 Jira 用户名、显示名、账号状态、时区和有限的群组信息，不返回密码或 Session Cookie。旧版 Jira Server 不提供 `/myself` 时，工具使用已认证用户名调用 `/user` 兼容查询。
+
+### `get_my_permissions`
+
+只读查询当前账号权限。权限通常随项目变化；判断编辑、流转或删除能力时优先提供 `issue_key` 或 `project_key`。
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `issue_key` | 空 | 可选任务上下文，与 `project_key` 互斥 |
+| `project_key` | 空 | 可选项目上下文，与 `issue_key` 互斥 |
+| `permissions` | 空 | 最多 50 个精确权限 key、ID 或名称；省略时返回全部可见权限 |
+
+不同 Jira 版本的权限 key 可能不同，例如当前实例可能使用 `DELETE_ISSUE` 而不是 `DELETE_ISSUES`。不确定时先省略 `permissions`，再使用返回的准确 key 过滤。未知值通过 `unknown_permissions` 明确返回。
 
 ### `search_jql_fields`
 
@@ -236,6 +258,16 @@ search_issues(jql="assignee = currentUser() AND resolution = Unresolved")
 字段值中的 `|` 和换行会转义,Jira 内容无法伪造表格结构。附件被省略时仍可用
 `get_attachment` 按 ID 单独读取。
 
+### `get_issue_changelog`
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `issue_key` | 必填 | Jira issue key |
+| `max_results` | `50` | 每页历史数量，范围 1–100 |
+| `start_at` | `0` | 分页偏移 |
+
+返回每次变更的作者、时间以及字段变更前后的 ID 和显示值，单值和单次变更项数量均有上限。新版 Jira 使用独立 changelog 分页接口；旧版 Jira 自动回退到 `expand=changelog`。如果旧版接口只返回部分历史，结果会设置 `pagination_supported=false`、`warning` 和空的 `next_start_at`，不会伪装为完整证据。
+
 ### `get_transitions`
 
 返回当前账号对指定任务此刻可执行的工作流流转，包括数字 transition ID、
@@ -308,6 +340,35 @@ ID，不按正文猜测目标评论。
 |---|---:|---|
 | `issue_key` | 必填 | Jira issue key |
 | `comment_id` | 必填 | `get_comments` 返回的数字评论 ID |
+
+### `create_issue`
+
+仅在用户明确要求创建任务时调用。工具先读取 Jira `createmeta`，确认项目、Issue 类型、字段和必填项全部可用；任一校验失败都不会发送创建请求。
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `project_key` | 必填 | 精确 Jira 项目 key |
+| `issue_type` | 必填 | 精确 Issue 类型数字 ID 或名称 |
+| `fields` | 必填 | 不含 `project`、`issuetype` 的 Jira REST API v2 原生字段对象，最多 50 个字段 |
+| `idempotency_key` | 空 | 同一次用户提交及其重试使用的稳定键，最长 200 字符 |
+
+```text
+create_issue(
+  project_key="APP",
+  issue_type="Task",
+  fields={"summary": "新增登录超时提示", "description": "需求说明"},
+  idempotency_key="create-form-018f6f8d"
+)
+```
+
+`project` 和 `issuetype` 必须通过独立参数传入，不能在 `fields` 中覆盖。成功返回新任务的 ID 和 key。
+
+服务端在同一 MCP 进程内提供两层重复提交保护：
+
+- 未传 `idempotency_key` 时，5 秒内项目、类型和字段完全相同的请求只创建一次，后续调用返回同一 Issue Key 并设置 `deduplicated=true`。
+- 传入稳定 key 时，同一 key 和相同数据的成功结果最多保留 24 小时；同一 key 搭配不同数据会返回 `idempotency_key_reused`，不会创建。
+
+去重缓存不跨 MCP 进程持久化，因此界面仍应在首次点击后立即禁用提交按钮，并为一次表单提交生成一个 key。未知结果或连接中断后必须复用原 key，不能生成新 key 直接重试。
 
 ### `update_issue`
 

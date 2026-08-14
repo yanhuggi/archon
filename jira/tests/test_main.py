@@ -34,15 +34,19 @@ def test_create_server_always_exposes_stable_tools() -> None:
     tools = asyncio.run(server.list_tools())
     prompts = asyncio.run(server.list_prompts())
     assert [tool.name for tool in tools] == [
+        "get_current_user",
+        "get_my_permissions",
         "search_jql_fields",
         "get_jql_value_suggestions",
         "search_issues",
         "get_issue",
+        "get_issue_changelog",
         "get_transitions",
         "get_comments",
         "add_comment",
         "update_comment",
         "delete_comment",
+        "create_issue",
         "update_issue",
         "transition_issue",
         "get_attachment",

@@ -18,11 +18,15 @@ from server.config import SUPPORTED_TRANSPORTS, JiraConfig
 from server.instructions import SERVER_INSTRUCTIONS
 from server.providers.jira import JiraProvider
 from server.tools.add_comment import register as register_add_comment
+from server.tools.create_issue import register as register_create_issue
 from server.tools.delete_comment import register as register_delete_comment
 from server.tools.export_issue import register as register_export_issue
 from server.tools.get_attachment import register as register_get_attachment
 from server.tools.get_comments import register as register_get_comments
+from server.tools.get_current_user import register as register_get_current_user
 from server.tools.get_issue import register as register_get_issue
+from server.tools.get_issue_changelog import register as register_get_issue_changelog
+from server.tools.get_my_permissions import register as register_get_my_permissions
 from server.tools.get_transitions import register as register_get_transitions
 from server.tools.get_jql_value_suggestions import (
     register as register_get_jql_value_suggestions,
@@ -76,20 +80,24 @@ def create_server(config: JiraConfig | None = None) -> MCPServer:
     server = MCPServer(
         name=SERVER_NAME,
         title="Archon Jira",
-        description="MCP server for Jira issue/comment retrieval, controlled editing, and local exports.",
+        description="MCP server for Jira inspection, issue/comment workflows, and local exports.",
         instructions=SERVER_INSTRUCTIONS,
         version=SERVER_VERSION,
         log_level=config.log_level,
     )
+    register_get_current_user(server, provider=provider)
+    register_get_my_permissions(server, provider=provider)
     register_search_jql_fields(server, provider=provider)
     register_get_jql_value_suggestions(server, provider=provider)
     register_search_issues(server, provider=provider)
     register_get_issue(server, provider=provider)
+    register_get_issue_changelog(server, provider=provider)
     register_get_transitions(server, provider=provider)
     register_get_comments(server, provider=provider)
     register_add_comment(server, provider=provider)
     register_update_comment(server, provider=provider)
     register_delete_comment(server, provider=provider)
+    register_create_issue(server, provider=provider)
     register_update_issue(server, provider=provider)
     register_transition_issue(server, provider=provider)
     register_get_attachment(server, provider=provider)

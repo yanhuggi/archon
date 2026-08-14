@@ -11,6 +11,20 @@ from typing import Protocol, runtime_checkable
 class JiraProvider(Protocol):
     """Protocol for Jira API backend implementations."""
 
+    def get_current_user(self, **kwargs) -> str:
+        """Get the Jira user authenticated by the current MCP server."""
+        ...
+
+    def get_my_permissions(
+        self,
+        issue_key: str | None = None,
+        project_key: str | None = None,
+        permissions: list[str] | None = None,
+        **kwargs,
+    ) -> str:
+        """Get current-account permissions in an optional issue or project context."""
+        ...
+
     def search_issues(
         self, jql: str, max_results: int = 50, start_at: int = 0, **kwargs
     ) -> str:
@@ -35,6 +49,12 @@ class JiraProvider(Protocol):
 
     def get_issue_json(self, issue_key: str, **kwargs) -> dict:
         """Get full issue details and return structured JSON dictionary."""
+        ...
+
+    def get_issue_changelog(
+        self, issue_key: str, max_results: int = 50, start_at: int = 0, **kwargs
+    ) -> str:
+        """Get paginated field-change history for a Jira issue."""
         ...
 
     def get_transitions(self, issue_key: str, **kwargs) -> str:
@@ -71,6 +91,17 @@ class JiraProvider(Protocol):
 
     def update_issue(self, issue_key: str, fields: dict[str, object], **kwargs) -> str:
         """Update Jira issue fields and return a structured result string."""
+        ...
+
+    def create_issue(
+        self,
+        project_key: str,
+        issue_type: str,
+        fields: dict[str, object],
+        idempotency_key: str | None = None,
+        **kwargs,
+    ) -> str:
+        """Create one Jira issue after validating create metadata."""
         ...
 
     def get_attachment(self, attachment_id: str, **kwargs) -> str:
