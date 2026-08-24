@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_PATH="$0"
+case "$SCRIPT_PATH" in
+  /*) : ;;
+  *) SCRIPT_PATH="$(pwd)/$SCRIPT_PATH" ;;
+esac
+
+while [ -h "$SCRIPT_PATH" ]; do
+  SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)
+  LINK_TARGET=$(readlink "$SCRIPT_PATH")
+  case "$LINK_TARGET" in
+    /*) SCRIPT_PATH="$LINK_TARGET" ;;
+    *) SCRIPT_PATH="$SCRIPT_DIR/$LINK_TARGET" ;;
+  esac
+done
+
+APP_HOME=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")/.." && pwd -P)
+
+if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/java" ]; then
+  JAVA_EXE="${JAVA_HOME}/bin/java"
+else
+  JAVA_EXE=java
+fi
+
+CLASSPATH="${APP_HOME}/lib/*"
+exec "$JAVA_EXE" ${DEFAULT_JVM_OPTS:-} ${JAVA_OPTS:-} ${JDBSEE_OPTS:-} \
+  -Djdbsee.home="$APP_HOME" -Dtextdb.allow_full_path=true -Dfile.encoding=UTF-8 \
+  -cp "$CLASSPATH" com.archon.jdbsee.jdbcli.CliApplication "$@"

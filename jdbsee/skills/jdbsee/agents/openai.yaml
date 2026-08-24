@@ -1,0 +1,4 @@
+interface:
+  display_name: "JDBSee"
+  short_description: "Query and manage JDBC databases with JDBSee"
+  default_prompt: "Use $jdbsee to inspect this JDBC database and complete the requested operation safely."

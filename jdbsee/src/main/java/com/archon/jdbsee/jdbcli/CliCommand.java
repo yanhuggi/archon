@@ -1,0 +1,7 @@
+package com.archon.jdbsee.jdbcli;
+
+/**
+ * Marker interface for CLI commands
+ */
+public interface CliCommand extends Runnable{
+}

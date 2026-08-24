@@ -1,0 +1,123 @@
+= JDBSEE CLI 2.1.1
+
+:toc:
+
+== Overview
+
+JDBSee provides batch JDBC access, persistent driver/alias settings, schema
+inspection, and an MCP server. The 2.1.1 fork is batch-oriented; the upstream
+`shell`, `connect`, `run`, and `describe` commands are not part of this fork.
+
+== Query
+
+`query` accepts only read-only `SELECT` statements. Non-SELECT statements,
+`SELECT ... FOR UPDATE`, parse failures, and suspicious multi-statement patterns
+are rejected.
+
+[source,shell]
+----
+jdbsee query [CONNECTION OPTIONS] [OUTPUT OPTIONS] "SELECT ..."
+----
+
+Connection options:
+
+* `-a, --alias`: reuse a stored connection alias.
+* `-l, --url`: JDBC URL; overrides the alias URL when both are present.
+* `-u, --user` and `-p, --password`: connection credentials.
+* `-P, --ask-for-password`: read the password from the console.
+* `-j, --jar`: load a JDBC driver from a JAR.
+* `-d, --dependency`: resolve a Maven driver dependency.
+* `-c, --driver-class`: explicit JDBC driver class.
+
+Output options:
+
+* `-f, --format`: `json`, `markdown`, or `csv`.
+* `--metadata`: `basic`, `enhanced`, or `full`.
+* `-o, --output-file`: write output to a file.
+
+== Execute
+
+`execute` handles validated DDL/DML. `SELECT`, `TRUNCATE`, `DROP DATABASE`, and
+blocked patterns are rejected.
+
+[source,shell]
+----
+jdbsee execute -a local "UPDATE contacts SET active = true WHERE id = 1"
+jdbsee execute -a local --sql-file migration.sql
+----
+
+Multiple semicolon-separated statements are supported.
+
+== Drivers
+
+[source,shell]
+----
+jdbsee driver create NAME [-c CLASS] [-m CLASS_REGEX] [-j JAR]... [-d GAV]...
+jdbsee driver list
+jdbsee driver show DRIVER_ID
+jdbsee driver delete DRIVER_ID...
+jdbsee driver jar-add DRIVER_ID JAR...
+jdbsee driver jar-remove JAR_ID...
+jdbsee driver dependency-add DRIVER_ID GAV...
+jdbsee driver dependency-remove DEPENDENCY_ID...
+----
+
+Relative JARs must resolve inside a configured `dropins` directory. Maven
+coordinates use `group:artifact:version` notation.
+
+== Aliases
+
+[source,shell]
+----
+jdbsee alias create DRIVER NAME URL [-u USER] [-p PASSWORD] [-P] [-r REMARK]
+jdbsee alias list
+jdbsee alias show ALIAS_ID
+jdbsee alias delete ALIAS_ID...
+----
+
+Passwords are encrypted before persistence. On first startup, legacy plaintext
+passwords are migrated to AES-256-GCM ciphertext using the key at
+`$HOME/.jdbsee/.master.key`.
+
+== Schema
+
+[source,shell]
+----
+jdbsee schema tables [CONNECTION OPTIONS] [PATTERN]
+jdbsee schema views [CONNECTION OPTIONS] [PATTERN]
+jdbsee schema driver [CONNECTION OPTIONS] [PATTERN]
+----
+
+== MCP Server
+
+[source,shell]
+----
+jdbsee mcp start [--alias NAME] [--port PORT] [--timeout SECONDS] [--max-results ROWS]
+----
+
+The server exposes JSON-RPC over HTTP/SSE at `/mcp` and provides these tools:
+
+* `execute_query`
+* `list_tables`
+* `describe_table`
+* `get_result`
+* `list_aliases`
+
+Query results are cached and retrieved in pages through `get_result`.
+
+== Persistent Data
+
+Driver and alias settings use HSQLDB text tables under
+`$HOME/.jdbsee/data`. Process-local reentrant locking and a cross-process file
+lock serialize schema migrations and settings writes.
+
+== Driver Loading
+
+JDBC drivers can be loaded from:
+
+1. Maven dependencies supplied with `--dependency`.
+2. Explicit files supplied with `--jar`.
+3. JARs placed in the user or installation `dropins` directory.
+
+An explicit `--driver-class` is recommended when a JAR contains multiple JDBC
+driver implementations.

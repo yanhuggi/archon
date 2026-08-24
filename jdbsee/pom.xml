@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.archon.jdbsee</groupId>
+  <artifactId>jdbsee</artifactId>
+  <version>2.1.1</version>
+  <name>jdbsee</name>
+  <description>A minimalistic CLI for jdbc operations</description>
+  <packaging>jar</packaging>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+    <maven.compiler.source>1.8</maven.compiler.source>
+    <maven.compiler.target>1.8</maven.compiler.target>
+    <distribution.finalName>jdbsee-${project.version}</distribution.finalName>
+    <groovy.version>3.0.25</groovy.version>
+    <dagger.version>2.14.1</dagger.version>
+    <junit.version>4.13.2</junit.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency><groupId>org.antlr</groupId><artifactId>antlr-runtime</artifactId><version>3.5.2</version></dependency>
+      <dependency><groupId>com.google.errorprone</groupId><artifactId>error_prone_annotations</artifactId><version>2.10.0</version></dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <dependency><groupId>com.google.dagger</groupId><artifactId>dagger</artifactId><version>${dagger.version}</version></dependency>
+
+    <dependency><groupId>org.codehaus.groovy</groupId><artifactId>groovy</artifactId><version>${groovy.version}</version></dependency>
+    <dependency><groupId>org.codehaus.groovy</groupId><artifactId>groovy-cli-picocli</artifactId><version>${groovy.version}</version></dependency>
+    <dependency><groupId>org.codehaus.groovy</groupId><artifactId>groovy-json</artifactId><version>${groovy.version}</version></dependency>
+    <dependency><groupId>org.codehaus.groovy</groupId><artifactId>groovy-sql</artifactId><version>${groovy.version}</version></dependency>
+
+    <dependency><groupId>com.google.guava</groupId><artifactId>guava</artifactId><version>24.0-jre</version></dependency>
+    <dependency><groupId>org.apache.ivy</groupId><artifactId>ivy</artifactId><version>2.4.0</version></dependency>
+    <dependency><groupId>org.reflections</groupId><artifactId>reflections</artifactId><version>0.9.11</version></dependency>
+    <dependency><groupId>info.picocli</groupId><artifactId>picocli</artifactId><version>4.6.3</version></dependency>
+    <dependency><groupId>de.vandermeer</groupId><artifactId>asciitable</artifactId><version>0.3.2</version></dependency>
+    <dependency><groupId>de.vandermeer</groupId><artifactId>skb-interfaces</artifactId><version>0.0.2</version></dependency>
+
+    <dependency><groupId>org.jdbi</groupId><artifactId>jdbi3-core</artifactId><version>3.0.1</version></dependency>
+    <dependency><groupId>org.jdbi</groupId><artifactId>jdbi3-sqlobject</artifactId><version>3.0.1</version></dependency>
+    <dependency><groupId>com.fasterxml.jackson.core</groupId><artifactId>jackson-databind</artifactId><version>2.9.4</version></dependency>
+    <dependency><groupId>com.fasterxml.jackson.dataformat</groupId><artifactId>jackson-dataformat-csv</artifactId><version>2.9.4</version></dependency>
+    <dependency><groupId>com.google.code.gson</groupId><artifactId>gson</artifactId><version>2.8.9</version></dependency>
+    <dependency><groupId>com.github.jsqlparser</groupId><artifactId>jsqlparser</artifactId><version>4.6</version></dependency>
+    <dependency><groupId>com.github.javaparser</groupId><artifactId>javaparser-core</artifactId><version>3.25.6</version></dependency>
+    <dependency><groupId>com.github.ben-manes.caffeine</groupId><artifactId>caffeine</artifactId><version>2.9.3</version></dependency>
+    <dependency><groupId>org.eclipse.jetty</groupId><artifactId>jetty-server</artifactId><version>9.4.44.v20210927</version></dependency>
+    <dependency><groupId>org.eclipse.jetty</groupId><artifactId>jetty-servlet</artifactId><version>9.4.44.v20210927</version></dependency>
+    <dependency><groupId>javax.servlet</groupId><artifactId>javax.servlet-api</artifactId><version>3.1.0</version></dependency>
+    <dependency><groupId>org.apache.commons</groupId><artifactId>commons-lang3</artifactId><version>3.5</version></dependency>
+    <dependency><groupId>commons-io</groupId><artifactId>commons-io</artifactId><version>2.5</version></dependency>
+    <dependency><groupId>org.slf4j</groupId><artifactId>jul-to-slf4j</artifactId><version>1.7.25</version></dependency>
+    <dependency><groupId>org.slf4j</groupId><artifactId>log4j-over-slf4j</artifactId><version>1.7.25</version></dependency>
+    <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId><version>1.7.25</version></dependency>
+    <dependency><groupId>ch.qos.logback</groupId><artifactId>logback-classic</artifactId><version>1.2.3</version></dependency>
+    <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-core</artifactId><version>5.0.7</version></dependency>
+    <dependency><groupId>org.hsqldb</groupId><artifactId>hsqldb</artifactId><version>2.4.0</version></dependency>
+
+    <dependency><groupId>org.jboss.shrinkwrap.resolver</groupId><artifactId>shrinkwrap-resolver-api</artifactId><version>3.1.3</version></dependency>
+    <dependency><groupId>org.jboss.shrinkwrap.resolver</groupId><artifactId>shrinkwrap-resolver-spi</artifactId><version>3.1.3</version></dependency>
+    <dependency><groupId>org.jboss.shrinkwrap.resolver</groupId><artifactId>shrinkwrap-resolver-api-maven</artifactId><version>3.1.3</version></dependency>
+    <dependency><groupId>org.jboss.shrinkwrap.resolver</groupId><artifactId>shrinkwrap-resolver-spi-maven</artifactId><version>3.1.3</version></dependency>
+    <dependency><groupId>org.jboss.shrinkwrap.resolver</groupId><artifactId>shrinkwrap-resolver-impl-maven</artifactId><version>3.1.3</version></dependency>
+    <dependency><groupId>org.jboss.shrinkwrap.resolver</groupId><artifactId>shrinkwrap-resolver-impl-maven-archive</artifactId><version>3.1.3</version></dependency>
+
+    <dependency><groupId>junit</groupId><artifactId>junit</artifactId><version>${junit.version}</version><scope>test</scope></dependency>
+    <dependency><groupId>net.bytebuddy</groupId><artifactId>byte-buddy</artifactId><version>1.6.5</version><scope>test</scope></dependency>
+    <dependency><groupId>org.objenesis</groupId><artifactId>objenesis</artifactId><version>2.5.1</version><scope>test</scope></dependency>
+  </dependencies>
+
+  <build>
+    <resources>
+      <resource><directory>src/main/resources</directory></resource>
+      <resource><directory>${project.build.directory}/generated-resources</directory></resource>
+    </resources>
+    <plugins>
+      <plugin>
+        <groupId>org.codehaus.gmavenplus</groupId><artifactId>gmavenplus-plugin</artifactId><version>3.0.2</version>
+        <executions>
+          <execution><id>generate-groovy-stubs</id><phase>generate-sources</phase><goals><goal>generateStubs</goal></goals></execution>
+          <execution><id>compile-groovy</id><phase>compile</phase><goals><goal>compile</goal></goals></execution>
+          <execution><id>generate-groovy-test-stubs</id><phase>generate-test-sources</phase><goals><goal>generateTestStubs</goal></goals></execution>
+          <execution><id>compile-groovy-tests</id><phase>test-compile</phase><goals><goal>compileTests</goal></goals></execution>
+        </executions>
+        <configuration><targetBytecode>1.8</targetBytecode><invokeDynamic>true</invokeDynamic></configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.13.0</version>
+        <configuration>
+          <source>1.8</source><target>1.8</target><encoding>UTF-8</encoding>
+          <annotationProcessorPaths>
+            <path><groupId>com.google.dagger</groupId><artifactId>dagger-compiler</artifactId><version>${dagger.version}</version></path>
+          </annotationProcessorPaths>
+        </configuration>
+        <executions>
+          <execution><id>default-compile</id><phase>compile</phase><goals><goal>compile</goal></goals></execution>
+          <execution><id>default-testCompile</id><phase>test-compile</phase><goals><goal>testCompile</goal></goals></execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId><version>3.2.5</version>
+      </plugin>
+      <plugin>
+        <groupId>org.jacoco</groupId><artifactId>jacoco-maven-plugin</artifactId><version>0.8.11</version>
+        <executions><execution><id>prepare-agent</id><goals><goal>prepare-agent</goal></goals></execution><execution><id>report</id><phase>test</phase><goals><goal>report</goal></goals></execution></executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId><artifactId>maven-jar-plugin</artifactId><version>3.4.2</version>
+        <configuration><archive><manifest><mainClass>com.archon.jdbsee.jdbcli.CliApplication</mainClass></manifest></archive></configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId><artifactId>maven-dependency-plugin</artifactId><version>3.7.1</version>
+        <executions><execution><id>stage-runtime-dependencies</id><phase>package</phase><goals><goal>copy-dependencies</goal></goals><configuration><outputDirectory>${project.build.directory}/distribution/lib</outputDirectory><includeScope>runtime</includeScope><excludeGroupIds>com.h2database,mysql,org.postgresql,com.microsoft.sqlserver,net.sf.jt400</excludeGroupIds><excludeTransitive>false</excludeTransitive></configuration></execution></executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId><artifactId>maven-antrun-plugin</artifactId><version>3.1.0</version>
+        <executions>
+          <execution><id>clean-distribution-staging</id><phase>prepare-package</phase><goals><goal>run</goal></goals><configuration><target>
+            <delete dir="${project.build.directory}/distribution"/>
+          </target></configuration></execution>
+          <execution><id>generate-version</id><phase>generate-resources</phase><goals><goal>run</goal></goals><configuration><target>
+            <mkdir dir="${project.build.directory}/generated-resources"/>
+            <echo file="${project.build.directory}/generated-resources/version.txt">Version: ${project.version}
+Buildtime: ${maven.build.timestamp}
+Application-name: ${project.artifactId}</echo>
+          </target></configuration></execution>
+          <execution><id>stage-distribution-files</id><phase>package</phase><goals><goal>run</goal></goals><configuration><target>
+          <mkdir dir="${project.build.directory}/distribution/bin"/><mkdir dir="${project.build.directory}/distribution/dropins"/>
+          <copy file="${project.build.directory}/${project.build.finalName}.jar" todir="${project.build.directory}/distribution/lib"/>
+          <copy todir="${project.build.directory}/distribution/bin"><fileset dir="src/assembly/bin"/></copy>
+          <copy todir="${project.build.directory}/distribution/dropins"><fileset dir="src/dist/dropins"/></copy>
+          <copy todir="${project.build.directory}/distribution/skills/jdbsee"><fileset dir="skills/jdbsee"/></copy>
+          <chmod file="${project.build.directory}/distribution/bin/jdbsee" perm="755"/>
+        </target></configuration></execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId><artifactId>maven-assembly-plugin</artifactId><version>3.7.1</version>
+        <executions>
+          <execution><id>distribution-zip</id><phase>package</phase><goals><goal>single</goal></goals><configuration><descriptors><descriptor>src/assembly/distribution.xml</descriptor></descriptors><finalName>${distribution.finalName}</finalName><appendAssemblyId>false</appendAssemblyId><formats><format>zip</format></formats></configuration></execution>
+          <execution><id>distribution-tar</id><phase>package</phase><goals><goal>single</goal></goals><configuration><descriptors><descriptor>src/assembly/distribution.xml</descriptor></descriptors><finalName>${distribution.finalName}</finalName><appendAssemblyId>false</appendAssemblyId><formats><format>tar</format></formats></configuration></execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <profile>
+      <id>full-distribution</id>
+      <properties><distribution.finalName>jdbsee-full-${project.version}</distribution.finalName></properties>
+      <dependencies>
+        <dependency><groupId>com.h2database</groupId><artifactId>h2</artifactId><version>1.4.196</version></dependency>
+        <dependency><groupId>mysql</groupId><artifactId>mysql-connector-java</artifactId><version>8.0.8-dmr</version></dependency>
+        <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><version>42.2.1</version></dependency>
+        <dependency><groupId>com.microsoft.sqlserver</groupId><artifactId>mssql-jdbc</artifactId><version>6.3.6.jre8-preview</version></dependency>
+        <dependency><groupId>net.sf.jt400</groupId><artifactId>jt400</artifactId><version>9.4</version></dependency>
+      </dependencies>
+      <build><plugins>
+        <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-dependency-plugin</artifactId><executions>
+          <execution><id>stage-full-drivers</id><phase>package</phase><goals><goal>copy-dependencies</goal></goals><configuration><outputDirectory>${project.build.directory}/distribution/dropins</outputDirectory><includeScope>runtime</includeScope><includeGroupIds>com.h2database,mysql,org.postgresql,com.microsoft.sqlserver,net.sf.jt400</includeGroupIds></configuration></execution>
+          <execution><id>stage-hsqldb-driver</id><phase>package</phase><goals><goal>copy</goal></goals><configuration><artifactItems><artifactItem><groupId>org.hsqldb</groupId><artifactId>hsqldb</artifactId><version>2.4.0</version></artifactItem></artifactItems><outputDirectory>${project.build.directory}/distribution/dropins</outputDirectory></configuration></execution>
+        </executions></plugin>
+      </plugins></build>
+    </profile>
+  </profiles>
+
+</project>
