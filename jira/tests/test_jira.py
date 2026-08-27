@@ -936,6 +936,68 @@ def test_update_issue_returns_jira_validation_details() -> None:
 
 
 # ---------------------------------------------------------------------------
+# issue links
+# ---------------------------------------------------------------------------
+
+
+def test_link_issue_blocks_success() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    response = MagicMock(status_code=201)
+    response.raise_for_status = MagicMock()
+    mock_client.post.return_value = response
+    provider._client = mock_client
+
+    data = json.loads(provider.link_issue_blocks("PROJ-1", "PROJ-2"))
+
+    assert data == {
+        "source_issue_key": "PROJ-1",
+        "target_issue_key": "PROJ-2",
+        "link_type": "Blocks",
+        "linked": True,
+    }
+    mock_client.post.assert_called_once_with(
+        "rest/api/2/issueLink",
+        json={
+            "type": {"name": "Blocks"},
+            "inwardIssue": {"key": "PROJ-1"},
+            "outwardIssue": {"key": "PROJ-2"},
+        },
+    )
+    provider.close()
+
+
+def test_link_issue_blocks_rejects_invalid_or_identical_keys_without_request() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    provider._client = mock_client
+
+    assert json.loads(provider.link_issue_blocks("bad key", "PROJ-2"))["error_code"] == "invalid_issue_key"
+    assert json.loads(provider.link_issue_blocks("PROJ-1", "proj-1"))["error_code"] == "invalid_issue_link"
+    mock_client.post.assert_not_called()
+    provider.close()
+
+
+def test_link_issue_blocks_returns_jira_validation_details() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    request = httpx.Request("POST", "https://jira.example.com/rest/api/2/issueLink")
+    mock_client.post.return_value = httpx.Response(
+        400,
+        request=request,
+        json={"errorMessages": ["A link of this type already exists"]},
+    )
+    provider._client = mock_client
+
+    data = json.loads(provider.link_issue_blocks("PROJ-1", "PROJ-2"))
+
+    assert data["error_code"] == "upstream_error"
+    assert data["linked"] is False
+    assert "A link of this type already exists" in data["error"]
+    provider.close()
+
+
+# ---------------------------------------------------------------------------
 # get_attachment
 # ---------------------------------------------------------------------------
 

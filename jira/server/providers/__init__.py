@@ -93,6 +93,15 @@ class JiraProvider(Protocol):
         """Update Jira issue fields and return a structured result string."""
         ...
 
+    def link_issue_blocks(
+        self,
+        source_issue_key: str,
+        target_issue_key: str,
+        **kwargs,
+    ) -> str:
+        """Create a Blocks link from the source issue to the target issue."""
+        ...
+
     def create_issue(
         self,
         project_key: str,

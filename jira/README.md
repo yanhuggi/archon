@@ -20,6 +20,7 @@
 | `delete_comment` | Jira 写入 | 删除指定评论 |
 | `create_issue` | Jira 写入 | 校验创建元数据后新建一个任务 |
 | `update_issue` | Jira 写入 | 编辑现有任务的标准字段或自定义字段 |
+| `link_issue_blocks` | Jira 写入 | 创建“源任务 blocks 目标任务”的连接 |
 | `transition_issue` | Jira 写入 | 使用精确 transition ID 执行工作流流转 |
 | `get_attachment` | Jira 只读 | 内联读取文本或图片附件 |
 | `export_issue` | 本地写入 | 将任务导出为 `.docx` |
@@ -28,7 +29,7 @@
 
 主要特性：
 
-- 十七个工具始终可发现；配置不完整时返回稳定的 `configuration_error`。
+- 十八个工具始终可发现；配置不完整时返回稳定的 `configuration_error`。
 - server instructions 和工具描述明确 JQL 探索、查询、评论、编辑、附件读取和导出的使用边界。
 - JQL 字段与候选值使用进程内缓存和原子 JSON 快照，避免每次搜索前请求元数据。
 - 工具参数不暴露内部 provider 选择。
@@ -41,6 +42,8 @@
 > `get_attachment` 只读返回附件内容，不写入本地磁盘。`export_issue` 会写入本地磁盘，仅在用户明确要求导出时调用，并为 `JIRA_ALLOWED_OUTPUT_DIR` 设置尽可能小的范围。
 >
 > `update_issue` 会直接修改远端 Jira 数据。仅在用户明确要求编辑任务时调用，并只发送用户要求变更的字段。
+>
+> `link_issue_blocks` 会直接创建远端任务关系。`source_issue_key` 为阻塞方，`target_issue_key` 为被阻塞方；仅在用户明确要求时调用，未知结果不可盲目重试。
 >
 > `create_issue` 会创建新的远端 Jira 记录。仅在用户明确要求创建时调用；同一次界面提交及其重试应复用稳定的 `idempotency_key`。
 >
@@ -393,6 +396,24 @@ update_issue(
 自定义字段应使用确切的 `customfield_12345` ID 和 Jira 要求的 JSON 形状。
 状态流转和评论不属于此工具；它们需要独立的 Jira API 操作。
 
+### `link_issue_blocks`
+
+仅在用户明确要求创建阻塞关系时调用。源任务会阻塞目标任务，即 Jira 中源任务显示为
+“blocks 目标任务”，目标任务显示为“is blocked by 源任务”。该调用是非幂等远端写入，
+出现连接中断或未知结果时不要直接重试；先读取任务关系确认结果。
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `source_issue_key` | 必填 | 阻塞方任务 key |
+| `target_issue_key` | 必填 | 被阻塞方任务 key，且不能与源任务相同 |
+
+```text
+link_issue_blocks(
+  source_issue_key="APP-123",
+  target_issue_key="APP-456"
+)
+```
+
 ### `get_attachment`
 
 只读读取附件，不接受本地路径，也不会创建目录或写入文件。文本附件返回
@@ -439,6 +460,7 @@ JSON 工具调用失败时返回 `error` 与 `error_code`。`get_issue` 成功�
 | `ambiguous_jql_field` | 字段名称对应多个字段，需要改用 ID 或 `cf[ID]` |
 | `metadata_unsupported` | 当前 Jira 不支持候选值接口 |
 | `invalid_issue_key` | Issue key 格式不合法 |
+| `invalid_issue_link` | 任务连接的源/目标相同 |
 | `invalid_transition_id` | Transition ID 不是数字 |
 | `transition_unavailable` | 请求的流转当前不可用，未提交状态变更 |
 | `unavailable_transition_fields` | 请求字段不在流转页面中，未提交状态变更 |
@@ -458,7 +480,7 @@ JSON 工具调用失败时返回 `error` 与 `error_code`。`get_issue` 成功�
 
 ## Claude Code 模型策略
 
-Tool Search 可以通过十三个工具的名称和描述发现相应能力。为了提高调用稳定性，可在项目 `CLAUDE.md` 中加入：
+Tool Search 可以通过十八个工具的名称和描述发现相应能力。为了提高调用稳定性，可在项目 `CLAUDE.md` 中加入：
 
 ```markdown
 ## Jira
@@ -488,6 +510,8 @@ relationships, attachments, or comments.
   after obtaining its numeric ID from `get_comments`.
 - Use `update_issue` only when the user explicitly asks to change an issue. Read
   the issue first when current state matters, and send only requested fields.
+- Use `link_issue_blocks` only when the user explicitly asks to create a Blocks
+  relationship. The source issue blocks the target issue; do not reverse them.
 - Use `get_attachment` when the user needs to inspect an attachment, after
   obtaining its numeric ID from `get_issue`; it returns inline content and does
   not write files.
@@ -675,6 +699,7 @@ jira/
 │       ├── update_comment.py
 │       ├── delete_comment.py
 │       ├── update_issue.py
+│       ├── link_issue_blocks.py
 │       ├── transition_issue.py
 │       ├── get_attachment.py
 │       └── export_issue.py

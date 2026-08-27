@@ -31,6 +31,7 @@ from server.tools.get_transitions import register as register_get_transitions
 from server.tools.get_jql_value_suggestions import (
     register as register_get_jql_value_suggestions,
 )
+from server.tools.link_issue_blocks import register as register_link_issue_blocks
 from server.tools.search_issues import register as register_search_issues
 from server.tools.search_jql_fields import register as register_search_jql_fields
 from server.tools.update_comment import register as register_update_comment
@@ -99,6 +100,7 @@ def create_server(config: JiraConfig | None = None) -> MCPServer:
     register_delete_comment(server, provider=provider)
     register_create_issue(server, provider=provider)
     register_update_issue(server, provider=provider)
+    register_link_issue_blocks(server, provider=provider)
     register_transition_issue(server, provider=provider)
     register_get_attachment(server, provider=provider)
     register_export_issue(server, config=config, provider=provider)

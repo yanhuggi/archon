@@ -2968,6 +2968,98 @@ class JiraProvider:
             ensure_ascii=False,
         )
 
+    # ── issue links ───────────────────────────────────────────────
+
+    def link_issue_blocks(
+        self,
+        source_issue_key: str,
+        target_issue_key: str,
+        **kwargs,
+    ) -> str:
+        """Create a Blocks relation where ``source_issue_key`` blocks ``target_issue_key``.
+
+        Jira's issue-link creation payload assigns the issue displayed with the
+        standard ``Blocks`` outward text to ``inwardIssue``. This is the inverse
+        of the names returned from an issue's ``issuelinks`` field, so keep the
+        mapping isolated here rather than exposing Jira's terminology to callers.
+        """
+        source_error = self._validate_issue_key(source_issue_key)
+        if source_error:
+            return _json_error(
+                source_error,
+                "invalid_issue_key",
+                source_issue_key=source_issue_key,
+                target_issue_key=target_issue_key,
+                linked=False,
+            )
+        target_error = self._validate_issue_key(target_issue_key)
+        if target_error:
+            return _json_error(
+                target_error,
+                "invalid_issue_key",
+                source_issue_key=source_issue_key,
+                target_issue_key=target_issue_key,
+                linked=False,
+            )
+        if source_issue_key.upper() == target_issue_key.upper():
+            return _json_error(
+                "The source and target issue keys must differ",
+                "invalid_issue_link",
+                source_issue_key=source_issue_key,
+                target_issue_key=target_issue_key,
+                linked=False,
+            )
+
+        try:
+            self._request(
+                "POST",
+                "rest/api/2/issueLink",
+                json={
+                    "type": {"name": "Blocks"},
+                    "inwardIssue": {"key": source_issue_key},
+                    "outwardIssue": {"key": target_issue_key},
+                },
+            )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            LOGGER.warning("Jira issue-link creation returned HTTP %d", status)
+            return _json_error(
+                _http_error_message(exc),
+                _status_error_code(status),
+                source_issue_key=source_issue_key,
+                target_issue_key=target_issue_key,
+                linked=False,
+            )
+        except httpx.RequestError as exc:
+            LOGGER.warning("Jira issue-link creation request failed: %s", exc)
+            return _json_error(
+                f"Request failed: {exc}",
+                "upstream_error",
+                source_issue_key=source_issue_key,
+                target_issue_key=target_issue_key,
+                linked=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize provider failures to MCP errors
+            LOGGER.exception("Jira issue-link creation failed")
+            code = "configuration_error" if isinstance(exc, RuntimeError) else "provider_error"
+            return _json_error(
+                f"{type(exc).__name__}: {exc}",
+                code,
+                source_issue_key=source_issue_key,
+                target_issue_key=target_issue_key,
+                linked=False,
+            )
+
+        return json.dumps(
+            {
+                "source_issue_key": source_issue_key,
+                "target_issue_key": target_issue_key,
+                "link_type": "Blocks",
+                "linked": True,
+            },
+            ensure_ascii=False,
+        )
+
     # ── attachment content ────────────────────────────────────────
 
     def _fetch_attachment_content(self, attachment_id: str) -> tuple[dict, bytes] | str:
