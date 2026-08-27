@@ -3060,6 +3060,148 @@ class JiraProvider:
             ensure_ascii=False,
         )
 
+    def remove_issue_blocks(
+        self,
+        source_issue_key: str,
+        target_issue_key: str,
+        **kwargs,
+    ) -> str:
+        """Remove the Blocks relation where ``source_issue_key`` blocks ``target_issue_key``.
+
+        Jira requires the opaque issue-link ID to delete a relationship. The
+        MCP tool deliberately accepts the meaningful source/target pair instead
+        and discovers that ID immediately before deleting. It only accepts the
+        source issue's outward ``Blocks`` relation, preventing an inverted link
+        from being removed accidentally.
+        """
+        source_error = self._validate_issue_key(source_issue_key)
+        if source_error:
+            return _json_error(
+                source_error,
+                "invalid_issue_key",
+                source_issue_key=source_issue_key,
+                target_issue_key=target_issue_key,
+                removed=False,
+            )
+        target_error = self._validate_issue_key(target_issue_key)
+        if target_error:
+            return _json_error(
+                target_error,
+                "invalid_issue_key",
+                source_issue_key=source_issue_key,
+                target_issue_key=target_issue_key,
+                removed=False,
+            )
+        if source_issue_key.upper() == target_issue_key.upper():
+            return _json_error(
+                "The source and target issue keys must differ",
+                "invalid_issue_link",
+                source_issue_key=source_issue_key,
+                target_issue_key=target_issue_key,
+                removed=False,
+            )
+
+        try:
+            issue = self._request(
+                "GET",
+                f"rest/api/2/issue/{source_issue_key}",
+                params={"fields": "issuelinks"},
+            ).json()
+            fields = issue.get("fields") if isinstance(issue, dict) else None
+            raw_links = fields.get("issuelinks", []) if isinstance(fields, dict) else None
+            if not isinstance(raw_links, list):
+                return _json_error(
+                    "Jira issue response must contain an issuelinks list",
+                    "invalid_provider_response",
+                    source_issue_key=source_issue_key,
+                    target_issue_key=target_issue_key,
+                    removed=False,
+                )
+
+            matching_link_ids: list[str] = []
+            for link in raw_links:
+                if not isinstance(link, dict):
+                    continue
+                link_type = link.get("type")
+                outward_issue = link.get("outwardIssue")
+                if not isinstance(link_type, dict) or not isinstance(outward_issue, dict):
+                    continue
+                if link_type.get("name") != "Blocks":
+                    continue
+                if str(outward_issue.get("key") or "").upper() != target_issue_key.upper():
+                    continue
+                link_id = link.get("id")
+                if not isinstance(link_id, str) or not link_id.isdigit():
+                    return _json_error(
+                        "Matching Jira issue link has an invalid ID",
+                        "invalid_provider_response",
+                        source_issue_key=source_issue_key,
+                        target_issue_key=target_issue_key,
+                        removed=False,
+                    )
+                matching_link_ids.append(link_id)
+
+            if not matching_link_ids:
+                return _json_error(
+                    "No Blocks relationship from the source issue to the target issue was found",
+                    "issue_link_not_found",
+                    source_issue_key=source_issue_key,
+                    target_issue_key=target_issue_key,
+                    removed=False,
+                )
+            if len(matching_link_ids) > 1:
+                return _json_error(
+                    "Multiple matching Blocks relationships were found; none was removed",
+                    "ambiguous_issue_link",
+                    source_issue_key=source_issue_key,
+                    target_issue_key=target_issue_key,
+                    removed=False,
+                    matching_link_ids=matching_link_ids,
+                )
+
+            link_id = matching_link_ids[0]
+            self._request("DELETE", f"rest/api/2/issueLink/{link_id}")
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            LOGGER.warning("Jira issue-link deletion returned HTTP %d", status)
+            return _json_error(
+                _http_error_message(exc),
+                _status_error_code(status),
+                source_issue_key=source_issue_key,
+                target_issue_key=target_issue_key,
+                removed=False,
+            )
+        except httpx.RequestError as exc:
+            LOGGER.warning("Jira issue-link deletion request failed: %s", exc)
+            return _json_error(
+                f"Request failed: {exc}",
+                "upstream_error",
+                source_issue_key=source_issue_key,
+                target_issue_key=target_issue_key,
+                removed=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize provider failures to MCP errors
+            LOGGER.exception("Jira issue-link deletion failed")
+            code = "configuration_error" if isinstance(exc, RuntimeError) else "provider_error"
+            return _json_error(
+                f"{type(exc).__name__}: {exc}",
+                code,
+                source_issue_key=source_issue_key,
+                target_issue_key=target_issue_key,
+                removed=False,
+            )
+
+        return json.dumps(
+            {
+                "source_issue_key": source_issue_key,
+                "target_issue_key": target_issue_key,
+                "link_type": "Blocks",
+                "link_id": link_id,
+                "removed": True,
+            },
+            ensure_ascii=False,
+        )
+
     # ── attachment content ────────────────────────────────────────
 
     def _fetch_attachment_content(self, attachment_id: str) -> tuple[dict, bytes] | str:

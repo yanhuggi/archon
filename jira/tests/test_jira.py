@@ -997,6 +997,91 @@ def test_link_issue_blocks_returns_jira_validation_details() -> None:
     provider.close()
 
 
+def _issue_links_response(links: list[dict]) -> MagicMock:
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"fields": {"issuelinks": links}}
+    response.raise_for_status = MagicMock()
+    return response
+
+
+def test_remove_issue_blocks_success() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    mock_client.get.return_value = _issue_links_response([
+        {
+            "id": "10001",
+            "type": {"name": "Blocks"},
+            "outwardIssue": {"key": "PROJ-2"},
+        }
+    ])
+    delete_response = MagicMock(status_code=204)
+    delete_response.raise_for_status = MagicMock()
+    mock_client.delete.return_value = delete_response
+    provider._client = mock_client
+
+    data = json.loads(provider.remove_issue_blocks("PROJ-1", "PROJ-2"))
+
+    assert data == {
+        "source_issue_key": "PROJ-1",
+        "target_issue_key": "PROJ-2",
+        "link_type": "Blocks",
+        "link_id": "10001",
+        "removed": True,
+    }
+    mock_client.get.assert_called_once_with(
+        "rest/api/2/issue/PROJ-1",
+        params={"fields": "issuelinks"},
+    )
+    mock_client.delete.assert_called_once_with("rest/api/2/issueLink/10001")
+    provider.close()
+
+
+def test_remove_issue_blocks_does_not_delete_missing_or_reversed_relationship() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    mock_client.get.return_value = _issue_links_response([
+        {
+            "id": "10001",
+            "type": {"name": "Blocks"},
+            "inwardIssue": {"key": "PROJ-2"},
+        }
+    ])
+    provider._client = mock_client
+
+    data = json.loads(provider.remove_issue_blocks("PROJ-1", "PROJ-2"))
+
+    assert data["error_code"] == "issue_link_not_found"
+    assert data["removed"] is False
+    mock_client.delete.assert_not_called()
+    provider.close()
+
+
+def test_remove_issue_blocks_does_not_delete_ambiguous_relationships() -> None:
+    provider = JiraProvider()
+    mock_client = _make_mock_client()
+    mock_client.get.return_value = _issue_links_response([
+        {
+            "id": "10001",
+            "type": {"name": "Blocks"},
+            "outwardIssue": {"key": "PROJ-2"},
+        },
+        {
+            "id": "10002",
+            "type": {"name": "Blocks"},
+            "outwardIssue": {"key": "PROJ-2"},
+        },
+    ])
+    provider._client = mock_client
+
+    data = json.loads(provider.remove_issue_blocks("PROJ-1", "PROJ-2"))
+
+    assert data["error_code"] == "ambiguous_issue_link"
+    assert data["matching_link_ids"] == ["10001", "10002"]
+    assert data["removed"] is False
+    mock_client.delete.assert_not_called()
+    provider.close()
+
+
 # ---------------------------------------------------------------------------
 # get_attachment
 # ---------------------------------------------------------------------------

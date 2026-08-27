@@ -49,6 +49,7 @@ def test_create_server_always_exposes_stable_tools() -> None:
         "create_issue",
         "update_issue",
         "link_issue_blocks",
+        "remove_issue_blocks",
         "transition_issue",
         "get_attachment",
         "export_issue",
