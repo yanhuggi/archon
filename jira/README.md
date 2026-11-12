@@ -1,6 +1,6 @@
 # archon-jira
 
-`archon-jira` 是一个面向 Jira Server REST API v2 的 MCP（Model Context Protocol）服务，为 AI 编程助手提供账号与权限检查、JQL 元数据发现、任务搜索、详情、变更历史、创建与编辑、工作流流转、评论读写、附件下载和 Word 导出能力。
+`archon-jira` 是一个面向 Jira Server REST API v2 的 MCP（Model Context Protocol）服务，为 AI 编程助手提供账号与权限检查、JQL 元数据发现、任务搜索、详情、变更历史、创建、原生复制与编辑、工作流流转、评论读写、附件下载和 Word 导出能力。
 
 ## 能力概览
 
@@ -19,6 +19,7 @@
 | `update_comment` | Jira 写入 | 编辑指定评论正文 |
 | `delete_comment` | Jira 写入 | 删除指定评论 |
 | `create_issue` | Jira 写入 | 校验创建元数据后新建一个任务 |
+| `clone_issue` | Jira 写入 | 调用 Jira 原生复制，支持附件、子任务与关联关系选项 |
 | `update_issue` | Jira 写入 | 编辑现有任务的标准字段或自定义字段 |
 | `link_issue_blocks` | Jira 写入 | 创建“源任务 blocks 目标任务”的连接 |
 | `remove_issue_blocks` | Jira 写入 | 移除“源任务 blocks 目标任务”的连接 |
@@ -30,7 +31,7 @@
 
 主要特性：
 
-- 十九个工具始终可发现；配置不完整时返回稳定的 `configuration_error`。
+- 二十个工具始终可发现；配置不完整时返回稳定的 `configuration_error`。
 - server instructions 和工具描述明确 JQL 探索、查询、评论、编辑、附件读取和导出的使用边界。
 - JQL 字段与候选值使用进程内缓存和原子 JSON 快照，避免每次搜索前请求元数据。
 - 工具参数不暴露内部 provider 选择。
@@ -263,6 +264,48 @@ search_issues(jql="assignee = currentUser() AND resolution = Unresolved")
 
 字段值中的 `|` 和换行会转义,Jira 内容无法伪造表格结构。附件被省略时仍可用
 `get_attachment` 按 ID 单独读取。
+
+### `clone_issue`
+
+使用当前会话访问 Jira 的原生 `CloneIssueDetails` 表单并提交复制，字段复制、
+源任务关联和工作流初始状态由 Jira 自身处理。新任务位于原项目并保持原任务类型；
+评论、工时日志和历史记录不复制。
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `source_issue_key` | 必填 | 要复制的 Jira 任务编号 |
+| `summary` | `null` | 可选新标题；省略时保留 Jira 原生复制表单生成的标题 |
+| `clone_attachments` | `false` | 是否复制附件 |
+| `clone_subtasks` | `false` | 是否复制子任务 |
+| `clone_links` | `false` | 是否复制原任务的关联关系 |
+| `idempotency_key` | `null` | 同一次复制提交及其重试复用的稳定 key |
+
+```text
+clone_issue(
+  source_issue_key="APP-123",
+  summary="第二阶段任务",
+  clone_attachments=true,
+  clone_subtasks=true,
+  idempotency_key="clone-app-123-phase-2"
+)
+```
+
+成功返回新任务的 `issue_key`、`url`、`summary` 和 `cloned=true`。
+工具读取并提交原生 CSRF token；请求的选项在当前表单中不可用且源任务存在相应内容时，
+会在提交前拒绝。源任务没有附件、子任务或关联关系时，对应复制选项无需操作。
+普通成功请求短时间内自动去重，显式 key 的成功结果与所有结果未知的请求在当前进程中
+保留最多 24 小时；同一 key 不能用于不同源任务、标题或复制选项。
+
+原生复制可能在后台执行，工具仅在同一 Jira 实例内跟随任务进度页面。
+若提交后超时或响应无法确认，会返回 `clone_outcome_unknown`、
+`outcome_unknown=true` 和 `retry_blocked=true`，并在可用时提供 `progress_url`。
+此时先查看进度链接或搜索 Jira，避免使用新 key 再次提交。工具不会自动重发复制 POST，
+即使配置了 `JIRA_RETRY_MUTATIONS_ON_401`。去重记录不跨进程重启保存。
+
+Jira Server 的公开 REST API v2 没有原生 Clone 接口，本工具依赖 Jira 的网页入口。
+已对 Jira 6.0.5 的原生表单完成只读兼容验证，复制提交与结果处理使用模拟响应测试。
+其他版本或限制网页会话的部署可能返回 `clone_unavailable`。
+修改代码后的 MCP 服务需要重启或重新连接后才能发现新工具。
 
 ### `get_issue_changelog`
 

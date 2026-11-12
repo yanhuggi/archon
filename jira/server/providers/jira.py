@@ -507,8 +507,19 @@ class JiraProvider:
             return True
         return self._config().retry_mutations_on_401
 
-    def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
-        """Send one authenticated Jira request, re-authenticating once on 401."""
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        _retry_after_401: bool = True,
+        **kwargs,
+    ) -> httpx.Response:
+        """Send an authenticated request, optionally recovering once from a 401.
+
+        A caller can forbid recovery for a native action that must never be
+        resubmitted, including when general mutation recovery is enabled.
+        """
 
         last_attempt = 1
         for attempt in (0, last_attempt):
@@ -522,7 +533,11 @@ class JiraProvider:
                 # Drop exactly this session so the retry, and any later call,
                 # authenticates again instead of reusing a rejected cookie.
                 self._invalidate_client(client)
-                if attempt == last_attempt or not self._may_retry_after_401(method):
+                if (
+                    attempt == last_attempt
+                    or not _retry_after_401
+                    or not self._may_retry_after_401(method)
+                ):
                     raise
                 LOGGER.info("Jira session rejected %s %s; re-authenticating once", method, url)
                 continue
@@ -2833,6 +2848,32 @@ class JiraProvider:
                 "created_fields": list(canonical_fields),
             },
             ensure_ascii=False,
+        )
+
+    # ── clone_issue ───────────────────────────────────────────────
+
+    def clone_issue(
+        self,
+        source_issue_key: str,
+        summary: str | None = None,
+        clone_attachments: bool = False,
+        clone_subtasks: bool = False,
+        clone_links: bool = False,
+        idempotency_key: str | None = None,
+        **kwargs,
+    ) -> str:
+        """Clone through Jira's native web action and existing session."""
+
+        from server.providers.clone import clone_issue
+
+        return clone_issue(
+            self,
+            source_issue_key,
+            summary,
+            clone_attachments,
+            clone_subtasks,
+            clone_links,
+            idempotency_key,
         )
 
     # ── update_issue ──────────────────────────────────────────────

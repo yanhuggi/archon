@@ -18,6 +18,7 @@ from server.config import SUPPORTED_TRANSPORTS, JiraConfig
 from server.instructions import SERVER_INSTRUCTIONS
 from server.providers.jira import JiraProvider
 from server.tools.add_comment import register as register_add_comment
+from server.tools.clone_issue import register as register_clone_issue
 from server.tools.create_issue import register as register_create_issue
 from server.tools.delete_comment import register as register_delete_comment
 from server.tools.export_issue import register as register_export_issue
@@ -100,6 +101,7 @@ def create_server(config: JiraConfig | None = None) -> MCPServer:
     register_update_comment(server, provider=provider)
     register_delete_comment(server, provider=provider)
     register_create_issue(server, provider=provider)
+    register_clone_issue(server, provider=provider)
     register_update_issue(server, provider=provider)
     register_link_issue_blocks(server, provider=provider)
     register_remove_issue_blocks(server, provider=provider)

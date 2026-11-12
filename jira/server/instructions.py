@@ -42,6 +42,13 @@ to create one issue. Supply the exact project, issue type, and requested fields;
 reuse one stable `idempotency_key` for retries of the same user submission and
 never reuse that key with different fields.
 
+Use `clone_issue` only when the user explicitly asks to copy/clone a Jira issue.
+It submits Jira's native Clone action in the same project and issue type. Omit
+summary to preserve Jira's native clone title. Copy attachments, subtasks, and
+issue links only when requested. Reuse one stable `idempotency_key` for retries
+with identical options. If the outcome is unknown, check the returned progress
+URL or search Jira; never submit another clone speculatively.
+
 Use `get_transitions` to discover the transitions currently available for one
 issue and `transition_issue` only when the user explicitly asks to change its
 workflow state. Use the exact returned transition ID, never write `status` as a
@@ -197,4 +204,17 @@ Export one Jira issue to a local `.docx` document. Use only when the user asks
 for an offline Word copy. Includes metadata, description, subtasks, relations,
 and optional bounded text attachment content. Writes a file and obeys output-dir
 and overwrite rules.
+"""
+
+
+CLONE_ISSUE_DESCRIPTION = """\
+Clone one Jira issue using Jira Server's native Clone action and authenticated
+web session. Call only when the user explicitly asks to copy/clone an issue.
+Preserves Jira's native field-copy behavior, project, issue type, and initial
+workflow status. Optionally copy attachments, subtasks, and issue links; comments,
+worklogs, and history are not copied. Omit summary for Jira's native clone title.
+Unsupported requested options are rejected before submission. Exact duplicate
+requests are coalesced briefly; reuse one stable idempotency key for retries.
+If the result is unknown, check progress_url or search Jira before any manual
+retry. Native web action availability depends on the Jira version and web access.
 """

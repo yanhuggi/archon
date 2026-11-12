@@ -2,6 +2,7 @@
 
 from server.instructions import (
     CREATE_ISSUE_DESCRIPTION,
+    CLONE_ISSUE_DESCRIPTION,
     GET_ATTACHMENT_DESCRIPTION,
     ADD_COMMENT_DESCRIPTION,
     DELETE_COMMENT_DESCRIPTION,
@@ -87,3 +88,12 @@ def test_create_description_discloses_idempotency_boundary() -> None:
     assert "one MCP process" in CREATE_ISSUE_DESCRIPTION
     assert "POST result is unknown" in CREATE_ISSUE_DESCRIPTION
     assert "new key" in CREATE_ISSUE_DESCRIPTION
+
+
+def test_clone_instructions_describe_native_action_and_unknown_outcomes() -> None:
+    assert "clone_issue" in SERVER_INSTRUCTIONS
+    assert "native Clone action" in CLONE_ISSUE_DESCRIPTION
+    assert "explicitly asks" in CLONE_ISSUE_DESCRIPTION
+    assert "idempotency key" in CLONE_ISSUE_DESCRIPTION
+    assert "progress_url" in CLONE_ISSUE_DESCRIPTION
+    assert "web access" in CLONE_ISSUE_DESCRIPTION
