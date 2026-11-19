@@ -11,7 +11,7 @@
 | `search_jql_fields` | Jira 只读 | 查找标准字段和实例自定义字段的 JQL 元数据 |
 | `get_jql_value_suggestions` | Jira 只读 | 获取某个字段的候选值和可直接使用的 JQL literal |
 | `search_issues` | Jira 只读 | 使用 JQL 搜索任务 |
-| `get_issue` | Jira 只读 | 获取任务详情、关系、子任务和附件 ID |
+| `get_issue` | Jira 只读 | 获取任务摘要，或按 ID 完整回读一个文本字段 |
 | `get_issue_changelog` | Jira 只读 | 分页获取任务字段变更历史 |
 | `get_transitions` | Jira 只读 | 获取任务当前可用的工作流流转 |
 | `get_comments` | Jira 只读 | 分页获取评论与讨论记录 |
@@ -244,7 +244,7 @@ search_issues(jql="assignee = currentUser() AND resolution = Unresolved")
 
 ### `get_issue`
 
-参数 `issue_key` 接受 `APP-123` 形式的 Jira key。工具返回适合模型阅读的 Markdown，包含：
+参数 `issue_key` 接受 `APP-123` 形式的 Jira key。不传 `field_id` 时，工具返回 Markdown 摘要，包含：
 
 - 类型、状态、优先级、版本、组件和标签。
 - 经办人、报告人和配置的自定义字段。
@@ -265,6 +265,16 @@ search_issues(jql="assignee = currentUser() AND resolution = Unresolved")
 
 字段值中的 `|` 和换行会转义,Jira 内容无法伪造表格结构。附件被省略时仍可用
 `get_attachment` 按 ID 单独读取。
+
+**核对单字段全文。** 调用 `get_issue` 并传入一个准确的 Jira REST 字段 ID，例如：
+
+```json
+{"issue_key": "APP-123", "field_id": "customfield_12345"}
+```
+
+该模式只向 Jira 请求指定字段。成功的 JSON 包含 `issue_key`、`field_id` 和 `value`；文本的首尾空白、换行和 Markdown 字符保持原样，`null` 与空字符串 `""` 分别返回。Jira 未返回字段或返回非文本值时会报错；未返回字段不等同于返回 `null`。
+
+**60,000 字符是连接器的回读上限，不是调用端的接收或展示保证。** 超过上限时，连接器返回 `field_too_large`，不返回部分值。只有取得完整响应、能解析为合法且无错误的 JSON 对象，并确认其中的 `value` 存在且类型符合预期（字符串或 `null`），才比较 `value`。如果调用端或呈现层发生截断，不能确认全文；不要用片段或首尾相同代替全文相等。
 
 ### `clone_issue`
 
@@ -539,7 +549,7 @@ UTF-8 正文，图片以内联 MCP 图片内容返回；其他二进制附件只
 
 ## 错误契约
 
-JSON 工具调用失败时返回 `error` 与 `error_code`。`get_issue` 成功时返回 Markdown，失败时也返回相同 JSON 错误包络。
+JSON 工具调用失败时返回 `error` 与 `error_code`。`get_issue` 的摘要模式成功时返回 Markdown，失败时也返回相同 JSON 错误包络；单字段模式返回 JSON。
 
 常见错误码：
 
@@ -552,6 +562,10 @@ JSON 工具调用失败时返回 `error` 与 `error_code`。`get_issue` 成功�
 | `ambiguous_jql_field` | 字段名称对应多个字段，需要改用 ID 或 `cf[ID]` |
 | `metadata_unsupported` | 当前 Jira 不支持候选值接口 |
 | `invalid_issue_key` | Issue key 格式不合法 |
+| `invalid_field_id` | 单字段模式未使用一个准确的 REST 字段 ID |
+| `field_not_returned` | Jira 未返回指定字段；无法仅凭此区分不存在、不适用于该任务或当前账号不可见 |
+| `non_text_field` | 指定字段返回的既不是字符串也不是 `null` |
+| `field_too_large` | 文本字段超过 60,000 个字符，不返回字段值 |
 | `invalid_issue_link` | 任务连接的源/目标相同 |
 | `issue_link_not_found` | 未找到源任务 blocks 目标任务的连接，未删除任何关系 |
 | `ambiguous_issue_link` | 找到多条匹配连接，未删除任何关系 |
@@ -563,7 +577,7 @@ JSON 工具调用失败时返回 `error` 与 `error_code`。`get_issue` 成功�
 | `invalid_output_path` | 输出路径越界、为目录或不允许覆盖 |
 | `invalid_attachment_url` | 下载地址与 Jira 不同源 |
 | `attachment_too_large` | 声明大小或实际下载大小超过限制 |
-| `authentication_error` | Jira 返回 401/403；读操作已自动重新登录重试过一次 |
+| `authentication_error` | Jira 返回 401（读请求会按会话机制尝试重新认证）或 403（拒绝访问） |
 | `not_found` | Jira 返回 404 |
 | `rate_limited` | Jira 返回 429 |
 | `upstream_error` | 网络或其他 Jira HTTP 错误 |
@@ -592,7 +606,8 @@ relationships, attachments, or comments.
 - Use `get_jql_value_suggestions` only when a field is known but its valid value
   is uncertain. Use the returned `jql_literal`; do not invent custom values.
 - Use `search_issues` when the issue key is unknown or a list/filter is needed.
-- Use `get_issue` when a specific issue key is known.
+- Use `get_issue` when a specific issue key is known; pass an exact `field_id`
+  when verifying the full value of one text field.
 - Use `get_transitions` immediately before a requested workflow change.
 - Use `transition_issue` only with an exact transition ID returned by
   `get_transitions`; never update `status` as a normal field.

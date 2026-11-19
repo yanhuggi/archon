@@ -9,7 +9,7 @@ from server.tools.get_issue import register as register_tool
 
 
 class StubProvider:
-    def get_issue(self, issue_key: str, **kwargs) -> str:
+    def get_issue(self, issue_key: str) -> str:
         return f"# {issue_key} - Example\n\n**关联任务：**\n- Blocks TEST-2"
 
 

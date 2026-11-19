@@ -28,11 +28,13 @@ _MAX_OTHER_FIELD_LENGTH = 500
 _MAX_LIST_ITEMS = 50
 _MAX_INLINE_VALUES = 30
 _MAX_ISSUE_CHARS = 60_000
+_MAX_ISSUE_FIELD_CHARS = 60_000
 _MAX_SEARCH_RESULTS = 200
 _MAX_CACHED_VALUE_SUGGESTIONS = 1000
 _DEFAULT_MAX_ATTACHMENT_SIZE = DEFAULT_MAX_ATTACHMENT_SIZE
 _SAFE_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+$")
+_ISSUE_FIELD_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,99}")
 _PROJECT_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 _COMMENT_ID_RE = re.compile(r"^\d+$")
 _MAX_COMMENT_LENGTH = 32767
@@ -1565,10 +1567,58 @@ class JiraProvider:
             "attachments": attachments,
         }
 
-    def get_issue(self, issue_key: str, **kwargs) -> str:
+    def _get_issue_text_field(self, issue_key: str, field_id: str) -> str:
+        """Read one exact text value without the Markdown summary's rendering or limits."""
+        context = {"issue_key": issue_key, "field_id": field_id}
+        if not _ISSUE_FIELD_ID_RE.fullmatch(field_id):
+            return _json_error(
+                "Use one exact Jira REST field ID, such as description or customfield_12345",
+                "invalid_field_id",
+                issue_key=issue_key,
+            )
+
+        try:
+            response = self._request(
+                "GET", f"rest/api/2/issue/{issue_key}", params={"fields": field_id}
+            )
+        except httpx.HTTPStatusError as exc:
+            return _json_error(_http_error_message(exc), _status_error_code(exc.response.status_code), **context)
+        except httpx.RequestError as exc:
+            return _json_error(f"Request failed: {exc}", "upstream_error", **context)
+        except RuntimeError as exc:
+            return _json_error(str(exc), "configuration_error", **context)
+
+        try:
+            issue = response.json()
+        except ValueError:
+            issue = None
+        fields = issue.get("fields") if isinstance(issue, dict) else None
+        if not isinstance(fields, dict):
+            return _json_error(
+                "Jira issue response must contain a fields object", "invalid_provider_response", **context
+            )
+        if field_id not in fields:
+            return _json_error("Jira omitted the requested field", "field_not_returned", **context)
+
+        value = fields[field_id]
+        if value is not None and not isinstance(value, str):
+            return _json_error("Requested Jira field value is not text", "non_text_field", **context)
+        if value is not None and len(value) > _MAX_ISSUE_FIELD_CHARS:
+            return _json_error(
+                f"Jira field exceeds the {_MAX_ISSUE_FIELD_CHARS:,}-character readback limit",
+                "field_too_large",
+                length=len(value),
+                max_length=_MAX_ISSUE_FIELD_CHARS,
+                **context,
+            )
+        return json.dumps({**context, "value": value}, ensure_ascii=False)
+
+    def get_issue(self, issue_key: str, *, field_id: str | None = None, **kwargs) -> str:
         err = self._validate_issue_key(issue_key)
         if err:
             return _json_error(err, "invalid_issue_key", issue_key=issue_key)
+        if field_id is not None:
+            return self._get_issue_text_field(issue_key, field_id)
 
         field_map = self._get_field_map()
         custom_fields = ",".join(field_map.keys())

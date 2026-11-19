@@ -16,6 +16,7 @@ from server.providers.jira import (
     _MAX_FIELD_LENGTH,
     _MAX_INLINE_VALUES,
     _MAX_ISSUE_CHARS,
+    _MAX_ISSUE_FIELD_CHARS,
     _MAX_LIST_ITEMS,
     _MAX_OTHER_FIELD_LENGTH,
     _MAX_OTHER_FIELD_ROWS,
@@ -310,6 +311,76 @@ def test_get_issue_custom_field_truncation() -> None:
     assert result.count("x") == _MAX_OTHER_FIELD_LENGTH
     assert "..." in result
     provider.close()
+
+
+@pytest.mark.parametrize("value", [None, "", "字" * _MAX_ISSUE_FIELD_CHARS])
+def test_get_issue_text_field_returns_exact_value(value: str | None) -> None:
+    provider = JiraProvider(JiraConfig())
+    client = provider._client = _make_mock_client()
+    client.get.return_value.json.return_value = {"fields": {"description": value}}
+    assert json.loads(provider.get_issue("PROJ-1", field_id="description")) == {
+        "issue_key": "PROJ-1",
+        "field_id": "description",
+        "value": value,
+    }
+    client.get.assert_called_once_with("rest/api/2/issue/PROJ-1", params={"fields": "description"})
+
+
+@pytest.mark.parametrize(
+    ("issue", "code"),
+    [
+        ({"fields": {"description": "different field"}}, "field_not_returned"),
+        ({"fields": {"customfield_42": {"value": "Option"}}}, "non_text_field"),
+        ({"fields": {"customfield_42": []}}, "non_text_field"),
+        ({"fields": {"customfield_42": 42}}, "non_text_field"),
+        ({"fields": {"customfield_42": False}}, "non_text_field"),
+        ({"fields": []}, "invalid_provider_response"),
+        ({}, "invalid_provider_response"),
+    ],
+)
+def test_get_issue_text_field_reports_unavailable_and_nontext_values(issue, code: str) -> None:
+    provider = JiraProvider(JiraConfig())
+    client = provider._client = _make_mock_client()
+    client.get.return_value.json.return_value = issue
+    result = json.loads(provider.get_issue("PROJ-1", field_id="customfield_42"))
+    assert result["error_code"] == code
+    assert result["field_id"] == "customfield_42"
+    assert "value" not in result
+
+
+def test_get_issue_text_field_rejects_oversize_without_partial_value() -> None:
+    provider = JiraProvider(JiraConfig())
+    client = provider._client = _make_mock_client()
+    length = _MAX_ISSUE_FIELD_CHARS + 1
+    client.get.return_value.json.return_value = {"fields": {"description": "x" * length}}
+    result = json.loads(provider.get_issue("PROJ-1", field_id="description"))
+    assert result["error_code"] == "field_too_large"
+    assert result["length"] == length
+    assert result["max_length"] == _MAX_ISSUE_FIELD_CHARS
+    assert "value" not in result
+
+
+@pytest.mark.parametrize("field_id", ["", "*all", "-description", "summary,description", "Field Name", " description"])
+def test_get_issue_text_field_rejects_non_id_selectors_before_any_request(field_id: str) -> None:
+    provider = JiraProvider(JiraConfig())
+    with patch.object(provider, "_request") as request:
+        result = json.loads(provider.get_issue("PROJ-1", field_id=field_id))
+    assert result["error_code"] == "invalid_field_id"
+    request.assert_not_called()
+
+
+@pytest.mark.parametrize(("status", "code"), [(403, "authentication_error"), (404, "not_found")])
+def test_get_issue_text_field_surfaces_http_errors(status: int, code: str) -> None:
+    provider = JiraProvider(JiraConfig())
+    client = provider._client = _make_mock_client()
+    request = httpx.Request("GET", "https://jira.example.invalid/rest/api/2/issue/PROJ-1")
+    client.get.return_value = httpx.Response(status, request=request)
+
+    result = json.loads(provider.get_issue("PROJ-1", field_id="description"))
+    assert result["error_code"] == code
+    assert result["field_id"] == "description"
+    assert "value" not in result
+    client.get.assert_called_once()
 
 
 def test_get_issue_json_skips_the_unused_custom_field_lookup() -> None:

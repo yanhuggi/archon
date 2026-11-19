@@ -43,8 +43,8 @@ class JiraProvider(Protocol):
         """Get Jira-provided candidate values for one JQL field."""
         ...
 
-    def get_issue(self, issue_key: str, **kwargs) -> str:
-        """Get full issue details and return formatted result string."""
+    def get_issue(self, issue_key: str, *, field_id: str | None = None, **kwargs) -> str:
+        """Return the Markdown issue summary or a JSON readback of one exact text field."""
         ...
 
     def get_issue_json(self, issue_key: str, **kwargs) -> dict:
