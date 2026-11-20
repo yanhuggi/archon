@@ -360,27 +360,65 @@ def test_get_issue_text_field_rejects_oversize_without_partial_value() -> None:
     assert "value" not in result
 
 
-@pytest.mark.parametrize("field_id", ["", "*all", "-description", "summary,description", "Field Name", " description"])
+@pytest.mark.parametrize(
+    "field_id", ["", "*all", "-description", "summary,description", "Field Name", " description", "private\ud800"]
+)
 def test_get_issue_text_field_rejects_non_id_selectors_before_any_request(field_id: str) -> None:
     provider = JiraProvider(JiraConfig())
     with patch.object(provider, "_request") as request:
         result = json.loads(provider.get_issue("PROJ-1", field_id=field_id))
     assert result["error_code"] == "invalid_field_id"
+    assert "field_id" not in result
     request.assert_not_called()
 
 
-@pytest.mark.parametrize(("status", "code"), [(403, "authentication_error"), (404, "not_found")])
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [(403, "authentication_error"), (404, "not_found"), (429, "rate_limited"), (503, "upstream_error")],
+)
 def test_get_issue_text_field_surfaces_http_errors(status: int, code: str) -> None:
     provider = JiraProvider(JiraConfig())
     client = provider._client = _make_mock_client()
     request = httpx.Request("GET", "https://jira.example.invalid/rest/api/2/issue/PROJ-1")
-    client.get.return_value = httpx.Response(status, request=request)
+    client.get.return_value = httpx.Response(
+        status,
+        request=request,
+        json={"errorMessages": ["PRIVATE_ERROR_DETAIL"], "errors": {"description": "PRIVATE_FIELD_ERROR"}},
+    )
 
     result = json.loads(provider.get_issue("PROJ-1", field_id="description"))
-    assert result["error_code"] == code
-    assert result["field_id"] == "description"
-    assert "value" not in result
+    assert result == {
+        "issue_key": "PROJ-1",
+        "field_id": "description",
+        "error": f"Jira returned HTTP {status}",
+        "error_code": code,
+        "http_status": status,
+    }
     client.get.assert_called_once()
+
+
+def test_get_issue_text_field_hides_request_error_details() -> None:
+    provider = JiraProvider(JiraConfig())
+    client = provider._client = _make_mock_client()
+    client.get.side_effect = httpx.ReadTimeout("PRIVATE_EXCEPTION_DETAIL")
+
+    assert json.loads(provider.get_issue("PROJ-1", field_id="description")) == {
+        "issue_key": "PROJ-1",
+        "field_id": "description",
+        "error": "Could not complete the Jira field request",
+        "error_code": "upstream_error",
+    }
+
+
+def test_get_issue_text_field_reports_missing_configuration() -> None:
+    provider = JiraProvider(JiraConfig())
+
+    assert json.loads(provider.get_issue("PROJ-1", field_id="description")) == {
+        "issue_key": "PROJ-1",
+        "field_id": "description",
+        "error": "Jira connection is not configured",
+        "error_code": "configuration_error",
+    }
 
 
 def test_get_issue_json_skips_the_unused_custom_field_lookup() -> None:

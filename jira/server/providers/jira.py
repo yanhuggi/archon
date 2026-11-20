@@ -1569,29 +1569,34 @@ class JiraProvider:
 
     def _get_issue_text_field(self, issue_key: str, field_id: str) -> str:
         """Read one exact text value without the Markdown summary's rendering or limits."""
-        context = {"issue_key": issue_key, "field_id": field_id}
         if not _ISSUE_FIELD_ID_RE.fullmatch(field_id):
             return _json_error(
                 "Use one exact Jira REST field ID, such as description or customfield_12345",
                 "invalid_field_id",
                 issue_key=issue_key,
             )
+        context = {"issue_key": issue_key, "field_id": field_id}
 
         try:
             response = self._request(
                 "GET", f"rest/api/2/issue/{issue_key}", params={"fields": field_id}
             )
         except httpx.HTTPStatusError as exc:
-            return _json_error(_http_error_message(exc), _status_error_code(exc.response.status_code), **context)
-        except httpx.RequestError as exc:
-            return _json_error(f"Request failed: {exc}", "upstream_error", **context)
-        except RuntimeError as exc:
-            return _json_error(str(exc), "configuration_error", **context)
+            status = exc.response.status_code
+            return _json_error(
+                f"Jira returned HTTP {status}", _status_error_code(status), http_status=status, **context
+            )
+        except httpx.RequestError:
+            return _json_error("Could not complete the Jira field request", "upstream_error", **context)
+        except RuntimeError:
+            if self._config().is_configured:
+                raise
+            return _json_error("Jira connection is not configured", "configuration_error", **context)
 
         try:
             issue = response.json()
         except ValueError:
-            issue = None
+            return _json_error("Jira returned invalid JSON", "invalid_provider_response", **context)
         fields = issue.get("fields") if isinstance(issue, dict) else None
         if not isinstance(fields, dict):
             return _json_error(
@@ -1603,19 +1608,27 @@ class JiraProvider:
         value = fields[field_id]
         if value is not None and not isinstance(value, str):
             return _json_error("Requested Jira field value is not text", "non_text_field", **context)
-        if value is not None and len(value) > _MAX_ISSUE_FIELD_CHARS:
-            return _json_error(
-                f"Jira field exceeds the {_MAX_ISSUE_FIELD_CHARS:,}-character readback limit",
-                "field_too_large",
-                length=len(value),
-                max_length=_MAX_ISSUE_FIELD_CHARS,
-                **context,
-            )
+        if value is not None:
+            if len(value) > _MAX_ISSUE_FIELD_CHARS:
+                return _json_error(
+                    f"Jira field exceeds the {_MAX_ISSUE_FIELD_CHARS:,}-character readback limit",
+                    "field_too_large",
+                    length=len(value),
+                    max_length=_MAX_ISSUE_FIELD_CHARS,
+                    **context,
+                )
+            # JSON decoding accepts escaped lone surrogates, which MCP cannot send as UTF-8.
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                return _json_error("Jira field contains invalid Unicode", "invalid_provider_response", **context)
         return json.dumps({**context, "value": value}, ensure_ascii=False)
 
     def get_issue(self, issue_key: str, *, field_id: str | None = None, **kwargs) -> str:
         err = self._validate_issue_key(issue_key)
         if err:
+            if field_id is not None:
+                return _json_error("Use a valid Jira issue key, such as PROJ-123", "invalid_issue_key")
             return _json_error(err, "invalid_issue_key", issue_key=issue_key)
         if field_id is not None:
             return self._get_issue_text_field(issue_key, field_id)

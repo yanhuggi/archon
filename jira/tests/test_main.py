@@ -64,6 +64,9 @@ def test_create_server_always_exposes_stable_tools() -> None:
     issue = next(tool for tool in tools if tool.name == "get_issue")
     assert issue.annotations.read_only_hint is True
     assert issue.annotations.destructive_hint is False
+    assert "complete raw MCP response" in issue.description
+    assert "neither `error` nor `error_code`" in issue.description
+    assert "report full equality unverified" in issue.description
     attachment = next(tool for tool in tools if tool.name == "get_attachment")
     assert attachment.input_schema["required"] == ["attachment_id"]
     assert attachment.annotations.read_only_hint is True
@@ -140,6 +143,43 @@ def test_get_issue_text_field_over_mcp(oversize: bool) -> None:
     else:
         assert payload == {"issue_key": "APP-123", "field_id": field_id, "value": value}
     assert len(requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        (br'{"fields":{"description":"PRIVATE_FIELD_VALUE\ud800"}}', "Jira field contains invalid Unicode"),
+        (b'{"fields":{"description":"PRIVATE_FIELD_VALUE\xff"}}', "Jira returned invalid JSON"),
+        (b"PRIVATE_INVALID_JSON", "Jira returned invalid JSON"),
+    ],
+    ids=["unpaired-surrogate", "invalid-utf8", "invalid-json"],
+)
+def test_get_issue_text_field_rejects_invalid_responses_over_mcp(body: bytes, message: str) -> None:
+    config = JiraConfig()
+    provider = JiraProvider(config)
+    with httpx.Client(
+        base_url="https://jira.example.invalid/",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=body)),
+    ) as client:
+        provider._client = client
+        with patch("server.main.JiraProvider", return_value=provider), patch("server.main.atexit.register"):
+            server = create_server(config)
+
+        async def call_tool():
+            async with Client(server) as mcp:
+                return await mcp.call_tool("get_issue", {"issue_key": "APP-123", "field_id": "description"})
+
+        result = asyncio.run(call_tool())
+
+    assert result.is_error is False
+    assert len(result.content) == 1
+    assert isinstance(result.content[0], TextContent)
+    assert json.loads(result.content[0].text) == {
+        "issue_key": "APP-123",
+        "field_id": "description",
+        "error": message,
+        "error_code": "invalid_provider_response",
+    }
 
 
 def test_servers_keep_their_provider_binding() -> None:

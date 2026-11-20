@@ -112,9 +112,21 @@ Get one Jira issue by key. Without `field_id`, returns a Markdown summary with
 metadata, description, hierarchy, relationships, and attachment IDs. With one
 exact REST text field ID (e.g. `description` or `customfield_12345`), returns
 JSON with `issue_key`, `field_id`, and the exact `value` (string or null).
-An omitted field, non-text value, or text over 60,000 characters returns an
-error instead of a partial value. Use `get_comments` for discussion and
-`get_attachment` to inspect a listed attachment.
+A missing, non-text, invalid Unicode, or over-limit field returns an error
+without a partial value. Tool errors include `error` and `error_code`, plus
+`http_status` for Jira HTTP errors; MCP protocol errors may not return JSON.
+The server limit is 60,000 characters, not a guarantee that the client
+delivers the full response.
+
+To verify equality, use the complete raw MCP response. Require MCP success
+and a JSON object with neither `error` nor `error_code`, matching `issue_key`
+and `field_id`, and an explicit string or null `value`. Compare decoded values
+exactly, including whitespace and line endings; null is not an empty string.
+If the response is truncated or unavailable, report full equality unverified;
+a summary or matching excerpts are insufficient.
+
+Use `get_comments` for discussion and `get_attachment` to inspect a listed
+attachment.
 """
 
 GET_ISSUE_CHANGELOG_DESCRIPTION = """\

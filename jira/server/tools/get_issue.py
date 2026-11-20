@@ -47,20 +47,23 @@ def register(mcp: MCPServer, default_provider: str = "jira", provider: JiraProvi
     ) -> str:
         normalized_key = issue_key.strip().upper() if isinstance(issue_key, str) else ""
         if not ISSUE_KEY_RE.fullmatch(normalized_key):
+            if field_id is not None:
+                return error_response("invalid_issue_key", "Use a valid Jira issue key, such as PROJ-123")
             return error_response("invalid_issue_key", f"Invalid issue key: {issue_key!r}", issue_key=normalized_key)
         selector = {"field_id": field_id} if field_id is not None else {}
-        context = {"issue_key": normalized_key, **selector}
         resolved_provider, error = provider_or_error(default_provider, provider)
         if error:
-            return error_response("provider_unavailable", "Jira provider is unavailable", **context)
+            return error_response("provider_unavailable", "Jira provider is unavailable", issue_key=normalized_key)
         try:
             raw = resolved_provider.get_issue(normalized_key, **selector)
+            if field_id is not None:
+                return ensure_json_result(raw, issue_key=normalized_key)
         except Exception as exc:  # noqa: BLE001 - provider boundary
+            if field_id is not None:
+                return error_response("provider_error", "Jira field readback failed", issue_key=normalized_key)
             return error_response(
                 "provider_error",
                 f"Jira provider failed: {type(exc).__name__}: {exc}",
-                **context,
+                issue_key=normalized_key,
             )
-        if field_id is not None:
-            return ensure_json_result(raw, **context)
         return ensure_markdown_result(raw, issue_key=normalized_key)

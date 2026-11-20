@@ -48,3 +48,24 @@ def test_get_issue_normalizes_provider_error() -> None:
     register("error", provider)
     data = json.loads(get_func("error")("TEST-1"))
     assert data["error_code"] == "not_found"
+
+
+def test_get_issue_text_field_hides_unexpected_provider_exception() -> None:
+    provider = StubProvider()
+    provider.get_issue = MagicMock(side_effect=RuntimeError("PRIVATE_EXCEPTION_DETAIL"))
+    register("error", provider)
+
+    get_issue = get_func("error")
+    assert json.loads(get_issue("test-1", "description")) == {
+        "issue_key": "TEST-1",
+        "error": "Jira field readback failed",
+        "error_code": "provider_error",
+    }
+    assert json.loads(get_issue("test-1"))["error"] == "Jira provider failed: RuntimeError: PRIVATE_EXCEPTION_DETAIL"
+
+
+def test_get_issue_text_field_does_not_return_invalid_identifiers() -> None:
+    assert json.loads(get_func()("PRIVATE BAD KEY\ud800", "description")) == {
+        "error": "Use a valid Jira issue key, such as PROJ-123",
+        "error_code": "invalid_issue_key",
+    }
