@@ -111,6 +111,15 @@ class JiraProvider(Protocol):
         """Remove the Blocks link from the source issue to the target issue."""
         ...
 
+    def remove_issue_clone(
+        self,
+        source_issue_key: str,
+        target_issue_key: str,
+        **kwargs,
+    ) -> str:
+        """Remove source (original) is cloned by target (clone)."""
+        ...
+
     def create_issue(
         self,
         project_key: str,

@@ -23,6 +23,7 @@
 | `update_issue` | Jira 写入 | 编辑现有任务的标准字段或自定义字段 |
 | `link_issue_blocks` | Jira 写入 | 创建“源任务 blocks 目标任务”的连接 |
 | `remove_issue_blocks` | Jira 写入 | 移除“源任务 blocks 目标任务”的连接 |
+| `remove_issue_clone` | Jira 写入 | 移除“原任务 is cloned by 克隆任务”的复制来源关系 |
 | `transition_issue` | Jira 写入 | 使用精确 transition ID 执行工作流流转 |
 | `get_attachment` | Jira 只读 | 内联读取文本或图片附件 |
 | `export_issue` | 本地写入 | 将任务导出为 `.docx` |
@@ -31,7 +32,7 @@
 
 主要特性：
 
-- 二十个工具始终可发现；配置不完整时返回稳定的 `configuration_error`。
+- 二十一个工具始终可发现；配置不完整时返回稳定的 `configuration_error`。
 - server instructions 和工具描述明确 JQL 探索、查询、评论、编辑、附件读取和导出的使用边界。
 - JQL 字段与候选值使用进程内缓存和原子 JSON 快照，避免每次搜索前请求元数据。
 - 工具参数不暴露内部 provider 选择。
@@ -478,6 +479,33 @@ remove_issue_blocks(
 )
 ```
 
+### `remove_issue_clone`
+
+仅在用户明确要求移除复制关系时调用。这是破坏性远端写入，只删除关系，不删除任务，
+也不改变 Blocks 关系、字段、评论或状态。
+
+参数方向固定为：**原任务 `is cloned by` 克隆任务**（克隆任务 `clones` 原任务）。
+工具先读取原任务的关系，仅匹配类型名为 `Cloners` 且方向描述为 `is cloned by` 的连接，
+不猜测 inward/outward 方向。没有匹配、方向反转、描述无法识别、多个匹配或连接 ID
+异常时均不删除。自定义/本地化类型名或方向描述不在当前支持范围内，工具会安全拒绝。
+未知执行结果后，应先重新查询关系，不能盲目重试。
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `source_issue_key` | 必填 | 原任务 key（被复制的任务） |
+| `target_issue_key` | 必填 | 克隆任务 key，且不能与原任务相同 |
+
+```text
+remove_issue_clone(
+  source_issue_key="YLZHXT-30463",
+  target_issue_key="YLZHXT-30757"
+)
+```
+
+成功返回 `source_issue_key`、`target_issue_key`、`link_type="Cloners"`、`link_id`
+和 `removed=true`。失败返回 `error_code`、`error` 和 `removed=false`；请求超时等
+未知结果不代表远端一定未删除，需要回读确认。
+
 ### `get_attachment`
 
 只读读取附件，不接受本地路径，也不会创建目录或写入文件。文本附件返回
@@ -580,6 +608,10 @@ relationships, attachments, or comments.
   relationship. The source issue blocks the target issue; do not reverse them.
 - Use `remove_issue_blocks` only when the user explicitly asks to remove a
   Blocks relationship. The source issue must block the target issue.
+- Use `remove_issue_clone` only when the user explicitly asks to remove a clone
+  relationship. Source is the original issue; target is its clone. Remove only
+  the unique Cloners link described as source 'is cloned by' target. Inspect
+  current relationships before retrying an unknown outcome.
 - Use `get_attachment` when the user needs to inspect an attachment, after
   obtaining its numeric ID from `get_issue`; it returns inline content and does
   not write files.
@@ -769,6 +801,7 @@ jira/
 │       ├── update_issue.py
 │       ├── link_issue_blocks.py
 │       ├── remove_issue_blocks.py
+│       ├── remove_issue_clone.py
 │       ├── transition_issue.py
 │       ├── get_attachment.py
 │       └── export_issue.py

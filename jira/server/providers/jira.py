@@ -3107,14 +3107,32 @@ class JiraProvider:
         target_issue_key: str,
         **kwargs,
     ) -> str:
-        """Remove the Blocks relation where ``source_issue_key`` blocks ``target_issue_key``.
+        """Remove the unique outward Blocks relation from source to target."""
+        return self._remove_issue_link(source_issue_key, target_issue_key, type_name="Blocks")
 
-        Jira requires the opaque issue-link ID to delete a relationship. The
-        MCP tool deliberately accepts the meaningful source/target pair instead
-        and discovers that ID immediately before deleting. It only accepts the
-        source issue's outward ``Blocks`` relation, preventing an inverted link
-        from being removed accidentally.
-        """
+    def remove_issue_clone(
+        self,
+        source_issue_key: str,
+        target_issue_key: str,
+        **kwargs,
+    ) -> str:
+        """Remove source (original) 'is cloned by' target (clone), never its inverse."""
+        return self._remove_issue_link(
+            source_issue_key,
+            target_issue_key,
+            type_name="Cloners",
+            direction_text="is cloned by",
+        )
+
+    def _remove_issue_link(
+        self,
+        source_issue_key: str,
+        target_issue_key: str,
+        *,
+        type_name: str,
+        direction_text: str | None = None,
+    ) -> str:
+        """Discover and delete exactly one matching link; fail closed on ambiguity."""
         source_error = self._validate_issue_key(source_issue_key)
         if source_error:
             return _json_error(
@@ -3149,7 +3167,7 @@ class JiraProvider:
                 params={"fields": "issuelinks"},
             ).json()
             fields = issue.get("fields") if isinstance(issue, dict) else None
-            raw_links = fields.get("issuelinks", []) if isinstance(fields, dict) else None
+            raw_links = fields.get("issuelinks") if isinstance(fields, dict) else None
             if not isinstance(raw_links, list):
                 return _json_error(
                     "Jira issue response must contain an issuelinks list",
@@ -3164,12 +3182,25 @@ class JiraProvider:
                 if not isinstance(link, dict):
                     continue
                 link_type = link.get("type")
-                outward_issue = link.get("outwardIssue")
-                if not isinstance(link_type, dict) or not isinstance(outward_issue, dict):
+                if not isinstance(link_type, dict) or link_type.get("name") != type_name:
                     continue
-                if link_type.get("name") != "Blocks":
-                    continue
-                if str(outward_issue.get("key") or "").upper() != target_issue_key.upper():
+                if direction_text is None:
+                    sides = ("outward",)
+                else:
+                    # Match the displayed relation, not a guessed inward/outward mapping.
+                    sides = tuple(
+                        side for side in ("inward", "outward")
+                        if isinstance(link_type.get(side), str)
+                        and link_type[side].strip().casefold() == direction_text
+                    )
+                    if len(sides) != 1:
+                        continue
+                if not any(
+                    isinstance(link.get(f"{side}Issue"), dict)
+                    and str(link[f"{side}Issue"].get("key") or "").upper()
+                    == target_issue_key.upper()
+                    for side in sides
+                ):
                     continue
                 link_id = link.get("id")
                 if not isinstance(link_id, str) or not link_id.isdigit():
@@ -3184,7 +3215,7 @@ class JiraProvider:
 
             if not matching_link_ids:
                 return _json_error(
-                    "No Blocks relationship from the source issue to the target issue was found",
+                    f"No {direction_text or type_name} relationship from the source issue to the target issue was found",
                     "issue_link_not_found",
                     source_issue_key=source_issue_key,
                     target_issue_key=target_issue_key,
@@ -3192,7 +3223,7 @@ class JiraProvider:
                 )
             if len(matching_link_ids) > 1:
                 return _json_error(
-                    "Multiple matching Blocks relationships were found; none was removed",
+                    f"Multiple matching {type_name} relationships were found; none was removed",
                     "ambiguous_issue_link",
                     source_issue_key=source_issue_key,
                     target_issue_key=target_issue_key,
@@ -3236,7 +3267,7 @@ class JiraProvider:
             {
                 "source_issue_key": source_issue_key,
                 "target_issue_key": target_issue_key,
-                "link_type": "Blocks",
+                "link_type": type_name,
                 "link_id": link_id,
                 "removed": True,
             },
